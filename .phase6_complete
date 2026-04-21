@@ -1,0 +1,5 @@
+集成测试验证完成
+- tests/test_integration.py: 4 tests
+- tests/test_api_integration.py: 9 tests
+- docker-compose.yml: 完整部署配置
+- scripts/start.sh: 服务启动脚本

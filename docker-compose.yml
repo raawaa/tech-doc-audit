@@ -26,7 +26,7 @@ services:
       - "8584:8584"
     volumes:
       - pageindex_data:/root/.pageindex
-      - ./data/documents:/data/documents
+      - ./sample_docs:/data/documents:ro
     environment:
       - OPENAI_API_BASE=http://ollama:11434/v1
       - OPENAI_API_KEY=sk-dummy
@@ -35,6 +35,67 @@ services:
       ollama:
         condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8584/api/v1/search/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # FastAPI 后端服务
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: audit-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./services:/app/services
+      - ./storage:/app/storage
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=qwen3.5:0.8b
+      - AUDIT_DATA_DIR=/app/data
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 前端服务
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: audit-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_BASE=/api/v1
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # Nginx 反向代理（可选）
+  nginx:
+    image: nginx:latest
+    container_name: audit-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - api
+    restart: unless-stopped
+    profiles:
+      - with-nginx
 
 volumes:
   ollama_data:
