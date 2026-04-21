@@ -8,14 +8,19 @@
 
 ## 当前阶段
 
-**阶段四：审核核心流程** ✓
+**阶段五：前端界面** ✓
 
 已完成：
-- 审核任务管理（创建/查询/取消）
-- 知识库检索服务
+- React + TypeScript SPA 应用
+- 知识库管理页面
+- 待审核文档管理页面
+- 审核流程与结果展示
+- JSON 报告导出
+
+**阶段四：审核核心流程** ✓
+- 审核任务管理
+- 知识库检索
 - LLM 审核分析
-- 结果生成与汇总
-- API + CLI 双入口
 
 **阶段三：文档处理** ✓
 - 待审核文档上传、解析、结构识别
@@ -97,6 +102,15 @@ curl http://localhost:8000/api/v1/health
 curl http://localhost:8000/api/v1/knowledge-bases
 ```
 
+### 前端界面
+
+```bash
+cd frontend
+npm install
+npm run dev
+# 访问 http://localhost:3000
+```
+
 ## 目录结构
 
 ```
@@ -106,6 +120,12 @@ jishu_shenhe/
 │   └── routers/           # API 路由
 ├── cli/                   # CLI 工具
 │   └── main.py           # Typer CLI
+├── frontend/              # React 前端应用
+│   ├── src/              # 源代码
+│   │   ├── pages/       # 页面组件
+│   │   ├── components/  # 通用组件
+│   │   └── api/         # API 调用
+│   └── package.json
 ├── services/              # 业务逻辑层
 │   ├── kb_service.py      # 知识库服务
 │   ├── doc_service.py     # 文档服务
