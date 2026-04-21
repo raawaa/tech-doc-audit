@@ -1,0 +1,41 @@
+# 阶段三：文档处理模块 - 完成标记
+
+## 完成日期
+2026-04-21
+
+## 已完成功能
+
+### 1. 数据模型
+- `models/audit_document.py` - AuditDocument, DocumentStructure, Chapter, Clause 模型
+
+### 2. 存储层
+- `storage/audit_doc_repo.py` - 待审核文档 CRUD
+
+### 3. 服务层
+- `services/audit_doc_service.py` - 文档上传、解析
+- `services/structure_service.py` - LLM 辅助结构识别
+- `services/temp_index_service.py` - 临时索引管理
+
+### 4. 接口层
+- `api/routers/audit_docs.py` - 待审核文档 API
+- `cli/main.py` - audit 子命令
+
+### 5. 测试
+- `tests/test_audit_doc_service.py` - 6 个单元测试
+
+## 验证状态
+
+- [x] 文档上传功能正常
+- [x] PDF 解析正常
+- [x] 结构识别（LLM 辅助）
+- [x] 临时索引构建
+- [x] API 端点全部可用
+- [x] CLI 命令全部可用
+- [x] 单元测试全部通过 (6/6)
+
+## 下一步
+
+进入 **阶段四：审核核心流程**
+- Dify 工作流编排
+- 审核分析逻辑
+- 结果生成
