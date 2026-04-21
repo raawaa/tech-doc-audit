@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+venv/
+.venv/
+ENV/
+
+# Docker
+.docker/
+
+# Environment
+.env
+.env.local
+
+# Data
+data/
+*.pdf
+*.doc
+*.docx
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# PageIndex cache
+.pageindex/
