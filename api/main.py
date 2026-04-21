@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routers import knowledge_bases, documents, audit_docs
+from api.routers import knowledge_bases, documents, audit_docs, audit_tasks
 
 app = FastAPI(
     title="技术文档审核系统 API",
@@ -22,6 +22,7 @@ app.add_middleware(
 app.include_router(knowledge_bases.router)
 app.include_router(documents.router)
 app.include_router(audit_docs.router)
+app.include_router(audit_tasks.router)
 
 
 @app.get("/")

@@ -7,6 +7,7 @@ import services.indexing_service as idx_svc
 import services.audit_doc_service as audit_doc_svc
 import services.structure_service as structure_svc
 import services.temp_index_service as temp_index_svc
+import services.audit_task_service as audit_task_svc
 
 app = typer.Typer(help="技术文档审核系统 - CLI")
 
@@ -14,11 +15,13 @@ kb_app = typer.Typer(help="知识库管理")
 doc_app = typer.Typer(help="知识库文档管理")
 index_app = typer.Typer(help="知识库索引管理")
 audit_app = typer.Typer(help="待审核文档管理")
+audit_task_app = typer.Typer(help="审核任务管理")
 
 app.add_typer(kb_app, name="kb")
 app.add_typer(doc_app, name="doc")
 app.add_typer(index_app, name="index")
 app.add_typer(audit_app, name="audit")
+app.add_typer(audit_task_app, name="audit-task")
 
 
 @kb_app.command("create")
@@ -274,6 +277,158 @@ def audit_delete(
     else:
         typer.echo(f"删除失败: {doc_id}")
         raise typer.Exit(1)
+
+
+# ===== 审核任务管理 =====
+
+@audit_task_app.command("create")
+def audit_task_create(
+    doc_id: str = typer.Option(..., "--doc-id", help="待审核文档 ID"),
+    kb_ids: str = typer.Option(..., "--kb-ids", help="知识库 ID（逗号分隔）"),
+    async_mode: bool = typer.Option(True, "--sync", help="同步模式（不使用异步）"),
+):
+    """创建审核任务。"""
+    kb_id_list = [k.strip() for k in kb_ids.split(",")]
+
+    typer.echo(f"创建审核任务...")
+    typer.echo(f"  文档: {doc_id}")
+    typer.echo(f"  知识库: {kb_ids}")
+
+    task = audit_task_svc.create_task(
+        document_id=doc_id,
+        kb_ids=kb_id_list,
+    )
+    typer.echo(f"\n任务已创建: {task.id}")
+
+    if not async_mode:
+        typer.echo("开始执行审核...")
+        task = audit_task_svc.run_audit(task.id)
+        if task.status == "completed":
+            typer.echo(f"审核完成！发现 {len(task.result.issues)} 个问题")
+        else:
+            typer.echo(f"审核失败: {task.error_message}")
+
+
+@audit_task_app.command("list")
+def audit_task_list(
+    doc_id: str = typer.Option(None, "--doc-id", help="按文档筛选"),
+):
+    """列出审核任务。"""
+    tasks = audit_task_svc.list_tasks(doc_id)
+    if not tasks:
+        typer.echo("暂无审核任务")
+        return
+    typer.echo(f"{'ID':<30} {'文档':<20} {'状态':<12} {'进度':<8}")
+    typer.echo("-" * 80)
+    for t in tasks:
+        typer.echo(f"{t.id:<30} {t.document_name[:18]:<20} {t.status:<12} {t.progress*100:.0f}%")
+
+
+@audit_task_app.command("status")
+def audit_task_status(
+    task_id: str = typer.Option(..., "--id", help="任务 ID"),
+):
+    """查看审核任务状态。"""
+    task = audit_task_svc.get_task(task_id)
+    if not task:
+        typer.echo(f"任务不存在: {task_id}")
+        raise typer.Exit(1)
+
+    typer.echo(f"任务: {task.id}")
+    typer.echo(f"文档: {task.document_name}")
+    typer.echo(f"状态: {task.status}")
+    typer.echo(f"进度: {task.progress * 100:.0f}%")
+
+    if task.result:
+        r = task.result
+        typer.echo(f"\n审核结果:")
+        typer.echo(f"  总条款数: {r.summary.total_clauses}")
+        typer.echo(f"  问题总数: {r.summary.issues_count}")
+        typer.echo(f"    - 合规性: {r.summary.compliance_issues}")
+        typer.echo(f"    - 完整性: {r.summary.completeness_issues}")
+        typer.echo(f"    - 一致性: {r.summary.consistency_issues}")
+        typer.echo(f"  严重程度:")
+        typer.echo(f"    - 高: {r.summary.high_severity}")
+        typer.echo(f"    - 中: {r.summary.medium_severity}")
+        typer.echo(f"    - 低: {r.summary.low_severity}")
+
+    if task.error_message:
+        typer.echo(f"\n错误: {task.error_message}")
+
+
+@audit_task_app.command("result")
+def audit_task_result(
+    task_id: str = typer.Option(..., "--id", help="任务 ID"),
+):
+    """查看审核结果详情。"""
+    task = audit_task_svc.get_task(task_id)
+    if not task:
+        typer.echo(f"任务不存在: {task_id}")
+        raise typer.Exit(1)
+
+    if task.status != "completed":
+        typer.echo(f"任务未完成，当前状态: {task.status}")
+        raise typer.Exit(1)
+
+    result = task.result
+    if not result:
+        typer.echo("无审核结果")
+        raise typer.Exit(1)
+
+    typer.echo(f"\n{'='*60}")
+    typer.echo(f"审核报告: {result.document_name}")
+    typer.echo(f"{'='*60}")
+
+    typer.echo(f"\n【摘要】")
+    typer.echo(f"  总条款数: {result.summary.total_clauses}")
+    typer.echo(f"  发现问题: {result.summary.issues_count} 个")
+    typer.echo(f"    合规性问题: {result.summary.compliance_issues}")
+    typer.echo(f"    完整性问题: {result.summary.completeness_issues}")
+    typer.echo(f"    一致性问题: {result.summary.consistency_issues}")
+
+    if result.issues:
+        typer.echo(f"\n【问题详情】")
+        for issue in result.issues:
+            severity_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(issue.severity, "⚪")
+            typer.echo(f"\n{severity_icon} 问题 {issue.id}: [{issue.type}]")
+            if issue.location.clause_number:
+                typer.echo(f"   条款: {issue.location.clause_number}")
+            typer.echo(f"   描述: {issue.description[:100]}...")
+            if issue.standard_reference:
+                std = issue.standard_reference
+                typer.echo(f"   依据: {std.standard_name}")
+                if std.clause:
+                    typer.echo(f"   条款: {std.clause}")
+            if issue.suggestion:
+                typer.echo(f"   建议: {issue.suggestion[:80]}...")
+
+
+@audit_task_app.command("run")
+def audit_task_run(
+    task_id: str = typer.Option(..., "--id", help="任务 ID"),
+    sync: bool = typer.Option(False, "--sync", help="同步执行"),
+):
+    """执行审核任务。"""
+    task = audit_task_svc.get_task(task_id)
+    if not task:
+        typer.echo(f"任务不存在: {task_id}")
+        raise typer.Exit(1)
+
+    if task.status == "processing":
+        typer.echo("任务正在执行中")
+        return
+
+    typer.echo(f"开始执行任务: {task_id}")
+
+    if sync:
+        task = audit_task_svc.run_audit(task_id)
+        if task.status == "completed":
+            typer.echo(f"审核完成！发现 {len(task.result.issues) if task.result else 0} 个问题")
+        else:
+            typer.echo(f"审核失败: {task.error_message}")
+    else:
+        audit_task_svc.run_audit_async(task_id)
+        typer.echo("任务已启动（异步执行）")
 
 
 if __name__ == "__main__":
