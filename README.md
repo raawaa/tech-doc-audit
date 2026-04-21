@@ -8,6 +8,15 @@
 
 ## 当前阶段
 
+**阶段二：知识库管理模块** ✓
+
+已完成：
+- 知识库 CRUD API（FastAPI + CLI 双入口）
+- 文档导入与解析（PDF/Word）
+- PageIndex 索引管理
+- 文件系统存储层
+- 单元测试（pytest）
+
 **阶段一：基础设施搭建与技术验证** ✓
 
 已验证：
@@ -56,7 +65,58 @@ python scripts/generate_sample_doc.py
 python scripts/verify_all.py
 ```
 
+### CLI 使用
+
+```bash
+# 知识库管理
+python -m cli kb create --name "国家标准库" --category national
+python -m cli kb list
+python -m cli kb delete --id <kb_id>
+
+# 文档导入
+python -m cli doc import --kb-id <kb_id> --file sample_docs/sample_standard.pdf
+python -m cli doc list --kb-id <kb_id>
+
+# 索引管理
+python -m cli index rebuild --kb-id <kb_id>
+python -m cli index status --kb-id <kb_id>
+```
+
+### API 服务
+
+```bash
+# 启动 API 服务
+uvicorn api.main:app --reload --port 8000
+
+# 测试端点
+curl http://localhost:8000/api/v1/health
+curl http://localhost:8000/api/v1/knowledge-bases
+```
+
 ## 目录结构
+
+```
+jishu_shenhe/
+├── api/                    # FastAPI REST API
+│   ├── main.py            # 应用入口
+│   └── routers/           # API 路由
+├── cli/                   # CLI 工具
+│   └── main.py           # Typer CLI
+├── services/              # 业务逻辑层
+│   ├── kb_service.py      # 知识库服务
+│   ├── doc_service.py     # 文档服务
+│   └── indexing_service.py # 索引服务
+├── storage/               # 存储层
+│   ├── kb_repo.py        # 知识库存储
+│   ├── doc_repo.py       # 文档存储
+│   └── index_repo.py     # 索引存储
+├── models/                # 数据模型
+├── docker-compose.yml    # Docker 服务编排
+├── tests/                 # 测试脚本
+├── scripts/               # 工具脚本
+├── sample_docs/           # 示例文档
+└── docs/                  # 设计文档
+```
 
 ```
 jishu_shenhe/

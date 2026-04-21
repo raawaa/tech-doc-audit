@@ -18,7 +18,10 @@ ENV/
 .env.local
 
 # Data
-data/
+data/documents/
+data/kb_docs/
+data/kb_index/
+data/kb_meta/
 *.pdf
 *.doc
 *.docx

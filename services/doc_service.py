@@ -1,0 +1,53 @@
+import os
+from typing import Optional
+
+import pdfplumber
+
+from models.document import KBDocument
+from models.knowledge_base import KnowledgeBase
+import storage.doc_repo as doc_repo
+import storage.kb_repo as kb_repo
+
+
+def _detect_file_type(filename: str) -> Optional[str]:
+    ext = os.path.splitext(filename)[1].lower()
+    mapping = {".pdf": "pdf", ".doc": "doc", ".docx": "docx"}
+    return mapping.get(ext)
+
+
+def import_document(kb_id: str, original_name: str, content: bytes) -> KBDocument:
+    file_type = _detect_file_type(original_name)
+    if not file_type:
+        raise ValueError(f"不支持的文件格式: {original_name}")
+
+    doc = doc_repo.save_doc(kb_id, original_name, content, file_type)
+
+    # 提取 PDF 页数等元数据
+    if file_type == "pdf":
+        try:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            with pdfplumber.open(tmp_path) as pdf:
+                doc.page_count = len(pdf.pages)
+            os.unlink(tmp_path)
+        except Exception:
+            pass  # 解析失败不影响导入
+
+    # 更新知识库 document_ids
+    kb = kb_repo.get(kb_id)
+    if kb and doc.id not in kb.document_ids:
+        kb.document_ids.append(doc.id)
+        kb_repo.update(kb)
+
+    return doc
+
+
+def delete_document(kb_id: str, doc_id: str) -> bool:
+    # 更新知识库 document_ids
+    kb = kb_repo.get(kb_id)
+    if kb and doc_id in kb.document_ids:
+        kb.document_ids.remove(doc_id)
+        kb_repo.update(kb)
+    return doc_repo.delete_doc(kb_id, doc_id)
