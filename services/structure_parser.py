@@ -66,8 +66,10 @@ def parse_markdown_structure(markdown: str, doc_title: Optional[str] = None) -> 
             h3_text = h3_match.group(1)
             h3_clean = _clean_heading(h3_text)
 
-            # H3 标题可能本身就包含条款内容如 "### 2.3.1. 需求和深化设计：2个月内完成"
-            if _has_clause_content(h3_text):
+            # H3 标题可能包含条款内容（需同时满足：有编号 + 冒号后有实质内容）
+            # 无编号的 H3（如 "### 规格型号、主要功能"）→ 纯标题，不作为条款
+            num = _extract_number(h3_text)
+            if num and _has_clause_content(h3_text):
                 num = _extract_number(h3_text)
                 text = _extract_clause_text_from_heading(h3_text)
                 current_chapter.clauses.append(Clause(number=num, text=text[:200]))
@@ -87,8 +89,9 @@ def parse_markdown_structure(markdown: str, doc_title: Optional[str] = None) -> 
             current_clause_text = [f"【{_clean_heading(h2_text)}】"]
             continue
 
-        # 检测编号条款行：1)、2)、1.、2.、等
-        clause_match = re.match(r'^\s*(\d+)[\)\.、]\s*(.*)', stripped)
+        # 检测段落级编号条款：1) 2.1.1  格式
+        # 用负向预查确保编号后是空格或特定分隔符，不是紧跟中文字符
+        clause_match = re.match(r'^\s*(\d+(?:\.\d+)*)[）\)\.、]\s+(.*)', stripped)
         if clause_match:
             _finalize_clause(current_chapter, current_clause_num, current_clause_text)
             current_clause_num = clause_match.group(1)
@@ -96,12 +99,14 @@ def parse_markdown_structure(markdown: str, doc_title: Optional[str] = None) -> 
             continue
 
         # 检测带编号的短条款：3.2.1 防护等级
-        clause_num_match = re.match(r'^(\d+(?:\.\d+)+)\s+(.*)', stripped)
-        if clause_num_match and len(stripped) < 200:
-            _finalize_clause(current_chapter, current_clause_num, current_clause_text)
-            current_clause_num = clause_num_match.group(1)
-            current_clause_text = [clause_num_match.group(2).strip()]
-            continue
+        # 排除 HTML 标签和 markdown 图片行
+        if not stripped.startswith(("<", "!", "?")):
+            clause_num_match = re.match(r'^(\d+(?:\.\d+)+)\s+(.*)', stripped)
+            if clause_num_match and len(stripped) < 200:
+                _finalize_clause(current_chapter, current_clause_num, current_clause_text)
+                current_clause_num = clause_num_match.group(1)
+                current_clause_text = [clause_num_match.group(2).strip()]
+                continue
 
         # 检测表格标记 → 追加到上一个条款
         if stripped == "<TABLE>":
@@ -173,6 +178,8 @@ def _clean_heading(raw: str) -> str:
 def _extract_number(raw: str) -> str:
     """从标题或行中提取章节/条款编号。"""
     text = raw.strip()
+    # 去掉 markdown 标题前缀（如 ### 或 ##）
+    text = re.sub(r'^#{1,3}\s+', '', text)
     m = re.match(r'(\d+(?:\.\d+)*)', text)
     if m:
         return m.group(1)
@@ -180,11 +187,32 @@ def _extract_number(raw: str) -> str:
 
 
 def _has_clause_content(text: str) -> bool:
-    """判断 H3 标题行是否包含实质性的条款内容（而非纯标题）。"""
-    cleaned = _clean_heading(text)
-    # 如果清理后还有内容且带 要求/必须/应/需 等关键词
-    if len(cleaned) > 10:
-        return True
+    """判断 H2/H3 标题是否包含实质性条款内容。
+
+    判断规则：
+    1. 有编号 + 冒号后有3字以上内容 → 条款（正文在冒号后）
+    2. 有编号 + 无冒号或冒号后内容不足3字 → 只要长度>5就算条款
+       （如 "3.1.1. 规格型号、主要功能" 是条款，"3.1.1. 实施方案" 也算）
+    3. 无编号但有冒号 + 冒号后5字以上 → 条款
+    """
+    num = _extract_number(text)
+
+    if '：' in text or ':' in text:
+        parts = re.split(r'[：:]', text, 1)
+        after_colon = parts[1].strip() if len(parts) > 1 else ""
+        if num:
+            # 有编号：冒号后>=3字才算有实质内容
+            return len(after_colon) >= 3
+        else:
+            # 无编号：冒号后>=5字才算条款
+            return len(after_colon) >= 5
+
+    # 无冒号时
+    if num:
+        # 有编号的 H3/H2 → 只要编号存在就倾向算条款
+        # 除非清理后太短（如仅剩纯编号 "3.1.1"）
+        cleaned = _clean_heading(text)
+        return len(cleaned) > 5
     return False
 
 
