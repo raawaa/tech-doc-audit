@@ -1,10 +1,12 @@
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { kbApi } from '@/api'
 import { StatusBadge, EmptyState, LoadingSpinner } from '@/components/StatusBadge'
 
 export function KnowledgeBasesPage() {
+  const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [showCreate, setShowCreate] = useState(false)
   const [newName, setNewName] = useState('')
@@ -17,10 +19,12 @@ export function KnowledgeBasesPage() {
 
   const createMutation = useMutation({
     mutationFn: kbApi.create,
-    onSuccess: () => {
+    onSuccess: (newKb) => {
       queryClient.invalidateQueries({ queryKey: ['knowledge-bases'] })
       setShowCreate(false)
       setNewName('')
+      // 创建成功后跳转到详情页
+      navigate(`/knowledge-bases/${newKb.id}`)
     },
   })
 

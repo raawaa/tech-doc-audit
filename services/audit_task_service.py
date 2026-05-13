@@ -101,13 +101,13 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
         task.progress = 0.1
         repo.save_task(task)
 
-        # 执行审核
+        # 执行审核 — 按章批量审核（20万字文档也只需要几次调用）
         if use_quick_mode:
             issues, raw_analysis = analysis_svc.quick_audit_with_llm(
                 doc, task.kb_ids, task.audit_types
             )
         else:
-            issues, raw_analysis = analysis_svc.analyze_document_clauses(
+            issues, raw_analysis = analysis_svc.analyze_document_by_chapter(
                 doc, task.kb_ids, task.audit_types
             )
 

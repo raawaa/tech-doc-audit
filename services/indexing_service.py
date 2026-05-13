@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
 
@@ -7,14 +8,39 @@ import storage.doc_repo as doc_repo
 import storage.index_repo as index_repo
 import storage.kb_repo as kb_repo
 
+# 确保 PageIndex 可导入
+_pageindex_path = Path(__file__).resolve().parent.parent.parent / "Code" / "PageIndex"
+if _pageindex_path.exists() and str(_pageindex_path) not in sys.path:
+    sys.path.insert(0, str(_pageindex_path))
 
-def build_index_for_doc(doc: KBDocument, model: str = "qwen3.5:0.8b") -> KBDocument:
+
+def _get_llm_model() -> str:
+    """根据当前 LLM_PROVIDER 返回 litellm 兼容的模型名。"""
+    provider = os.environ.get("LLM_PROVIDER", "ollama").lower().strip()
+    if provider in ("minimax", "minimax-cn"):
+        return os.environ.get("MINIMAX_CN_MODEL", "MiniMax-M2.7")
+    return os.environ.get("OLLAMA_MODEL", "qwen3.5:0.8b")
+
+
+def _setup_litellm_for_pageindex():
+    """配置 litellm 环境变量以匹配当前 LLM 提供商。"""
+    provider = os.environ.get("LLM_PROVIDER", "ollama").lower().strip()
+    if provider in ("minimax", "minimax-cn"):
+        os.environ.setdefault("OPENAI_API_KEY", os.environ.get("MINIMAX_CN_API_KEY", ""))
+        os.environ.setdefault("OPENAI_API_BASE", os.environ.get("MINIMAX_CN_BASE_URL", "https://api.minimaxi.com/v1"))
+    elif provider == "ollama":
+        base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        os.environ.setdefault("OPENAI_API_BASE", f"{base}/v1")
+        os.environ.setdefault("OPENAI_API_KEY", "ollama")
+
+
+def build_index_for_doc(doc: KBDocument) -> KBDocument:
     """为单个文档构建 PageIndex 树索引。"""
     doc.index_status = "building"
     doc_repo._save_doc_meta(doc)
 
     try:
-        tree = _generate_pageindex_tree(doc.file_path, model)
+        tree = _generate_pageindex_tree(doc.file_path)
         index_path = index_repo.save_index(doc.kb_id, doc.id, tree)
         doc.tree_index_path = index_path
         doc.index_status = "ready"
@@ -27,7 +53,7 @@ def build_index_for_doc(doc: KBDocument, model: str = "qwen3.5:0.8b") -> KBDocum
     return doc
 
 
-def rebuild_kb_index(kb_id: str, model: str = "qwen3.5:0.8b") -> None:
+def rebuild_kb_index(kb_id: str) -> None:
     """重建知识库所有文档的索引。"""
     kb = kb_repo.get(kb_id)
     if not kb:
@@ -38,7 +64,7 @@ def rebuild_kb_index(kb_id: str, model: str = "qwen3.5:0.8b") -> None:
 
     docs = doc_repo.list_docs(kb_id)
     for doc in docs:
-        build_index_for_doc(doc, model)
+        build_index_for_doc(doc)
 
     _update_kb_index_status(kb_id)
 
@@ -61,34 +87,43 @@ def _update_kb_index_status(kb_id: str) -> None:
     kb_repo.update(kb)
 
 
-def _generate_pageindex_tree(file_path: str, model: str) -> dict:
+def _generate_pageindex_tree(file_path: str) -> dict:
     """调用 PageIndex 生成树索引。"""
+    _setup_litellm_for_pageindex()
+
     try:
-        from pageindex import PageIndexTree
+        from pageindex import page_index_main
+        from pageindex.utils import ConfigLoader
 
-        tree_builder = PageIndexTree(
-            pdf_path=file_path,
-            model=model,
-            max_pages_per_node=5,
-            max_tokens_per_node=15000
-        )
-        tree = tree_builder.generate()
+        model = _get_llm_model()
+        model_str = f"openai/{model}"  # litellm 格式
+
+        opt = ConfigLoader().load({
+            "model": model_str,
+            "if_add_node_summary": "yes",
+            "if_add_node_text": "yes",  # 需要文本做搜索
+            "if_add_doc_description": "yes",
+            "max_token_num_each_node": 15000,
+        })
+
+        # page_index_main 返回树结构
+        tree = page_index_main(doc=file_path, opt=opt)
         return tree
-    except ImportError:
-        # PageIndex 未安装时返回占位结构
-        import json
-        with open(file_path, "rb") as f:
-            pass
-        return _create_fallback_tree(file_path, model)
+
     except Exception as e:
-        # 降级为简单结构
-        return _create_fallback_tree(file_path, model)
+        # 降级：返回简化结构
+        return _create_fallback_tree(file_path)
 
 
-def _create_fallback_tree(file_path: str, model: str) -> dict:
+def _create_fallback_tree(file_path: str) -> dict:
     """创建降级的树索引结构（当 PageIndex 不可用时）。"""
-    # 尝试用 pdfplumber 提取文本作为基本信息
-    content = {"title": Path(file_path).stem, "model": model, "nodes": []}
+    content = {
+        "title": Path(file_path).stem,
+        "fallback": True,
+        "note": "PageIndex 树生成失败，使用降级模式",
+        "nodes": [],
+        "generated_at": datetime.utcnow().isoformat(),
+    }
     if file_path.lower().endswith(".pdf"):
         try:
             import pdfplumber
@@ -101,8 +136,4 @@ def _create_fallback_tree(file_path: str, model: str) -> dict:
                 content["pages"] = pages_text
         except Exception:
             pass
-
-    content["generated_at"] = datetime.utcnow().isoformat()
-    content["fallback"] = True
-    content["note"] = "PageIndex 未安装，使用降级模式"
     return content

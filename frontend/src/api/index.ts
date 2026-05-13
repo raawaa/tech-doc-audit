@@ -43,7 +43,7 @@ export const kbApi = {
   importDocument: async (kbId: string, file: File): Promise<KBDocument> => {
     const formData = new FormData()
     formData.append('file', file)
-    const resp = await apiClient.post(`/knowledge-bases/${kbId}/documents`, formData, {
+    const resp = await apiClient.post(`/documents/${kbId}/upload`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
     return resp.data
