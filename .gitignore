@@ -22,6 +22,8 @@ data/documents/
 data/kb_docs/
 data/kb_index/
 data/kb_meta/
+data/audit_docs/
+data/audit_tasks/
 *.pdf
 *.doc
 *.docx

@@ -9,9 +9,14 @@ import storage.index_repo as index_repo
 import storage.kb_repo as kb_repo
 
 # 确保 PageIndex 可导入
-_pageindex_path = Path(__file__).resolve().parent.parent.parent / "Code" / "PageIndex"
-if _pageindex_path.exists() and str(_pageindex_path) not in sys.path:
-    sys.path.insert(0, str(_pageindex_path))
+# 优先尝试通过 pip 安装的 pageindex；dev 环境下从本地源码加载
+try:
+    import pageindex  # noqa: F401 — 验证 pip 安装版本
+except ImportError:
+    # 开发环境回退：从 ../../Code/PageIndex 加载
+    _dev_path = Path(__file__).resolve().parent.parent.parent / "Code" / "PageIndex"
+    if _dev_path.exists() and str(_dev_path) not in sys.path:
+        sys.path.insert(0, str(_dev_path))
 
 
 def _get_llm_model() -> str:

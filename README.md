@@ -161,12 +161,12 @@ jishu_shenhe/
 
 | 组件 | 技术 |
 |------|------|
-| LLM | Ollama + Qwen3.5-0.8B |
-| 检索引擎 | PageIndex |
-| 应用平台 | Dify（后续阶段） |
-| 后端 | FastAPI（后续阶段） |
-| 前端 | React/Vue（后续阶段） |
-| 数据库 | PostgreSQL（后续阶段） |
+| LLM | Ollama / MiniMax / OpenAI（通过 `LLM_PROVIDER` 配置） |
+| 检索引擎 | PageIndex（推理式检索） |
+| 后端框架 | FastAPI |
+| 前端 | React + TypeScript + Vite + Tailwind CSS |
+| 存储 | 文件系统 + JSON 元数据 |
+| 部署 | Docker Compose（Ollama + PageIndex + API + 前端） |
 
 ## 文档
 

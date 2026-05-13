@@ -98,14 +98,14 @@ def delete_kb(kb_id: str):
 
 
 @router.post("/{kb_id}/reindex")
-def reindex_kb(kb_id: str, model: str = "qwen3.5:0.8b"):
+def reindex_kb(kb_id: str):
     """重建知识库索引"""
     kb = kb_svc.get_kb(kb_id)
     if not kb:
         raise HTTPException(status_code=404, detail="知识库不存在")
 
     # 异步处理（简化版：同步阻塞）
-    idx_svc.rebuild_kb_index(kb_id, model)
+    idx_svc.rebuild_kb_index(kb_id)
     return {"message": "索引重建完成"}
 
 
