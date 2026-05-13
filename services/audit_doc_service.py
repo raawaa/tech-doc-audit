@@ -23,18 +23,16 @@ import storage.audit_doc_repo as repo
 _MINERU_BIN: Optional[str] = None
 
 def _find_mineru() -> Optional[str]:
-    """查找 MinerU 可执行文件路径。"""
-    candidates = [
-        os.path.expanduser("~/.hermes/hermes-agent/venv/bin/mineru"),
-        "mineru",  # PATH 中
-    ]
-    for c in candidates:
-        try:
-            result = subprocess.run([c, "--version"], capture_output=True, text=True, timeout=5)
+    """查找 MinerU 可执行文件路径（仅通过 PATH 查找，不做任何硬编码）。"""
+    import shutil
+    try:
+        path = shutil.which("mineru")
+        if path:
+            result = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
-                return c
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
+                return path
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
     return None
 
 

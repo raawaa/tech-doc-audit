@@ -1,21 +1,8 @@
-# services/pageindex/requirements.txt
-# PageIndex 核心依赖
+# PageIndex 特有依赖（其余继承自主项目的 requirements.txt / requirements.lock）
 
 # PageIndex 框架（从 GitHub 安装）
 git+https://github.com/VectifyAI/PageIndex.git@main
 
-# 文档处理
-pdfplumber>=0.10.0
-python-docx>=1.1.0
-
-# LLM 客户端
-openai>=1.0.0
+# PageIndex 依赖的 LLM 工具链（主项目不直接需要）
 litellm>=1.0.0
-
-# Web 服务
-fastapi>=0.100.0
-uvicorn>=0.23.0
-
-# 工具库
-python-multipart>=0.0.6
 aiofiles>=23.0.0

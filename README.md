@@ -39,39 +39,47 @@
 
 - Docker & Docker Compose
 - Python 3.10+
-- Ollama（本地安装）
+- [uv](https://docs.astral.sh/uv/)（包管理器，推荐） 或 pip
+- Ollama（本地 LLM）/ MiniMax API Key（云端）
 
 ### 安装步骤
 
-1. 克隆项目
+#### 快速开始（推荐 — uv 隔离环境）
+
 ```bash
+# 1. 克隆项目
 git clone <repo_url>
 cd jishu_shenhe
-```
 
-2. 安装 Ollama 并下载模型
-```bash
-# macOS
+# 2. 安装 Ollama 并下载模型（如果使用 Ollama）
 brew install ollama
 ollama serve
-
-# 下载模型
 ollama pull qwen3.5:0.8b
+
+# 3. 安装依赖（自动创建 .venv）
+uv sync
+
+# 4. 激活虚拟环境
+source .venv/bin/activate
+
+# 5. 生成示例文档
+python scripts/generate_sample_doc.py
+
+# 6. 运行验证测试
+python scripts/verify_all.py
 ```
 
-3. 安装 Python 依赖
+或使用 `uv run` 避免手动激活：
+
+```bash
+uv run python scripts/generate_sample_doc.py
+uv run python scripts/verify_all.py
+```
+
+#### pip（无隔离环境）
+
 ```bash
 pip install -r requirements.txt
-```
-
-4. 生成示例文档
-```bash
-python scripts/generate_sample_doc.py
-```
-
-5. 运行验证测试
-```bash
-python scripts/verify_all.py
 ```
 
 ### CLI 使用

@@ -7,10 +7,10 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# 复制依赖文件
+# 复制依赖文件（requirements.txt 由 `uv export --no-dev` 生成，含哈希锁定）
 COPY requirements.txt .
 
-# 安装 Python 依赖
+# 安装 Python 依赖（不含 dev）
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制源代码
