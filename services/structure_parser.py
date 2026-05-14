@@ -1,7 +1,10 @@
-"""从 MinerU 输出的 Markdown 解析文档结构。
+"""文档结构解析器。
 
-不需要 LLM 参与，纯正则解析 Markdown 标题层级。
-覆盖全文，不截断，不遗漏。
+多层降级链（零 LLM 调用）：
+1. docx → python-docx 原生 Heading 样式
+2. MinerU Markdown → 正则解析 # / ## / ###
+3. 纯文本 → 正则解析编号标题
+4. 都没 → 整篇作为单章节
 """
 
 import re
@@ -12,39 +15,140 @@ from models.audit_document import DocumentStructure, Chapter, Clause
 
 # ── 主入口 ──────────────────────────────────────────────────────────────────
 
-def parse_markdown_structure(markdown: str, doc_title: Optional[str] = None) -> DocumentStructure:
-    """从 MinerU 生成的 Markdown 中解析完整的章节结构。
+def extract_structure(parsed_content: str, file_type: str = "", file_path: str = "") -> DocumentStructure:
+    """多层降级链提取文档结构，零 LLM 调用。
 
-    Args:
-        markdown: MinerU 输出的 Markdown 文本（含 HTML 表格）。
-        doc_title: 可选文档标题。
+    策略：
+    1. 正则解析 Markdown 标题（# / ## / ###）— 覆盖所有格式，不受 Word 样式限制
+    2. docx 原生 Heading 样式—补充条款层级（如果正则找不到 H3）
+    3. 整篇作为单章节—兜底
 
     Returns:
-        覆盖全文的 DocumentStructure，零 LLM 调用。
+        始终返回有效结构，最后一层兜底为单章节。
     """
-    lines = markdown.split("\n")
+
+    # ── 第 1 层：正则解析（不受 Word 样式限制，识别所有 # 标题）──
+    structure = _parse_by_regex(parsed_content)
+    if structure and structure.total_clauses > 0:
+        return structure
+    if structure and len(structure.chapters) > 0:
+        return structure
+
+    # ── 第 2 层：docx 原生 Heading 样式（补充，仅当正则完全失败时）──
+    if file_type == "docx" and file_path:
+        try:
+            structure = _extract_from_docx_styles(file_path, parsed_content)
+            if structure and len(structure.chapters) > 1:
+                return structure
+        except Exception:
+            pass
+
+    # ── 第 3 层：整篇作为单章节 ──
+    return DocumentStructure(
+        title="全文",
+        chapters=[Chapter(title="全文", text=parsed_content)],
+        total_clauses=0,
+    )
+
+
+# ── 第 1 层：docx Heading 样式 ──────────────────────────────────────────────
+
+def _extract_from_docx_styles(file_path: str, parsed_content: str) -> Optional[DocumentStructure]:
+    """从 docx 原生 Heading 样式提取章节结构，同时将章节文本映射回 parsed_content。"""
+    from docx import Document as DocxDocument
+
+    docx = DocxDocument(file_path)
+    chapters: list[Chapter] = []
+    current_chapter: Optional[Chapter] = None
+    clause_counter = 0
+
+    for para in docx.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+
+        style_name = para.style.name if para.style else "Normal"
+
+        # Heading 1 → 新章节
+        if "Heading 1" in style_name:
+            current_chapter = Chapter(title=text)
+            chapters.append(current_chapter)
+        # Heading 2 / Heading 3 → 新条款
+        elif "Heading" in style_name and current_chapter is not None:
+            clause_counter += 1
+            num = _extract_number(text)
+            current_chapter.clauses.append(Clause(
+                number=num or f"{clause_counter}",
+                text=text[:200],
+            ))
+
+    # 如果 docx 没用原生 Heading 样式（全 Normal），返回 None 走降级
+    if len(chapters) <= 1:
+        for para in docx.paragraphs:
+            if para.style and "Heading" in para.style.name:
+                return _map_chapter_texts(chapters, parsed_content)
+        return None  # 没有 Heading 样式 → 降级
+
+    return _map_chapter_texts(chapters, parsed_content)
+
+
+def _map_chapter_texts(chapters: list[Chapter], parsed_content: str) -> DocumentStructure:
+    """将章节标题映射回 parsed_content 中的文本位置，填充 chapter.text。"""
+    total_clauses = 0
+    for i, ch in enumerate(chapters):
+        total_clauses += len(ch.clauses)
+        # 找标题在 parsed_content 中的位置，提取到下一个标题为止
+        start = parsed_content.find(ch.title)
+        if start >= 0:
+            # 找下一个章节标题的位置
+            end = len(parsed_content)
+            for j in range(i + 1, len(chapters)):
+                next_start = parsed_content.find(chapters[j].title, start + 1)
+                if next_start > start:
+                    end = next_start
+                    break
+            ch.text = parsed_content[start:end].strip()
+        else:
+            # 标题在 parsed_content 中找不到（格式不同），用全文
+            ch.text = parsed_content[:5000]
+
+    total = sum(len(ch.clauses) for ch in chapters)
+    return DocumentStructure(
+        title=chapters[0].title if chapters else "",
+        chapters=chapters,
+        total_clauses=total,
+    )
+
+
+# ── 第 2 层：正则解析 ───────────────────────────────────────────────────────
+
+def _parse_by_regex(content: str) -> Optional[DocumentStructure]:
+    """用正则从 Markdown / 纯文本中提取章节和条款，同时保留章节原文。"""
+    lines = content.split("\n")
     chapters: list[Chapter] = []
     current_chapter: Optional[Chapter] = None
     current_clause_num: Optional[str] = None
     current_clause_text: list[str] = []
+    chapter_start_line = 0  # 当前章节在 lines 中的起始行
 
-    # 先去掉 HTML table 标签内的换行（避免干扰行解析）
     cleaned_lines = _flatten_html_tables(lines)
 
-    for line in cleaned_lines:
+    for idx, line in enumerate(cleaned_lines):
         stripped = line.strip()
         if not stripped:
             continue
 
-        # 检测 H1 标题 → 新章节
+        # H1 → 新章节
         h1_match = re.match(r'^#\s+(.+)$', stripped)
         if h1_match:
-            # 保存前一个章节未完成的条款
-            if current_chapter:
-                _finalize_clause(current_chapter, current_clause_num, current_clause_text)
+            _finalize_clause(current_chapter, current_clause_num, current_clause_text)
+            # 填充上一章节的 text
+            if current_chapter is not None:
+                current_chapter.text = "\n".join(lines[chapter_start_line:idx]).strip()
 
             current_clause_num = None
             current_clause_text = []
+            chapter_start_line = idx
 
             chapter_title = _clean_heading(h1_match.group(1))
             chapter_num = _extract_number(h1_match.group(1))
@@ -53,44 +157,34 @@ def parse_markdown_structure(markdown: str, doc_title: Optional[str] = None) -> 
             continue
 
         if current_chapter is None:
-            # H1 之前的文本（如表格、前导说明）→ 归入"前言"
             current_chapter = Chapter(title="前言")
             chapters.append(current_chapter)
 
-        # 检测 H2 / H3 标题 → 子章节，可能本身就是条款
+        # H3 → 条款
         h3_match = re.match(r'^###\s+(.+)$', stripped)
         h2_match = re.match(r'^##\s+(.+)$', stripped) if not h3_match else None
 
         if h3_match:
             _finalize_clause(current_chapter, current_clause_num, current_clause_text)
             h3_text = h3_match.group(1)
-            h3_clean = _clean_heading(h3_text)
-
-            # H3 标题可能包含条款内容（需同时满足：有编号 + 冒号后有实质内容）
-            # 无编号的 H3（如 "### 规格型号、主要功能"）→ 纯标题，不作为条款
             num = _extract_number(h3_text)
-            if num and _has_clause_content(h3_text):
-                num = _extract_number(h3_text)
-                text = _extract_clause_text_from_heading(h3_text)
-                current_chapter.clauses.append(Clause(number=num, text=text[:200]))
-                # 保留编号，后续段落追加到此条款
+            if num:
+                clause_text = _extract_clause_text_from_heading(h3_text)
+                current_chapter.clauses.append(Clause(number=num, text=clause_text[:200]))
                 current_clause_num = num
                 current_clause_text = []
             else:
-                # 纯标题行，作为上下文记录
                 current_clause_num = None
-                current_clause_text = [f"【{h3_clean}】"]
+                current_clause_text = [f"【{_clean_heading(h3_text)}】"]
             continue
 
         if h2_match:
             _finalize_clause(current_chapter, current_clause_num, current_clause_text)
-            h2_text = h2_match.group(1)
             current_clause_num = None
-            current_clause_text = [f"【{_clean_heading(h2_text)}】"]
+            current_clause_text = [f"【{_clean_heading(h2_match.group(1))}】"]
             continue
 
-        # 检测段落级编号条款：1) 2.1.1  格式
-        # 用负向预查确保编号后是空格或特定分隔符，不是紧跟中文字符
+        # 段落级编号匹配
         clause_match = re.match(r'^\s*(\d+(?:\.\d+)*)[）\)\.、]\s+(.*)', stripped)
         if clause_match:
             _finalize_clause(current_chapter, current_clause_num, current_clause_text)
@@ -98,8 +192,6 @@ def parse_markdown_structure(markdown: str, doc_title: Optional[str] = None) -> 
             current_clause_text = [clause_match.group(2).strip()]
             continue
 
-        # 检测带编号的短条款：3.2.1 防护等级
-        # 排除 HTML 标签和 markdown 图片行
         if not stripped.startswith(("<", "!", "?")):
             clause_num_match = re.match(r'^(\d+(?:\.\d+)+)\s+(.*)', stripped)
             if clause_num_match and len(stripped) < 200:
@@ -108,77 +200,67 @@ def parse_markdown_structure(markdown: str, doc_title: Optional[str] = None) -> 
                 current_clause_text = [clause_num_match.group(2).strip()]
                 continue
 
-        # 检测表格标记 → 追加到上一个条款
         if stripped == "<TABLE>":
-            # 追加到上一条款的文本中
             if current_chapter and current_chapter.clauses:
                 last = current_chapter.clauses[-1]
-                if "[包含表格]" not in last.text:
+                if "[包含表格数据]" not in last.text:
                     last.text = last.text.rstrip() + " [包含表格数据]"
             continue
 
-        # 普通段落 → 追加到当前条款
         if current_clause_num:
             current_clause_text.append(stripped)
         else:
             current_clause_text.append(stripped)
 
     # 收尾
-    if current_chapter:
-        _finalize_clause(current_chapter, current_clause_num, current_clause_text)
+    _finalize_clause(current_chapter, current_clause_num, current_clause_text)
+    if current_chapter is not None:
+        current_chapter.text = "\n".join(lines[chapter_start_line:]).strip()
 
     total = sum(len(ch.clauses) for ch in chapters)
 
+    if not chapters:
+        return None
+
     return DocumentStructure(
-        title=doc_title or (chapters[0].title if chapters else None),
+        title=chapters[0].title if chapters else "",
         chapters=chapters,
         total_clauses=total,
     )
 
 
-# ── 内部辅助 ─────────────────────────────────────────────────────────────────
+# ── 内部辅助（保持不变） ─────────────────────────────────────────────────────
 
 def _flatten_html_tables(lines: list[str]) -> list[str]:
-    """将 HTML table 跨行合并为单行 <TABLE> 标记，避免表格内容被误解析。"""
     result = []
     in_table = False
     for line in lines:
         has_open = "<table" in line.lower()
         has_close = "</table>" in line.lower()
-
         if has_open and has_close:
-            # 单行表格 <table>...</table>
             result.append("<TABLE>")
             continue
-
         if has_open:
             in_table = True
             result.append("<TABLE>")
             continue
-
         if has_close:
             in_table = False
             continue
-
         if not in_table:
             result.append(line)
     return result
 
 
 def _clean_heading(raw: str) -> str:
-    """清理标题文本：去除加粗标记、编号前缀。"""
     text = raw.strip()
-    # 去除 **加粗**
     text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
-    # 去除尾部编号
     text = re.sub(r'^\d+(?:\.\d+)*\.?\s*', '', text).strip()
     return text
 
 
 def _extract_number(raw: str) -> str:
-    """从标题或行中提取章节/条款编号。"""
     text = raw.strip()
-    # 去掉 markdown 标题前缀（如 ### 或 ##）
     text = re.sub(r'^#{1,3}\s+', '', text)
     m = re.match(r'(\d+(?:\.\d+)*)', text)
     if m:
@@ -186,54 +268,22 @@ def _extract_number(raw: str) -> str:
     return ""
 
 
-def _has_clause_content(text: str) -> bool:
-    """判断 H2/H3 标题是否包含实质性条款内容。
-
-    判断规则：
-    1. 有编号 + 冒号后有3字以上内容 → 条款（正文在冒号后）
-    2. 有编号 + 无冒号或冒号后内容不足3字 → 只要长度>5就算条款
-       （如 "3.1.1. 规格型号、主要功能" 是条款，"3.1.1. 实施方案" 也算）
-    3. 无编号但有冒号 + 冒号后5字以上 → 条款
-    """
-    num = _extract_number(text)
-
-    if '：' in text or ':' in text:
-        parts = re.split(r'[：:]', text, 1)
-        after_colon = parts[1].strip() if len(parts) > 1 else ""
-        if num:
-            # 有编号：冒号后>=3字才算有实质内容
-            return len(after_colon) >= 3
-        else:
-            # 无编号：冒号后>=5字才算条款
-            return len(after_colon) >= 5
-
-    # 无冒号时
-    if num:
-        # 有编号的 H3/H2 → 只要编号存在就倾向算条款
-        # 除非清理后太短（如仅剩纯编号 "3.1.1"）
-        cleaned = _clean_heading(text)
-        return len(cleaned) > 5
-    return False
-
-
 def _extract_clause_text_from_heading(text: str) -> str:
-    """从 H3 标题行提取条款内容。"""
     cleaned = _clean_heading(text)
-    # 去掉编号前缀
     return re.sub(r'^\d+(?:\.\d+)*\.?\s*', '', cleaned).strip()
 
 
-def _finalize_clause(chapter: Chapter, clause_num: Optional[str], text_lines: list[str]):
-    """将累积的文本行保存为 Clause。"""
-    if not clause_num and not text_lines:
+def _finalize_clause(chapter: Optional[Chapter], clause_num: Optional[str], text_lines: list[str]):
+    if not clause_num or chapter is None:
         return
-
     text = " ".join(t for t in text_lines if t).strip()
     if not text:
         return
-
-    # 如果没编号但有内容，作为"附注"归入上下文
-    if not clause_num:
+    if chapter.clauses and chapter.clauses[-1].number == clause_num:
+        existing = chapter.clauses[-1].text
+        if text not in existing:
+            remaining = 200 - len(existing)
+            if remaining > 0:
+                chapter.clauses[-1].text = existing + " " + text[:remaining]
         return
-
     chapter.clauses.append(Clause(number=clause_num, text=text[:200]))

@@ -101,18 +101,35 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
         task.progress = 0.1
         repo.save_task(task)
 
-        # 执行审核 — 按章批量审核（20万字文档也只需要几次调用）
-        if use_quick_mode:
-            issues, raw_analysis = analysis_svc.quick_audit_with_llm(
-                doc, task.kb_ids, task.audit_types
+        # 执行审核 — 逐章处理，每章一次 LLM 调用
+        structure = doc.structure
+        chapters = structure.chapters if structure else []
+
+        all_issues = []
+        raw_parts = []
+        total = max(len(chapters), 1)
+
+        for i, chapter in enumerate(chapters):
+            task.progress = 0.1 + 0.8 * (i / total)
+            repo.save_task(task)
+
+            chapter_issues = analysis_svc.audit_chapter(
+                chapter_title=chapter.title,
+                clauses=chapter.clauses,
+                kb_ids=task.kb_ids,
+                audit_types=task.audit_types,
+                chapter_index=i,
+                chapter_text=chapter.text,
+                markdown=doc.parsed_content or "",
             )
-        else:
-            issues, raw_analysis = analysis_svc.analyze_document_by_chapter(
-                doc, task.kb_ids, task.audit_types
+            all_issues.extend(chapter_issues)
+            raw_parts.append(
+                f"{chapter.title}: 发现 {len(chapter_issues)} 个问题"
+                if chapter_issues else f"{chapter.title}: 无问题"
             )
 
-        task.progress = 0.9
-        repo.save_task(task)
+        issues = all_issues
+        raw_analysis = "\n".join(raw_parts)
 
         # 生成结果
         summary = ResultSummary(

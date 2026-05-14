@@ -469,6 +469,17 @@ CHAPTER_AUDIT_TOOL = {
 }
 
 
+def _build_chapter_from_clauses(clauses: list[Clause], markdown: str) -> str:
+    """从原始 markdown 中按条款编号拼接章节上下文。"""
+    parts = []
+    for c in clauses:
+        raw = _get_raw_context(c.number, markdown) if markdown else ""
+        parts.append(f"---\n条款 {c.number}: {c.text}")
+        if raw and len(raw) > len(c.text) + 20:
+            parts.append(f"【原始内容】\n{raw[:500]}")
+    return "\n".join(parts)
+
+
 def _get_raw_context(clause_number: str, markdown: str) -> str:
     """从原始 Markdown 中提取指定条款的完整上下文。
 
@@ -521,21 +532,26 @@ def audit_chapter(
     kb_ids: list[str],
     audit_types: list[AuditType],
     chapter_index: int,
+    chapter_text: str = "",
     markdown: str = "",
 ) -> list[AuditIssue]:
-    """批量审核一个章节内的所有条款，一次 LLM 调用。"""
-    # 构建条款列表：带上原始上下文
-    clause_lines = []
-    for c in clauses:
-        raw = _get_raw_context(c.number, markdown) if markdown else ""
-        clause_lines.append(f"---\n条款 {c.number}: {c.text}")
-        if raw:
-            # 如果原始内容比摘要丰富，附上
-            if len(raw) > len(c.text) + 20:
-                clause_lines.append(f"【原始内容】\n{raw[:500]}")
+    """审核一个章节，一次 LLM 调用。
 
-    all_clause_text = "\n".join(clause_lines)
-    kb_content = search_svc.get_kb_content_for_audit(kb_ids, all_clause_text[:500])
+    优先用 chapter_text（章节原文片段），fallback 到从 clauses + markdown
+    拼接。KB 检索以章节标题为查询，命中更精准。
+    """
+    # 构建本章的待审核文本
+    if chapter_text:
+        chapter_body = chapter_text[:15000]  # 每章最多 15000 字，适配 128K context
+    elif markdown:
+        # 降级：从 markdown 中按 clause 编号取上下文
+        chapter_body = _build_chapter_from_clauses(clauses, markdown)
+    else:
+        chapter_body = "\n".join(f"条款 {c.number}: {c.text}" for c in clauses)
+
+    # 用章节标题检索 KB（更聚焦）
+    kb_query = chapter_title if chapter_title and chapter_title != "前言" else chapter_body[:200]
+    kb_content = search_svc.get_kb_content_for_audit(kb_ids, kb_query)
 
     audit_types_str = "、".join({
         "compliance": "合规性",
@@ -562,8 +578,8 @@ def audit_chapter(
 编号: {chapter_index + 1}
 标题: {chapter_title}
 
-【本章条款】
-{all_clause_text}
+【本章原文】
+{chapter_body}
 
 {kb_content}
 

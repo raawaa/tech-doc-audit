@@ -16,6 +16,7 @@ class Chapter(BaseModel):
     number: Optional[str] = None
     title: str
     clauses: list[Clause] = Field(default_factory=list)
+    text: str = ""  # 章节原文（在 parsed_content 中的对应片段），用于逐章审核
 
 
 class DocumentStructure(BaseModel):
