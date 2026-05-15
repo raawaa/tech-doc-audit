@@ -1,0 +1,173 @@
+"""主题审核。
+
+流程：
+1. 预定义关键词在 parsed_content 全文定位相关段落
+2. KB 搜索
+3. 1 次 LLM 审核调用
+"""
+
+import re
+import json
+
+from models.audit_task import AuditIssue, IssueLocation, StandardRef
+from services.document_nav import DocumentNav
+
+
+AUDIT_TOPICS = [
+    {
+        "id": "tax_compliance",
+        "name": "增值税与税率合规",
+        "prompt": "审核投标报价中的增值税税率条款是否合规、税率调整机制是否合理、税务风险是否充分披露。",
+        "keywords": ["增值税", "税率", "税务", "不含税价", "发票", "税收", "税率调整"],
+    },
+    {
+        "id": "brand_restriction",
+        "name": "品牌限制与公平竞争",
+        "prompt": "审核技术规格中是否存在不合理品牌指定或限制竞争条款。",
+        "keywords": ["品牌", "型号", "原产地", "指定", "同等或以上"],
+    },
+    {
+        "id": "payment_terms",
+        "name": "费用与支付条款",
+        "prompt": "审核投标保证金、招标服务费、付款条件等费用条款是否明确合理。",
+        "keywords": ["保证金", "服务费", "付款", "费用", "报价", "金额"],
+    },
+    {
+        "id": "quality_warranty",
+        "name": "质保与验收要求",
+        "prompt": "审核质保期、验收标准、售后服务要求是否完整明确。",
+        "keywords": ["质保", "保修", "验收", "售后服务", "质量保证"],
+    },
+    {
+        "id": "liability_penalty",
+        "name": "责任与违约条款",
+        "prompt": "审核违约责任、赔偿限额、争议解决条款是否平衡合理。",
+        "keywords": ["违约", "赔偿", "责任", "争议", "罚款"],
+    },
+    {
+        "id": "scope_clarity",
+        "name": "采购范围与技术要求",
+        "prompt": "审核采购范围、技术规格、参数要求是否清晰无歧义。",
+        "keywords": ["范围", "规格", "参数", "要求", "标准", "技术"],
+    },
+    {
+        "id": "data_reasonableness",
+        "name": "数据与指标合理性",
+        "prompt": "审核文档中涉及的具体数据、指标、参数、报价金额、时限是否合理、一致、无矛盾。",
+        "keywords": ["★", "不低于", "不超过", "大于", "小于", "万元", "元/"],
+    },
+    {
+        "id": "completeness",
+        "name": "文档完整性",
+        "prompt": "审核文档是否有内容缺失、占位符未填写、引用不完整等问题。",
+        "keywords": ["【】", "___", "XX", "详见", "N/A"],
+    },
+]
+
+
+# ── 段落定位 ────────────────────────────────────────────────────────────────
+
+KEYWORD_CONTEXT_CHARS = 1500
+
+
+def locate_paragraphs(content: str, keywords: list[str]) -> str:
+    """在 parsed_content 全文搜关键词，取上下文的完整段落。"""
+    if not content or not keywords:
+        return ""
+    found = []
+    seen = set()
+    for kw in keywords:
+        for m in re.finditer(re.escape(kw), content, re.IGNORECASE):
+            start = max(0, m.start() - KEYWORD_CONTEXT_CHARS)
+            end = min(len(content), m.end() + KEYWORD_CONTEXT_CHARS)
+            key = (start // 1000, end // 1000)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(content[start:end].strip())
+            if len(found) >= 5:
+                break
+        if len(found) >= 5:
+            break
+    return "\n\n---\n\n".join(found) if found else ""
+
+
+# ── 审核 ────────────────────────────────────────────────────────────────────
+
+AUDIT_SYSTEM_PROMPT = """你是一个严格的技术文档审核专家。请对给定主题审核文档中的相关段落。
+
+对于每个发现的问题，返回 JSON：
+{"issues": [{"type": "compliance|completeness|consistency", "clause_number": "条款编号", "description": "描述", "severity": "high|medium|low", "standard_reference": {"standard_name": "", "standard_id": "", "clause": "", "requirement": ""}, "suggestion": "建议"}]}
+
+没有问题的主题返回 {"issues": []}。"""
+
+
+def audit_topic(
+    topic: dict,
+    doc_nav: DocumentNav,
+    kb_ids: list[str],
+    topic_index: int,
+    parsed_content: str,
+) -> list[AuditIssue]:
+    """一个主题：关键词定位段落 → 搜 KB → 1 次 LLM。"""
+    keywords = topic.get("keywords", [topic["name"]])
+    chapter_body = locate_paragraphs(parsed_content, keywords)
+    if not chapter_body:
+        chapter_body = "（文档中未找到匹配内容）"
+
+    user_prompt = f"""审核主题：{topic['name']}
+审核要求：{topic['prompt']}
+
+【文档相关段落】
+{chapter_body}
+
+请审核此主题在文档中的表现。"""
+
+    try:
+        from services.llm_client import generate
+        raw = generate(user_prompt, system_prompt=AUDIT_SYSTEM_PROMPT, timeout=180)
+        # generate() 返回 raw API JSON，需要先解析出 choices[0].message.content
+        response = json.loads(raw)
+        content = response.get("choices", [{}])[0].get("message", {}).get("content", raw)
+        import re
+        match = re.search(r'\{.*\}', content, re.DOTALL)
+        if match:
+            data = json.loads(match.group(0))
+            return _parse_issues(data, topic_index)
+    except Exception:
+        pass
+    return []
+
+
+def _search_kb(kb_ids: list[str], query: str) -> str:
+    import services.search_service as search_svc
+    try:
+        return search_svc.get_kb_content_for_audit(kb_ids, query)
+    except Exception:
+        return ""
+
+
+def _parse_issues(data: dict, topic_index: int) -> list[AuditIssue]:
+    issues = []
+    for i, item in enumerate(data.get("issues", [])):
+        std_ref = item.get("standard_reference")
+        issue = AuditIssue(
+            id=topic_index * 1000 + i + 1,
+            type=item.get("type", "completeness"),
+            location=IssueLocation(
+                clause_number=item.get("clause_number"),
+                original_text=item.get("description", "")[:200],
+            ),
+            description=item.get("description", ""),
+            severity=item.get("severity", "medium"),
+            suggestion=item.get("suggestion"),
+        )
+        if std_ref:
+            issue.standard_reference = StandardRef(
+                standard_name=std_ref.get("standard_name", ""),
+                standard_id=std_ref.get("standard_id", ""),
+                clause=std_ref.get("clause"),
+                requirement=std_ref.get("requirement"),
+            )
+        issues.append(issue)
+    return issues

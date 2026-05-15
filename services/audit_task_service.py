@@ -6,6 +6,7 @@ from models.audit_task import AuditTask, AuditResult, ResultSummary, AuditType
 import storage.audit_task_repo as repo
 import storage.audit_doc_repo as doc_repo
 import services.audit_analysis_service as analysis_svc
+import services.topic_audit as topic_audit
 
 
 def create_task(
@@ -101,31 +102,31 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
         task.progress = 0.1
         repo.save_task(task)
 
-        # 执行审核 — 逐章处理，每章一次 LLM 调用
-        structure = doc.structure
-        chapters = structure.chapters if structure else []
+        # 执行审核 — 主题式批量审核
+        # 1. LLM 生成关键词 → 在 parsed_content 定位相关段落
+        # 2. 搜 KB → 1 次 LLM 审核
+        topics = task.audit_topics if hasattr(task, 'audit_topics') and task.audit_topics else topic_audit.AUDIT_TOPICS
+        parsed_content = doc.parsed_content or ""
 
         all_issues = []
         raw_parts = []
-        total = max(len(chapters), 1)
+        total = max(len(topics), 1)
 
-        for i, chapter in enumerate(chapters):
+        for i, topic in enumerate(topics):
             task.progress = 0.1 + 0.8 * (i / total)
             repo.save_task(task)
 
-            chapter_issues = analysis_svc.audit_chapter(
-                chapter_title=chapter.title,
-                clauses=chapter.clauses,
+            topic_issues = topic_audit.audit_topic(
+                topic=topic,
+                doc_nav=None,
                 kb_ids=task.kb_ids,
-                audit_types=task.audit_types,
-                chapter_index=i,
-                chapter_text=chapter.text,
-                markdown=doc.parsed_content or "",
+                topic_index=i,
+                parsed_content=parsed_content,
             )
-            all_issues.extend(chapter_issues)
+            all_issues.extend(topic_issues)
             raw_parts.append(
-                f"{chapter.title}: 发现 {len(chapter_issues)} 个问题"
-                if chapter_issues else f"{chapter.title}: 无问题"
+                f"{topic['name']}: 发现 {len(topic_issues)} 个问题"
+                if topic_issues else f"{topic['name']}: 无问题"
             )
 
         issues = all_issues
