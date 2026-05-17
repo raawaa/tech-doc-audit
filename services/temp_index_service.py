@@ -6,11 +6,11 @@ from models.audit_document import AuditDocument
 import storage.audit_doc_repo as repo
 
 
-AUDIT_DOCS_DIR = Path(__file__).parent.parent / "data" / "audit_docs"
+AUDITS_DIR = Path(__file__).parent.parent / "data" / "audits"
 
 
 def _index_file(doc_id: str) -> Path:
-    return AUDIT_DOCS_DIR / doc_id / "tree_index.json"
+    return AUDITS_DIR / doc_id / "tree_index.json"
 
 
 def build_temp_index(doc: AuditDocument) -> AuditDocument:

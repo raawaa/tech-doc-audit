@@ -4,7 +4,6 @@ from pathlib import Path
 from models.document import KBDocument
 
 DATA_DIR = Path(__file__).parent.parent / "data"
-KB_INDEX_DIR = DATA_DIR / "kb_index"
 
 
 def _ensure_dir(path: Path) -> None:
@@ -12,7 +11,7 @@ def _ensure_dir(path: Path) -> None:
 
 
 def _kb_index_dir(kb_id: str) -> Path:
-    return KB_INDEX_DIR / kb_id
+    return DATA_DIR / "kbs" / kb_id / "index"
 
 
 def _index_file(kb_id: str, doc_id: str) -> Path:

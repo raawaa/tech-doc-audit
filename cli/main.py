@@ -125,11 +125,12 @@ def index_build(
 @index_app.command("rebuild")
 def index_rebuild(
     kb_id: str = typer.Option(..., "--kb-id", help="知识库 ID"),
-    model: str = typer.Option("qwen3.5:0.8b", "--model", "-m"),
+    model: str = typer.Option("", "--model", "-m", hidden=True),
 ):
-    typer.echo(f"开始重建知识库 {kb_id} 的索引...")
-    idx_svc.rebuild_kb_index(kb_id, model)
-    typer.echo("索引重建完成")
+    typer.echo(f"开始重建知识库 {kb_id} 的向量索引...")
+    from services.vector_search import rebuild_kb_index as rebuild_vec
+    rebuild_vec(kb_id)
+    typer.echo("向量索引重建完成")
 
 
 @index_app.command("status")

@@ -8,7 +8,7 @@ import shutil
 from models.knowledge_base import KnowledgeBase
 
 DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
-KB_META_DIR = DATA_DIR / "kb_meta"
+KBS_DIR = DATA_DIR / "kbs"
 
 
 def _ensure_dir(path: Path) -> None:
@@ -16,7 +16,7 @@ def _ensure_dir(path: Path) -> None:
 
 
 def _kb_dir(kb_id: str) -> Path:
-    return KB_META_DIR / kb_id
+    return KBS_DIR / kb_id
 
 
 def _kb_file(kb_id: str) -> Path:
@@ -46,10 +46,10 @@ def get(kb_id: str) -> Optional[KnowledgeBase]:
 
 
 def list_all() -> list[KnowledgeBase]:
-    if not KB_META_DIR.exists():
+    if not KBS_DIR.exists():
         return []
     results = []
-    for kb_dir in KB_META_DIR.iterdir():
+    for kb_dir in KBS_DIR.iterdir():
         if kb_dir.is_dir():
             kb_file = kb_dir / "kb.json"
             if kb_file.exists():

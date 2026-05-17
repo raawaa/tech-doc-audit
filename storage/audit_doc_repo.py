@@ -7,8 +7,6 @@ from typing import Optional
 from models.audit_document import AuditDocument
 
 DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
-AUDIT_DOCS_DIR = DATA_DIR / "audit_docs"
-AUDIT_META_DIR = AUDIT_DOCS_DIR / "meta"
 
 
 def _ensure_dir(path: Path) -> None:
@@ -16,7 +14,7 @@ def _ensure_dir(path: Path) -> None:
 
 
 def _doc_dir(doc_id: str) -> Path:
-    return AUDIT_DOCS_DIR / doc_id
+    return DATA_DIR / "audits" / doc_id / "doc"
 
 
 def _doc_file(doc_id: str, file_type: str) -> Path:
@@ -24,8 +22,7 @@ def _doc_file(doc_id: str, file_type: str) -> Path:
 
 
 def _meta_file(doc_id: str) -> Path:
-    _ensure_dir(AUDIT_META_DIR)
-    return AUDIT_META_DIR / f"{doc_id}.json"
+    return DATA_DIR / "audits" / doc_id / "meta.json"
 
 
 def _doc_to_json(doc: AuditDocument) -> dict:
@@ -56,14 +53,15 @@ def get_doc(doc_id: str) -> Optional[AuditDocument]:
 
 def list_docs() -> list[AuditDocument]:
     """列出所有待审核文档。"""
-    _ensure_dir(AUDIT_META_DIR)
+    audits_dir = DATA_DIR / "audits"
+    _ensure_dir(audits_dir)
     results = []
-    for f in AUDIT_META_DIR.iterdir():
-        if f.suffix == ".json":
-            with open(f, "r", encoding="utf-8") as fh:
+    for d in audits_dir.iterdir():
+        meta = d / "meta.json"
+        if meta.exists():
+            with open(meta, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             results.append(AuditDocument.from_dict(data))
-    # 按创建时间倒序
     results.sort(key=lambda d: d.created_at, reverse=True)
     return results
 
@@ -76,15 +74,8 @@ def update_doc(doc: AuditDocument) -> AuditDocument:
 
 def delete_doc(doc_id: str) -> bool:
     """删除文档及其文件。"""
-    # 删除元数据
-    meta_path = _meta_file(doc_id)
-    if meta_path.exists():
-        meta_path.unlink()
-
-    # 删除文档目录
-    doc_dir = _doc_dir(doc_id)
-    if doc_dir.exists():
+    audit_dir = DATA_DIR / "audits" / doc_id
+    if audit_dir.exists():
         import shutil
-        shutil.rmtree(doc_dir)
-
+        shutil.rmtree(audit_dir)
     return True

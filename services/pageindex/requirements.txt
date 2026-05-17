@@ -1,8 +1,0 @@
-# PageIndex 特有依赖（其余继承自主项目的 requirements.txt / requirements.lock）
-
-# PageIndex 框架（从 GitHub 安装）
-git+https://github.com/VectifyAI/PageIndex.git@main
-
-# PageIndex 依赖的 LLM 工具链（主项目不直接需要）
-litellm>=1.0.0
-aiofiles>=23.0.0

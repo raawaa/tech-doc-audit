@@ -8,7 +8,6 @@ import shutil
 from models.document import KBDocument
 
 DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
-KB_DOCS_DIR = DATA_DIR / "kb_docs"
 
 
 def _ensure_dir(path: Path) -> None:
@@ -16,11 +15,11 @@ def _ensure_dir(path: Path) -> None:
 
 
 def _kb_docs_dir(kb_id: str) -> Path:
-    return KB_DOCS_DIR / kb_id
+    return DATA_DIR / "kbs" / kb_id / "docs"
 
 
 def _doc_meta_dir(kb_id: str) -> Path:
-    return DATA_DIR / "kb_meta" / kb_id
+    return DATA_DIR / "kbs" / kb_id / "meta"
 
 
 def _doc_meta_file(kb_id: str, doc_id: str) -> Path:
@@ -45,7 +44,11 @@ def save_doc(kb_id: str, original_name: str, content: bytes, file_type: str) -> 
         file_type=file_type,
         file_path="",
     )
-    doc.file_path = str(_kb_docs_dir(kb_id) / f"{doc.id}.{file_type}")
+    # 文件名 = 原名 + ULID（保留原名可提高搜索命中率）
+    import re as _re
+    _stem = _re.sub(r'[^\w\s一-鿿\-]', '', Path(original_name).stem)[:80] or "doc"
+    _stem = _re.sub(r'\s+', '_', _stem)
+    doc.file_path = str(_kb_docs_dir(kb_id) / f"{_stem}_{doc.id}.{file_type}")
     with open(doc.file_path, "wb") as f:
         f.write(content)
     _ensure_dir(_doc_meta_dir(kb_id))

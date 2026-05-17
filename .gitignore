@@ -18,12 +18,8 @@ ENV/
 .env.local
 
 # Data
-data/documents/
-data/kb_docs/
-data/kb_index/
-data/kb_meta/
-data/audit_docs/
-data/audit_tasks/
+data/kbs/
+data/audits/
 *.pdf
 *.doc
 *.docx
@@ -44,3 +40,6 @@ logs/
 
 # PageIndex cache
 .pageindex/
+
+# Benchmark cache
+benchmark/_cache/

@@ -115,13 +115,19 @@ def audit_topic(
     if not chapter_body:
         chapter_body = "（文档中未找到匹配内容）"
 
+    # 从知识库检索相关标准/制度条文（用预定义关键词直接搜索）
+    kb_reference = _search_kb_by_keywords(kb_ids, keywords, topic["name"])
+
     user_prompt = f"""审核主题：{topic['name']}
 审核要求：{topic['prompt']}
 
 【文档相关段落】
 {chapter_body}
 
-请审核此主题在文档中的表现。"""
+【知识库参考依据】
+{kb_reference}
+
+请参照知识库中的标准/制度内容，审核文档中的相关段落是否合规。对比检查是否存在不一致、违规或遗漏之处。"""
 
     try:
         from services.llm_client import generate
@@ -145,6 +151,19 @@ def _search_kb(kb_ids: list[str], query: str) -> str:
         return search_svc.get_kb_content_for_audit(kb_ids, query)
     except Exception:
         return ""
+
+
+def _search_kb_by_keywords(kb_ids: list[str], keywords: list[str], topic_name: str = "") -> str:
+    """用预定义关键词搜索知识库，跳过 LLM 提取步骤。"""
+    try:
+        from services.vector_search import search_by_keywords
+        result = search_by_keywords(kb_ids, keywords, topic_name)
+        if result:
+            return result
+    except Exception:
+        pass
+    # 降级到普通搜索
+    return _search_kb(kb_ids, topic_name)
 
 
 def _parse_issues(data: dict, topic_index: int) -> list[AuditIssue]:

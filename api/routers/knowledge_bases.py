@@ -104,9 +104,10 @@ def reindex_kb(kb_id: str):
     if not kb:
         raise HTTPException(status_code=404, detail="知识库不存在")
 
-    # 异步处理（简化版：同步阻塞）
-    idx_svc.rebuild_kb_index(kb_id)
-    return {"message": "索引重建完成"}
+    # 重建向量索引
+    from services.vector_search import rebuild_kb_index as rebuild_vec
+    rebuild_vec(kb_id)
+    return {"message": "向量索引重建完成"}
 
 
 @router.get("/{kb_id}/documents", response_model=list[KBDocumentResponse])
