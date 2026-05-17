@@ -1,9 +1,9 @@
 """向量检索服务 — 本地 embedding + cosine similarity。
 
-文档分块 → bge-m3 embedding → numpy 余弦相似度 → 稳定快速。
+段落感知分块 → bge-m3 embedding → numpy 余弦相似度 → 稳定快速。
 
 流程：
-1. 文档导入 KB 时自动分块 + embedding 持久化到 data/kbs/{kb_id}/vectors/
+1. 文档导入 KB 时自动分块（段落感知） + embedding 持久化到 data/kbs/{kb_id}/vectors/
 2. 搜索时 embedding query → cosine similarity 召回
 3. 纯文本关键词搜索保留为最终降级
 """
@@ -53,16 +53,83 @@ def _get_model():
 
 # ── 文本分块 ──────────────────────────────────────────────────────────────
 
-MAX_CHARS = 512
-OVERLAP = 128
+# ── 分块参数 ──────────────────────────────────────────────────────────────
+
+MAX_CHUNK_CHARS = 512    # 单个 chunk 最大字符数
+MIN_CHUNK_CHARS = 80     # 短 chunk 合并阈值（< 此长度合并到相邻段）
+OVERLAP_CHARS = 50       # 相邻 chunk 间重叠字符数
 
 
 def _chunk_text(text: str) -> list[str]:
-    """滑动窗口分块，块间重叠。大文本性能好（O(n) 切片，无段落迭代）。"""
-    step = MAX_CHARS - OVERLAP
-    return [text[i:i + MAX_CHARS].strip()
-            for i in range(0, max(len(text) - step + 1, 1), step)
-            if text[i:i + MAX_CHARS].strip()] or [text[:MAX_CHARS]]
+    """段落感知分块 — 多遍流水线，保持技术标准条文完整。
+
+    1. 按双换行拆段落（自然段边界）
+    2. 合并过短段落（避免碎片）
+    3. 过长段落先按单换行拆句，仍超长降级到滑动窗口
+    4. 相邻 chunk 间加少量重叠，防止边界处条文编号丢失
+    """
+    # 1. 按双换行拆段落
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return [text[:MAX_CHUNK_CHARS]]
+
+    # 2. 合并短段落到下一个
+    merged: list[str] = []
+    i = 0
+    while i < len(paragraphs):
+        chunk = paragraphs[i]
+        if len(chunk) < MIN_CHUNK_CHARS and i + 1 < len(paragraphs):
+            paragraphs[i + 1] = chunk + "\n" + paragraphs[i + 1]
+            i += 1
+            continue
+        merged.append(chunk)
+        i += 1
+
+    # 3. 拆分过长 chunk
+    refined: list[str] = []
+    for chunk in merged:
+        if len(chunk) <= MAX_CHUNK_CHARS:
+            refined.append(chunk)
+            continue
+        # 先按单换行拆句
+        lines = [line.strip() for line in chunk.split("\n") if line.strip()]
+        if not lines:
+            refined.append(chunk)
+            continue
+        current = ""
+        for line in lines:
+            prospective = (current + "\n" + line).strip() if current else line
+            if len(prospective) <= MAX_CHUNK_CHARS:
+                current = prospective
+            else:
+                if current:
+                    refined.append(current)
+                # 单行仍超长 → 降级滑动窗口
+                if len(line) > MAX_CHUNK_CHARS:
+                    step = MAX_CHUNK_CHARS - OVERLAP_CHARS
+                    refined.extend(
+                        line[i : i + MAX_CHUNK_CHARS].strip()
+                        for i in range(0, len(line), step)
+                        if line[i : i + MAX_CHUNK_CHARS].strip()
+                    )
+                    current = ""
+                else:
+                    current = line
+        if current:
+            refined.append(current)
+
+    # 4. 相邻 chunk 间加重叠
+    if not refined:
+        return [text[:MAX_CHUNK_CHARS]]
+    if len(refined) == 1:
+        return refined
+    result = [refined[0]]
+    for j in range(1, len(refined)):
+        prev = refined[j - 1]
+        curr = refined[j]
+        prefix = prev[-OVERLAP_CHARS:] if len(prev) > OVERLAP_CHARS else prev
+        result.append(prefix + "\n" + curr)
+    return result
 
 
 
