@@ -1,7 +1,7 @@
 [project]
 name = "jishu-shenhe"
 version = "0.1.0"
-description = "技术文档智能审核系统 — FastAPI + PageIndex"
+description = "技术文档智能审核系统 — FastAPI + 向量检索"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -12,7 +12,7 @@ dependencies = [
     "pdfplumber>=0.10.0",
     "python-docx>=1.1.0",
     "reportlab>=4.0.0",
-    "mineru>=0.5.0",
+    "mineru[pipeline]>=0.5.0",
     # API 服务
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
@@ -22,6 +22,8 @@ dependencies = [
     "typer>=0.9.0",
     # 工具库
     "python-ulid>=2.0.0",
+    "sentence-transformers>=5.5.0",
+    "modelscope>=1.36.3",
 ]
 
 [dependency-groups]
@@ -32,7 +34,7 @@ requires = ["setuptools>=75.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["cli*", "api*", "models*", "services*", "storage*"]
+include = ["cli*", "api*", "models*", "services*", "storage*", "benchmark*"]
 exclude = ["tests*", "scripts*", "sample_docs*", "frontend*", "data*", "logs*"]
 
 [tool.uv.sources]

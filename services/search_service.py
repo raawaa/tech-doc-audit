@@ -1,10 +1,11 @@
 """检索服务。
 
-集成 PageIndex 推理式检索作为首选，关键词匹配作为降级。
+向量检索为首选（bge-m3 + numpy），关键词匹配为降级。
 
 环境变量：
-  SEARCH_ENGINE=pageindex    # (默认) 使用 PageIndex 推理式检索
-  SEARCH_ENGINE=keyword      # 使用传统关键词匹配
+  SEARCH_ENGINE=vector    # (默认) 向量检索（bge-m3 embedding + cosine similarity）
+  SEARCH_ENGINE=pageindex # 使用 PageIndex 推理式检索（旧版）
+  SEARCH_ENGINE=keyword   # 使用传统关键词匹配
 """
 
 import json
@@ -17,9 +18,14 @@ import storage.index_repo as index_repo
 from services.llm_client import generate
 
 
+def _use_vector_search() -> bool:
+    """判断是否使用向量检索（默认）。"""
+    return os.environ.get("SEARCH_ENGINE", "vector").lower() == "vector"
+
+
 def _use_pageindex() -> bool:
-    """判断是否使用 PageIndex。"""
-    return os.environ.get("SEARCH_ENGINE", "pageindex").lower() == "pageindex"
+    """判断是否使用 PageIndex（旧版）。"""
+    return os.environ.get("SEARCH_ENGINE", "").lower() == "pageindex"
 
 
 def search_in_knowledge_base(kb_id: str, query: str, max_results: int = 5) -> list[dict]:
@@ -27,6 +33,10 @@ def search_in_knowledge_base(kb_id: str, query: str, max_results: int = 5) -> li
     kb = kb_repo.get(kb_id)
     if not kb:
         return []
+
+    if _use_vector_search():
+        from services.vector_search import search
+        return search([kb_id], query, max_results)
 
     if _use_pageindex():
         from services.pageindex_search import pageindex_search
@@ -38,6 +48,10 @@ def search_in_knowledge_base(kb_id: str, query: str, max_results: int = 5) -> li
 
 def search_multiple_kbs(kb_ids: list[str], query: str, max_results: int = 10) -> list[dict]:
     """在多个知识库中检索。"""
+    if _use_vector_search():
+        from services.vector_search import search
+        return search(kb_ids, query, max_results)
+
     if _use_pageindex():
         from services.pageindex_search import pageindex_search
         return pageindex_search(kb_ids, query, max_results)
@@ -121,6 +135,13 @@ def _text_matches(query: str, text: str) -> bool:
 
 def get_kb_content_for_audit(kb_ids: list[str], clause_text: str) -> str:
     """获取相关知识库内容用于审核分析。"""
+    if _use_vector_search():
+        from services.vector_search import get_kb_content
+        try:
+            return get_kb_content(kb_ids, clause_text)
+        except Exception:
+            pass  # 降级到关键词
+
     if _use_pageindex():
         from services.pageindex_search import pageindex_get_kb_content
         try:

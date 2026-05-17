@@ -6,20 +6,14 @@ env_path = Path(__file__).resolve().parent.parent / ".env"
 if env_path.exists():
     load_dotenv(env_path)
 
-# PageIndex 路径
-_pageindex_path = Path(__file__).resolve().parent.parent.parent / "Code" / "PageIndex"
-if _pageindex_path.exists():
-    import sys
-    sys.path.insert(0, str(_pageindex_path))
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routers import knowledge_bases, documents, audit_docs, audit_tasks
+from api.routers import knowledge_bases, documents, audit_docs, audit_tasks, kb_search_chat
 
 app = FastAPI(
     title="技术文档审核系统 API",
-    description="基于 Dify + PageIndex 的技术文档智能审核系统",
+    description="技术文档智能审核系统",
     version="0.1.0",
 )
 
@@ -37,6 +31,7 @@ app.include_router(knowledge_bases.router)
 app.include_router(documents.router)
 app.include_router(audit_docs.router)
 app.include_router(audit_tasks.router)
+app.include_router(kb_search_chat.router)
 
 
 @app.get("/")

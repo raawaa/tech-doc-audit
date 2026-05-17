@@ -1,6 +1,6 @@
 # 技术文档审核系统
 
-基于 Dify + PageIndex 的技术文档智能审核系统。
+技术文档智能审核系统。
 
 ## 项目概述
 
@@ -154,8 +154,7 @@ jishu_shenhe/
 jishu_shenhe/
 ├── docker-compose.yml      # Docker 服务编排
 ├── services/               # 各服务配置
-│   ├── ollama/             # Ollama 配置
-│   └── pageindex/          # PageIndex 配置
+│   └── ollama/             # Ollama 配置
 ├── tests/                  # 测试脚本
 ├── scripts/                # 工具脚本
 ├── sample_docs/            # 示例文档
@@ -170,11 +169,11 @@ jishu_shenhe/
 | 组件 | 技术 |
 |------|------|
 | LLM | Ollama / MiniMax / OpenAI（通过 `LLM_PROVIDER` 配置） |
-| 检索引擎 | PageIndex（推理式检索） |
+| 检索引擎 | 本地向量检索（bge-m3 + numpy） |
 | 后端框架 | FastAPI |
 | 前端 | React + TypeScript + Vite + Tailwind CSS |
 | 存储 | 文件系统 + JSON 元数据 |
-| 部署 | Docker Compose（Ollama + PageIndex + API + 前端） |
+| 部署 | Docker Compose（Ollama + API + 前端） |
 
 ## 文档
 

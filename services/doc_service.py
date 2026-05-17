@@ -7,6 +7,7 @@ from models.document import KBDocument
 from models.knowledge_base import KnowledgeBase
 import storage.doc_repo as doc_repo
 import storage.kb_repo as kb_repo
+from services.vector_search import index_document as _index_vec
 
 
 def _detect_file_type(filename: str) -> Optional[str]:
@@ -21,6 +22,10 @@ def import_document(kb_id: str, original_name: str, content: bytes) -> KBDocumen
         raise ValueError(f"不支持的文件格式: {original_name}")
 
     doc = doc_repo.save_doc(kb_id, original_name, content, file_type)
+
+    # 无需预建索引，文档导入即 ready
+    doc.index_status = "ready"
+    doc_repo._save_doc_meta(doc)
 
     # 提取 PDF 页数等元数据
     if file_type == "pdf":
@@ -40,6 +45,13 @@ def import_document(kb_id: str, original_name: str, content: bytes) -> KBDocumen
     if kb and doc.id not in kb.document_ids:
         kb.document_ids.append(doc.id)
         kb_repo.update(kb)
+
+    # 自动建立向量索引（局部导入，免去手动 index rebuild）
+    if doc.file_path:
+        try:
+            _index_vec(kb_id, doc.id, doc.file_path)
+        except Exception:
+            pass
 
     return doc
 
