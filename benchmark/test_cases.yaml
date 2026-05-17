@@ -1,0 +1,64 @@
+test_cases:
+  - id: "procurement_contract"
+    topic_id: "payment_terms"
+    query: "招标采购 合同管理办法 签订"
+    description: "应检索到采购合同签订条款"
+    expected_chunks:
+      - content_keywords: ["采购部", "框架服务合同"]
+        relevance: "must_match"
+
+  - id: "triple_major_decision"
+    topic_id: "scope_clarity"
+    query: "三重一大 决策范围"
+    description: "应检索到三重一大决策制度"
+    expected_chunks:
+      - content_keywords: ["三重一大", "决策"]
+        relevance: "must_match"
+
+  - id: "safety_risk"
+    topic_id: "completeness"
+    query: "安全风险 双重预防 隐患排查"
+    description: "应检索到安全管理相关制度"
+    expected_chunks:
+      - content_keywords: ["双重预防", "安全隐患"]
+        relevance: "should_match"
+
+  - id: "fixed_asset"
+    topic_id: "completeness"
+    query: "固定资产 管理办法"
+    description: "应检索到固定资产财务管理办法"
+    expected_chunks:
+      - content_keywords: ["固定资产", "财务管理办法"]
+        relevance: "must_match"
+
+  - id: "party_meeting"
+    topic_id: "scope_clarity"
+    query: "党委会议事规则"
+    description: "应检索到党委会议事决策制度"
+    expected_chunks:
+      - content_keywords: ["党委会议事", "决策规则"]
+        relevance: "must_match"
+
+  - id: "seal_management"
+    topic_id: "completeness"
+    query: "印章 证照 管理办法"
+    description: "应检索到印章证照管理制度"
+    expected_chunks:
+      - content_keywords: ["行政印章", "企业证照"]
+        relevance: "should_match"
+
+  - id: "complaint_letter"
+    topic_id: "completeness"
+    query: "信访工作 管理办法"
+    description: "应检索到信访管理制度"
+    expected_chunks:
+      - content_keywords: ["信访工作", "管理办法"]
+        relevance: "must_match"
+
+  - id: "performance_appraisal"
+    topic_id: "data_reasonableness"
+    query: "绩效奖励分配 办法"
+    description: "应检索到绩效考核办法"
+    expected_chunks:
+      - content_keywords: ["绩效奖励", "分配办法"]
+        relevance: "must_match"

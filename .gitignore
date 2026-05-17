@@ -18,11 +18,13 @@ ENV/
 .env.local
 
 # Data
-data/kbs/
-data/audits/
+data/
 *.pdf
 *.doc
 *.docx
+
+# Generated output
+audit_report_*.txt
 
 # IDE
 .idea/
