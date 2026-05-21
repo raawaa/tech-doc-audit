@@ -5,7 +5,6 @@ from pydantic import BaseModel
 from typing import Literal
 
 import services.kb_service as kb_svc
-import services.indexing_service as idx_svc
 import storage.doc_repo as doc_repo
 
 router = APIRouter(prefix="/api/v1/knowledge-bases", tags=["knowledge-bases"])

@@ -3,7 +3,6 @@ from typing import Optional, Literal
 
 import services.kb_service as kb_svc
 import services.doc_service as doc_svc
-import services.indexing_service as idx_svc
 import services.audit_doc_service as audit_doc_svc
 import services.structure_service as structure_svc
 import services.temp_index_service as temp_index_svc
@@ -101,25 +100,6 @@ def doc_delete(
     else:
         typer.echo(f"删除失败: {doc_id}")
         raise typer.Exit(1)
-
-
-@index_app.command("build")
-def index_build(
-    kb_id: str = typer.Option(..., "--kb-id", help="知识库 ID"),
-    doc_id: str = typer.Option(..., "--doc-id", help="文档 ID"),
-    model: str = typer.Option("qwen3.5:0.8b", "--model", "-m"),
-):
-    """为知识库中的指定文档构建索引"""
-    import storage.doc_repo as doc_repo
-
-    doc = doc_repo.get_doc(kb_id, doc_id)
-    if not doc:
-        typer.echo(f"文档不存在: {doc_id}")
-        raise typer.Exit(1)
-
-    typer.echo(f"开始构建文档 {doc.name} 的索引...")
-    idx_svc.build_index_for_doc(doc, model)
-    typer.echo(f"索引构建完成，状态: {doc.index_status}")
 
 
 @index_app.command("rebuild")
