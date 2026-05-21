@@ -34,7 +34,11 @@ audit_report_*.txt
 
 # OS
 .DS_Store
+._*
 Thumbs.db
+
+# Mount artifacts
+Users/
 
 # Logs
 logs/
