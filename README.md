@@ -6,32 +6,16 @@
 
 用户上传技术文档（如招标文件），系统通过知识库（技术标准、规范）对比审核，生成详细的审核报告。
 
-## 当前阶段
+## 当前状态
 
-**阶段五：前端界面** ✓
+已完成 LlamaIndex 迁移，向量检索从 numpy 暴力搜索升级为 FAISS ANN，LLM 调用统一为 LlamaIndex Settings。
 
-已完成：
-- React + TypeScript SPA 应用
-- 知识库管理页面
-- 待审核文档管理页面
-- 审核流程与结果展示
-- JSON 报告导出
+**核心能力：**
+- 知识库管理：上传 PDF/DOCX，自动分块 + embedding（bge-m3），FAISS 索引
+- 文档审核：Agent 动态主题选择 + 8 个预定义维度，关键词段落定位，向量检索知识库，LLM 对比判断
+- 审核报告：结构化输出（问题列表、严重级别、标准依据、修改建议）
 
-**阶段四：审核核心流程** ✓
-- 审核任务管理
-- 知识库检索
-- LLM 审核分析
-
-**阶段三：文档处理** ✓
-- 待审核文档上传、解析、结构识别
-
-**阶段二：知识库管理** ✓
-- 知识库 CRUD API
-- 文档导入与索引
-
-**阶段一：基础设施搭建** ✓
-- Ollama + Qwen3.5-0.8B
-- PageIndex 验证
+**技术栈：** Python 3.12 + FastAPI + LlamaIndex（VectorStoreIndex/FAISS、LLM、Agent）+ React/Vite/Tailwind CSS
 
 ## 快速开始
 
