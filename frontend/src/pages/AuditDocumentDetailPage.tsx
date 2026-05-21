@@ -103,13 +103,13 @@ export function AuditDocumentDetailPage() {
 
       {/* Quick Result View */}
       {completedTask && (
-        <AuditResultCard taskId={completedTask.id} />
+        <AuditResultCard docId={id!} taskId={completedTask.id} />
       )}
     </div>
   )
 }
 
-function AuditResultCard({ taskId }: { taskId: string }) {
+function AuditResultCard({ docId, taskId }: { docId: string; taskId: string }) {
   const { data: result, isLoading } = useQuery({
     queryKey: ['audit-result', taskId],
     queryFn: () => auditTaskApi.getResult(taskId),
@@ -124,7 +124,7 @@ function AuditResultCard({ taskId }: { taskId: string }) {
       <div className="px-6 py-4 border-b flex justify-between items-center">
         <h2 className="text-lg font-semibold">审核结果</h2>
         <Link
-          to={`/audit/result/${taskId}`}
+          to={`/audit/${docId}/result/${taskId}`}
           className="text-blue-600 hover:text-blue-800 text-sm"
         >
           查看完整报告 →

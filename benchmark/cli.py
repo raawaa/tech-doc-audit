@@ -74,37 +74,20 @@ def inspect(
     kb_id: str = typer.Option(..., "--kb-id", help="知识库 ID"),
     max_chunks: int = typer.Option(10, "--max", help="最多显示 chunks"),
 ):
-    """查看 KB 中已有的向量 chunks（辅助编写测试用例）。"""
-    import json as _json
-    from services.vector_search import _vec_dir
+    """查看 KB 的 FAISS 索引状态。"""
+    from core.index_manager import get_kb_index_built, _vectors_dir
 
-    d = _vec_dir(kb_id)
-    if not d.exists():
-        typer.echo(f"KB {kb_id} 没有向量索引")
+    if not get_kb_index_built(kb_id):
+        typer.echo(f"KB {kb_id} 没有 FAISS 索引")
         raise typer.Exit(1)
 
-    index_file = d / "indexes.json"
-    if not index_file.exists():
-        typer.echo("没有 indexes.json")
-        raise typer.Exit(1)
-
-    idx = _json.loads(index_file.read_text(encoding="utf-8"))
-    shown = 0
-    for doc_id in idx.get("docs", []):
-        chunk_file = d / f"{doc_id}_chunks.json"
-        if not chunk_file.exists():
-            continue
-        chunks = _json.loads(chunk_file.read_text(encoding="utf-8"))
-        for i, chunk_text in enumerate(chunks.get("chunks", [])):
-            if shown >= max_chunks:
-                break
-            typer.echo(f"\n── chunk {doc_id}[{i}] ──")
-            typer.echo(chunk_text[:300])
-            shown += 1
-        if shown >= max_chunks:
-            break
-
-    typer.echo(f"\n共显示 {shown} 个 chunk")
+    d = _vectors_dir(kb_id)
+    import os as _os
+    index_path = d / "faiss.index"
+    file_size = _os.path.getsize(str(index_path)) if index_path.exists() else 0
+    typer.echo(f"FAISS 索引: {index_path}")
+    typer.echo(f"文件大小: {file_size / 1024:.1f} KB")
+    typer.echo(f"目录内容: {[p.name for p in d.iterdir()]}")
 
 
 def _resolve_kb_ids(kb_ids_str: str) -> list[str]:

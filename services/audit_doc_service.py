@@ -16,6 +16,9 @@ from typing import Optional
 
 from models.audit_document import AuditDocument
 import storage.audit_doc_repo as repo
+from core.logger import get_logger
+
+_logger = get_logger(__name__)
 
 
 # ── MinerU 探测 ──────────────────────────────────────────────────────────────
@@ -156,15 +159,16 @@ def _parse_with_mineru(doc: AuditDocument) -> bool:
                         if pi is not None:
                             page_nums.add(int(pi))
                     doc.page_count = max(len(page_nums), 1) if page_nums else None
-                except Exception:
-                    pass
+                except Exception as e:
+                    _logger.warning("failed to parse content_list for page count: %s", e)
 
             if doc.page_count is None:
                 doc.page_count = _estimate_page_count(doc.parsed_content)
 
             return True
 
-    except Exception:
+    except Exception as e:
+        _logger.warning("mineru parse failed for %s: %s", doc.id, e)
         return False
 
 

@@ -20,7 +20,6 @@ from pypdf import PdfReader, PdfWriter
 
 import storage.kb_repo as kb_repo
 from services.doc_service import import_document
-from services.vector_search import _vec_dir, _load_idx, _save_idx
 
 
 def extract_outline_all(pdf_path: str) -> list[dict]:
@@ -124,19 +123,6 @@ def split_and_import_all(kb_id: str, pdf_path: str):
             print(f"   [{imported}/{len(valid)}] {e['name'][:50]}")
 
     print(f"\n导入完成: {imported}/{len(valid)} 个")
-
-    # 清理旧的大文档索引
-    old_id = Path(pdf_path).stem
-    if old_id.startswith("01K"):
-        vd = _vec_dir(kb_id)
-        for sf in [vd / f"{old_id}_chunks.json", vd / f"{old_id}_emb.npy"]:
-            if sf.exists():
-                sf.unlink()
-        idx = _load_idx(kb_id)
-        if old_id in idx["docs"]:
-            idx["docs"].remove(old_id)
-            _save_idx(kb_id, idx)
-
     print("✓ 完成")
 
 

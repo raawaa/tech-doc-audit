@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -6,7 +7,8 @@ from models.audit_document import AuditDocument
 import storage.audit_doc_repo as repo
 
 
-AUDITS_DIR = Path(__file__).parent.parent / "data" / "audits"
+DATA_BASE = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
+AUDITS_DIR = DATA_BASE / "audits"
 
 
 def _index_file(doc_id: str) -> Path:

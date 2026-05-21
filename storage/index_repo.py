@@ -1,9 +1,10 @@
 import json
+import os
 from pathlib import Path
 
 from models.document import KBDocument
 
-DATA_DIR = Path(__file__).parent.parent / "data"
+DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 
 
 def _ensure_dir(path: Path) -> None:

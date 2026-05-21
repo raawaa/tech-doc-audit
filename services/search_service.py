@@ -16,6 +16,9 @@ import storage.kb_repo as kb_repo
 import storage.doc_repo as doc_repo
 import storage.index_repo as index_repo
 from services.llm_client import generate
+from core.logger import get_logger
+
+_logger = get_logger(__name__)
 
 
 def _use_vector_search() -> bool:
@@ -139,15 +142,15 @@ def get_kb_content_for_audit(kb_ids: list[str], clause_text: str) -> str:
         from services.vector_search import get_kb_content
         try:
             return get_kb_content(kb_ids, clause_text)
-        except Exception:
-            pass  # 降级到关键词
+        except Exception as e:
+            _logger.warning("vector kb content failed, falling back: %s", e)
 
     if _use_pageindex():
         from services.pageindex_search import pageindex_get_kb_content
         try:
             return pageindex_get_kb_content(kb_ids, clause_text)
-        except Exception:
-            pass  # 降级到关键词
+        except Exception as e:
+            _logger.warning("pageindex kb content failed, falling back: %s", e)
 
     results = search_multiple_kbs(kb_ids, clause_text, max_results=5)
     if not results:
@@ -185,5 +188,6 @@ def use_llm_search(kb_ids: list[str], query: str, max_results: int = 3) -> str:
     try:
         llm_output = generate(user_prompt, system_prompt=system_prompt, timeout=60)
         return llm_output
-    except Exception:
+    except Exception as e:
+        _logger.warning("LLM search failed: %s", e)
         return ""

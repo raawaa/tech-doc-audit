@@ -15,7 +15,7 @@ function App() {
         <Route path="/knowledge-bases/:id" element={<KnowledgeBaseDetailPage />} />
         <Route path="/audit" element={<AuditDocumentsPage />} />
         <Route path="/audit/:id" element={<AuditDocumentDetailPage />} />
-        <Route path="/audit/result/:taskId" element={<AuditResultPage />} />
+        <Route path="/audit/:id/result/:taskId" element={<AuditResultPage />} />
       </Routes>
     </Layout>
   )

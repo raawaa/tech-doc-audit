@@ -24,6 +24,13 @@ dependencies = [
     "python-ulid>=2.0.0",
     "sentence-transformers>=5.5.0",
     "modelscope>=1.36.3",
+    "llama-index-core>=0.14.22",
+    "llama-index-vector-stores-faiss>=0.6.0",
+    "llama-index-embeddings-huggingface>=0.7.0",
+    "faiss-cpu>=1.13.2",
+    "llama-index-llms-ollama>=0.10.1",
+    "llama-index-llms-openai>=0.7.8",
+    "socksio>=1.0.0",
 ]
 
 [dependency-groups]
@@ -34,7 +41,7 @@ requires = ["setuptools>=75.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["cli*", "api*", "models*", "services*", "storage*", "benchmark*"]
+include = ["cli*", "api*", "core*", "models*", "services*", "storage*", "benchmark*"]
 exclude = ["tests*", "scripts*", "sample_docs*", "frontend*", "data*", "logs*"]
 
 [tool.uv.sources]

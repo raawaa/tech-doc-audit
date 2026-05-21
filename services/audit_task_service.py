@@ -102,11 +102,20 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
         task.progress = 0.1
         repo.save_task(task)
 
-        # 执行审核 — 主题式批量审核
-        # 1. LLM 生成关键词 → 在 parsed_content 定位相关段落
-        # 2. 搜 KB → 1 次 LLM 审核
-        topics = task.audit_topics if hasattr(task, 'audit_topics') and task.audit_topics else topic_audit.AUDIT_TOPICS
+        # 确保 parsed_content 先于任何使用定义
         parsed_content = doc.parsed_content or ""
+
+        # 执行审核 — 主题式批量审核
+        # 1. LLM Agent 分析文档 → 确定审核主题
+        # 2. 关键词定位段落 + 搜 KB → 1 次 LLM 审核
+        if hasattr(task, 'audit_topics') and task.audit_topics:
+            topics = task.audit_topics  # 用户指定的主题
+        else:
+            # Agent 动态主题选择，降级到固定主题
+            from services.agent_audit import determine_audit_topics
+            topics = determine_audit_topics(parsed_content, task.kb_ids)
+            if not topics:
+                topics = topic_audit.AUDIT_TOPICS
 
         all_issues = []
         raw_parts = []

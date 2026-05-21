@@ -5,6 +5,9 @@ from models.audit_task import AuditIssue, AuditType, IssueLocation, StandardRef
 from models.audit_document import AuditDocument, Clause
 import services.search_service as search_svc
 from services.llm_client import generate, generate_with_tools
+from core.logger import get_logger
+
+_logger = get_logger(__name__)
 
 
 # Function/tool definition for audit issues
@@ -124,7 +127,7 @@ def audit_clause(
             issues.extend(parsed)
 
     except Exception as e:
-        pass
+        _logger.warning("audit clause failed (clause %s): %s", clause.number, e)
 
     return issues
 
@@ -604,7 +607,8 @@ def audit_chapter(
 
         return []
 
-    except Exception:
+    except Exception as e:
+        _logger.warning("chapter audit failed (%s): %s", chapter_title, e)
         return []
 
 

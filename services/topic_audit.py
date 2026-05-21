@@ -11,6 +11,9 @@ import json
 
 from models.audit_task import AuditIssue, IssueLocation, StandardRef
 from services.document_nav import DocumentNav
+from core.logger import get_logger
+
+_logger = get_logger(__name__)
 
 
 AUDIT_TOPICS = [
@@ -130,18 +133,22 @@ def audit_topic(
 请参照知识库中的标准/制度内容，审核文档中的相关段落是否合规。对比检查是否存在不一致、违规或遗漏之处。"""
 
     try:
-        from services.llm_client import generate
-        raw = generate(user_prompt, system_prompt=AUDIT_SYSTEM_PROMPT, timeout=180)
-        # generate() 返回 raw API JSON，需要先解析出 choices[0].message.content
-        response = json.loads(raw)
-        content = response.get("choices", [{}])[0].get("message", {}).get("content", raw)
-        import re
+        from core.settings import get_llm
+        from llama_index.core.llms import ChatMessage, MessageRole
+
+        messages = [
+            ChatMessage(role=MessageRole.SYSTEM, content=AUDIT_SYSTEM_PROMPT),
+            ChatMessage(role=MessageRole.USER, content=user_prompt),
+        ]
+        response = get_llm().chat(messages)
+        content = response.message.content or ""
+
         match = re.search(r'\{.*\}', content, re.DOTALL)
         if match:
             data = json.loads(match.group(0))
             return _parse_issues(data, topic_index)
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.warning("topic audit failed (%s): %s", topic.get("id", "?"), e)
     return []
 
 
