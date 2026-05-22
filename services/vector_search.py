@@ -172,6 +172,15 @@ def search_by_keywords(kb_ids: list[str], keywords: list[str], topic_name: str =
     return _text_search_fallback(kb_ids, keywords or [topic_name])
 
 
+def get_kb_content_for_audit(kb_ids: list[str], clause_text: str) -> str:
+    """获取相关知识库内容用于审核分析。"""
+    try:
+        return get_kb_content(kb_ids, clause_text)
+    except Exception as e:
+        _logger.warning("vector kb content failed: %s", e)
+        return "未找到相关标准依据。"
+
+
 def get_kb_content(kb_ids: list[str], query: str) -> str:
     """获取格式化 KB 内容（供审核使用）。"""
     results = vec_search(kb_ids, query, top_k=3)

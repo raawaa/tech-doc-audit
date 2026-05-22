@@ -6,6 +6,8 @@ import type {
   AuditTask,
   AuditResult,
   DocumentStructure,
+  QAResponse,
+  QARequest,
 } from './types'
 
 // ============ 知识库 API ============
@@ -128,5 +130,14 @@ export const auditTaskApi = {
 
   cancel: async (id: string): Promise<void> => {
     await apiClient.delete(`/audit-tasks/${id}`)
+  },
+}
+
+// ============ Q&A 问答 API ============
+
+export const qaApi = {
+  ask: async (data: QARequest): Promise<QAResponse> => {
+    const resp = await apiClient.post('/qa/ask', data)
+    return resp.data
   },
 }

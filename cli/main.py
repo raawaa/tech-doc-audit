@@ -15,12 +15,14 @@ doc_app = typer.Typer(help="知识库文档管理")
 index_app = typer.Typer(help="知识库索引管理")
 audit_app = typer.Typer(help="待审核文档管理")
 audit_task_app = typer.Typer(help="审核任务管理")
+qa_app = typer.Typer(help="知识问答")
 
 app.add_typer(kb_app, name="kb")
 app.add_typer(doc_app, name="doc")
 app.add_typer(index_app, name="index")
 app.add_typer(audit_app, name="audit")
 app.add_typer(audit_task_app, name="audit-task")
+app.add_typer(qa_app, name="qa")
 
 
 @kb_app.command("create")
@@ -410,6 +412,34 @@ def audit_task_run(
     else:
         audit_task_svc.run_audit_async(task_id)
         typer.echo("任务已启动（异步执行）")
+
+
+# ===== 知识问答 =====
+
+
+@qa_app.command("ask")
+def qa_ask(
+    question: str = typer.Argument(..., help="问题"),
+    kb_ids: str = typer.Option(..., "--kb-ids", help="知识库 ID（逗号分隔）"),
+    top_k: int = typer.Option(5, "--top-k", help="检索 chunk 数量"),
+):
+    """向知识库提问，获取答案及参考来源。"""
+    from services.qa_service import ask as ask_svc
+
+    kb_id_list = [k.strip() for k in kb_ids.split(",")]
+
+    typer.echo(f"\n{'='*60}")
+    typer.echo(f"问题: {question}")
+    typer.echo(f"{'='*60}\n")
+
+    result = ask_svc(kb_id_list, question, top_k)
+
+    typer.echo(result["answer"])
+    typer.echo(f"\n{'='*60}")
+    typer.echo(f"参考来源 ({len(result['sources'])} 条):")
+    for s in result["sources"]:
+        doc = s["doc_source"] or s["doc_id"]
+        typer.echo(f"  - [{doc}] (相关度: {s['relevance']:.2f})")
 
 
 if __name__ == "__main__":

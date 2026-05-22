@@ -4,7 +4,6 @@ from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException
 
 import services.audit_task_service as audit_task_svc
-import services.audit_analysis_service as analysis_svc
 import storage.audit_doc_repo as doc_repo
 
 router = APIRouter(prefix="/api/v1/audit-tasks", tags=["audit-tasks"])

@@ -22,6 +22,8 @@ uv run python -m cli kb list
 uv run python -m cli doc import --kb-id <id> --file sample_docs/sample.pdf
 uv run python -m cli audit upload --file sample_docs/sample.pdf
 uv run python -m cli audit-task create --doc-id <id> --kb-ids <ids>
+uv run python -m cli qa ask --kb-ids <ids> "问题"            # 知识库问答
+uv run python scripts/import_pdfs.py --kb-id <id> --dir <dir> # 批量导入 PDF
 
 # 生成示例文档
 uv run python scripts/generate_sample_doc.py

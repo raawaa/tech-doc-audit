@@ -96,3 +96,23 @@ export interface DocumentStructure {
   }[]
   total_clauses: number
 }
+
+// Q&A 问答类型
+export interface QASource {
+  kb_id: string
+  doc_id: string
+  doc_source: string
+  content_snippet: string
+  relevance: number
+}
+
+export interface QAResponse {
+  answer: string
+  sources: QASource[]
+}
+
+export interface QARequest {
+  question: string
+  kb_ids: string[]
+  top_k?: number
+}

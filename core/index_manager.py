@@ -14,7 +14,7 @@ from core.logger import get_logger
 _logger = get_logger(__name__)
 
 import faiss
-from llama_index.core import VectorStoreIndex, StorageContext, Document
+from llama_index.core import VectorStoreIndex, StorageContext, Document, Settings
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.vector_stores.faiss import FaissVectorStore
 
@@ -46,29 +46,52 @@ def _create_index(dim: int = 1024) -> VectorStoreIndex:
     faiss_index = faiss.IndexFlatIP(dim)
     vector_store = FaissVectorStore(faiss_index=faiss_index)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
-    return VectorStoreIndex.from_documents([], storage_context=storage_context)
+    # 直接用 VectorStoreIndex 构造，传入空 nodes + storage_context（含 FaissVectorStore）
+    index = VectorStoreIndex(
+        nodes=[],
+        storage_context=storage_context,
+        embed_model=Settings.embed_model,
+    )
+    return index
 
 
 def _load_index(kb_id: str) -> Optional[VectorStoreIndex]:
     """从磁盘加载已有 FAISS 索引。"""
     vectors_dir = _vectors_dir(kb_id)
-    index_path = vectors_dir / "faiss.index"
-    if not index_path.exists():
+    store_file = vectors_dir / "default__vector_store.json"
+    if not store_file.exists():
         return None
     try:
         get_embed_model()
-        faiss_index = faiss.read_index(str(index_path))
+        faiss_index = faiss.read_index(str(store_file))
         vector_store = FaissVectorStore(faiss_index=faiss_index)
-        # 读取持久化目录中的 docstore / index_store
+
+        from llama_index.core.storage.docstore import SimpleDocumentStore
+        from llama_index.core.storage.index_store import SimpleIndexStore
+        docstore = SimpleDocumentStore.from_persist_dir(str(vectors_dir))
+        index_store = SimpleIndexStore.from_persist_dir(str(vectors_dir))
+
         storage_context = StorageContext.from_defaults(
             vector_store=vector_store,
-            persist_dir=str(vectors_dir),
+            docstore=docstore,
+            index_store=index_store,
         )
-        index = VectorStoreIndex.from_documents(
-            [], storage_context=storage_context,
+
+        # 从已加载的 index_store 中获取已有的 index_struct
+        index_struct = None
+        for is_ in index_store.index_structs():
+            index_struct = is_
+            break
+
+        index = VectorStoreIndex(
+            nodes=[],
+            index_struct=index_struct,
+            storage_context=storage_context,
+            embed_model=Settings.embed_model,
         )
         return index
-    except Exception:
+    except Exception as e:
+        _logger.warning("failed to load index for kb %s: %s", kb_id, e)
         return None
 
 
@@ -188,8 +211,8 @@ def rebuild_kb_index(kb_id: str):
 
 
 def get_kb_index_built(kb_id: str) -> bool:
-    """检查 KB 是否已有索引（faiss.index 文件存在）。"""
-    return (_vectors_dir(kb_id) / "faiss.index").exists()
+    """检查 KB 是否已有索引（default__vector_store.json 文件存在）。"""
+    return (_vectors_dir(kb_id) / "default__vector_store.json").exists()
 
 
 # ── 搜索 ────────────────────────────────────────────────────────────────────────
@@ -204,6 +227,8 @@ def search(kb_ids: list[str], query: str, top_k: int = 5) -> list[dict]:
         return []
 
     hits = []
+    # 确保 embed_model 已加载，防止 LlamaIndex 默认解析到 OpenAI
+    get_embed_model()
     for kb_id in kb_ids:
         if not get_kb_index_built(kb_id):
             continue

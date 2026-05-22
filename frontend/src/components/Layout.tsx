@@ -3,6 +3,7 @@ import { Link, useLocation } from 'react-router-dom'
 const navItems = [
   { path: '/knowledge-bases', label: '知识库' },
   { path: '/audit', label: '待审核文档' },
+  { path: '/qa', label: '知识问答' },
 ]
 
 export function Layout({ children }: { children: React.ReactNode }) {

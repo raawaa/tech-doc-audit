@@ -5,6 +5,7 @@ import { KnowledgeBaseDetailPage } from './pages/KnowledgeBaseDetailPage'
 import { AuditDocumentsPage } from './pages/AuditDocumentsPage'
 import { AuditDocumentDetailPage } from './pages/AuditDocumentDetailPage'
 import { AuditResultPage } from './pages/AuditResultPage'
+import { QAPage } from './pages/QAPage'
 
 function App() {
   return (
@@ -16,6 +17,7 @@ function App() {
         <Route path="/audit" element={<AuditDocumentsPage />} />
         <Route path="/audit/:id" element={<AuditDocumentDetailPage />} />
         <Route path="/audit/:id/result/:taskId" element={<AuditResultPage />} />
+        <Route path="/qa" element={<QAPage />} />
       </Routes>
     </Layout>
   )

@@ -31,6 +31,7 @@ dependencies = [
     "llama-index-llms-ollama>=0.10.1",
     "llama-index-llms-openai>=0.7.8",
     "socksio>=1.0.0",
+    "llama-index-embeddings-openai>=0.6.0",
 ]
 
 [dependency-groups]

@@ -21,15 +21,28 @@ def _init():
 _init()
 
 
+_embed_model = None
+
+
 def get_embed_model():
     """延迟加载 embedding 模型（首次调用时加载 ~2GB bge-m3）。"""
-    if Settings.embed_model is None:
-        from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-        Settings.embed_model = HuggingFaceEmbedding(
-            model_name="BAAI/bge-m3",
-            normalize_embeddings=True,
-        )
-    return Settings.embed_model
+    global _embed_model
+    if _embed_model is not None:
+        return _embed_model
+    from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+    _modelscope_path = os.path.expanduser("~/.cache/modelscope/hub/BAAI/bge-m3")
+    if os.path.isdir(_modelscope_path):
+        # ModelScope 本地缓存优先（无网络环境）
+        _model_path = _modelscope_path
+    else:
+        _model_path = "BAAI/bge-m3"
+    _embed_model = HuggingFaceEmbedding(
+        model_name=_model_path,
+        normalize=True,
+        device="cpu",
+    )
+    Settings.embed_model = _embed_model
+    return _embed_model
 
 
 # ── LLM ────────────────────────────────────────────────────────────────────────
@@ -55,6 +68,10 @@ def get_llm():
         base_url = os.environ.get("MINIMAX_CN_BASE_URL", "https://api.minimaxi.com/v1").rstrip("/")
         api_key = os.environ.get("MINIMAX_CN_API_KEY", "")
         model = os.environ.get("MINIMAX_CN_MODEL", "MiniMax-M2.7")
+        # MiniMax 模型名不在 OpenAI 白名单中，注册到校验列表避免报错
+        from llama_index.llms.openai import utils as _openai_utils
+        _openai_utils.ALL_AVAILABLE_MODELS[model] = 128000
+        _openai_utils.CHAT_MODELS[model] = 128000
         _llm = OpenAILLM(
             model=model, api_base=base_url, api_key=api_key,
             request_timeout=timeout, is_chat_model=True,
@@ -66,6 +83,19 @@ def get_llm():
         model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
         _llm = OpenAILLM(
             model=model, api_base=base_url or None, api_key=api_key,
+            request_timeout=timeout, is_chat_model=True,
+        )
+    elif provider == "deepseek":
+        from llama_index.llms.openai import OpenAI as OpenAILLM
+        base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+        # DeepSeek 模型名不在 OpenAI 白名单中，注册到校验列表避免报错
+        from llama_index.llms.openai import utils as _openai_utils
+        _openai_utils.ALL_AVAILABLE_MODELS[model] = 128000
+        _openai_utils.CHAT_MODELS[model] = 128000
+        _llm = OpenAILLM(
+            model=model, api_base=base_url, api_key=api_key,
             request_timeout=timeout, is_chat_model=True,
         )
     else:

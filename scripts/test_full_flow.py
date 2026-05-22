@@ -20,7 +20,6 @@ def main():
         import services.doc_service as doc_svc
         import services.audit_doc_service as audit_doc_svc
         import services.audit_task_service as task_svc
-        import services.audit_analysis_service as analysis_svc
         print("   ✓ 所有模块导入成功")
     except Exception as e:
         print(f"   ✗ 导入失败: {e}")

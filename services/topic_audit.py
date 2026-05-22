@@ -153,9 +153,9 @@ def audit_topic(
 
 
 def _search_kb(kb_ids: list[str], query: str) -> str:
-    import services.search_service as search_svc
+    from services.vector_search import get_kb_content_for_audit
     try:
-        return search_svc.get_kb_content_for_audit(kb_ids, query)
+        return get_kb_content_for_audit(kb_ids, query)
     except Exception:
         return ""
 
