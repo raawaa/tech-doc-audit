@@ -11,6 +11,7 @@ interface Message {
 export function QAPage() {
   const [kbs, setKbs] = useState<KnowledgeBase[]>([])
   const [selectedKbIds, setSelectedKbIds] = useState<Set<string>>(new Set())
+  const [sessionId, setSessionId] = useState<string | undefined>(undefined)
   const [question, setQuestion] = useState('')
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)
@@ -34,6 +35,9 @@ export function QAPage() {
       else next.add(id)
       return next
     })
+    // 切换知识库时重置会话，避免跨 KB 的混乱上下文
+    setSessionId(undefined)
+    setMessages([])
   }
 
   const handleSubmit = async () => {
@@ -46,10 +50,12 @@ export function QAPage() {
     setError('')
 
     try {
-      const result = await qaApi.ask({
+      const result = await qaApi.chat({
         question: q,
         kb_ids: Array.from(selectedKbIds),
+        session_id: sessionId,
       })
+      setSessionId(result.session_id)
       setMessages((prev) => [
         ...prev,
         { role: 'assistant', content: result.answer, sources: result.sources },

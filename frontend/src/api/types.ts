@@ -116,3 +116,16 @@ export interface QARequest {
   kb_ids: string[]
   top_k?: number
 }
+
+export interface ChatRequest {
+  question: string
+  kb_ids: string[]
+  session_id?: string
+  top_k?: number
+}
+
+export interface ChatResponse {
+  session_id: string
+  answer: string
+  sources: QASource[]
+}

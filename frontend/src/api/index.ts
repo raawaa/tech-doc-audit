@@ -8,6 +8,8 @@ import type {
   DocumentStructure,
   QAResponse,
   QARequest,
+  ChatRequest,
+  ChatResponse,
 } from './types'
 
 // ============ 知识库 API ============
@@ -138,6 +140,10 @@ export const auditTaskApi = {
 export const qaApi = {
   ask: async (data: QARequest): Promise<QAResponse> => {
     const resp = await apiClient.post('/qa/ask', data)
+    return resp.data
+  },
+  chat: async (data: ChatRequest): Promise<ChatResponse> => {
+    const resp = await apiClient.post('/qa/chat', data)
     return resp.data
   },
 }
