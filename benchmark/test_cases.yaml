@@ -1,64 +1,56 @@
 test_cases:
-  - id: "procurement_contract"
-    topic_id: "payment_terms"
-    query: "招标采购 合同管理办法 签订"
-    description: "应检索到采购合同签订条款"
+  - id: "emergency_response"
+    query: "突发事件 应急预案 处置"
+    description: "应检索到突发事件应急预案相关制度"
     expected_chunks:
-      - content_keywords: ["采购部", "框架服务合同"]
+      - content_keywords: ["突发事件", "应急预案"]
         relevance: "must_match"
 
-  - id: "triple_major_decision"
-    topic_id: "scope_clarity"
-    query: "三重一大 决策范围"
-    description: "应检索到三重一大决策制度"
+  - id: "gate_management"
+    query: "航站楼 门禁 管理"
+    description: "应检索到航站楼门禁管理办法"
     expected_chunks:
-      - content_keywords: ["三重一大", "决策"]
+      - content_keywords: ["航站楼", "门禁"]
         relevance: "must_match"
 
-  - id: "safety_risk"
-    topic_id: "completeness"
-    query: "安全风险 双重预防 隐患排查"
-    description: "应检索到安全管理相关制度"
+  - id: "duty_management"
+    query: "值班管理规定 要求"
+    description: "应检索到值班管理规定"
     expected_chunks:
-      - content_keywords: ["双重预防", "安全隐患"]
-        relevance: "should_match"
-
-  - id: "fixed_asset"
-    topic_id: "completeness"
-    query: "固定资产 管理办法"
-    description: "应检索到固定资产财务管理办法"
-    expected_chunks:
-      - content_keywords: ["固定资产", "财务管理办法"]
+      - content_keywords: ["值班管理"]
         relevance: "must_match"
 
-  - id: "party_meeting"
-    topic_id: "scope_clarity"
-    query: "党委会议事规则"
-    description: "应检索到党委会议事决策制度"
+  - id: "sanitation_management"
+    query: "场容环境卫生 管理办法"
+    description: "应检索到场容环境卫生管理办法"
     expected_chunks:
-      - content_keywords: ["党委会议事", "决策规则"]
+      - content_keywords: ["环境卫生"]
         relevance: "must_match"
 
-  - id: "seal_management"
-    topic_id: "completeness"
-    query: "印章 证照 管理办法"
-    description: "应检索到印章证照管理制度"
+  - id: "greening_management"
+    query: "场区绿化 管理办法"
+    description: "应检索到场区绿化管理办法"
     expected_chunks:
-      - content_keywords: ["行政印章", "企业证照"]
-        relevance: "should_match"
-
-  - id: "complaint_letter"
-    topic_id: "completeness"
-    query: "信访工作 管理办法"
-    description: "应检索到信访管理制度"
-    expected_chunks:
-      - content_keywords: ["信访工作", "管理办法"]
+      - content_keywords: ["绿化管理"]
         relevance: "must_match"
 
-  - id: "performance_appraisal"
-    topic_id: "data_reasonableness"
-    query: "绩效奖励分配 办法"
-    description: "应检索到绩效考核办法"
+  - id: "blood_donation"
+    query: "献血工作 管理办法"
+    description: "应检索到献血工作管理办法"
     expected_chunks:
-      - content_keywords: ["绩效奖励", "分配办法"]
+      - content_keywords: ["献血", "管理办法"]
+        relevance: "must_match"
+
+  - id: "common_trench"
+    query: "共同沟 安全 管理"
+    description: "应检索到共同沟管理办法"
+    expected_chunks:
+      - content_keywords: ["共同沟"]
+        relevance: "must_match"
+
+  - id: "airport_usage"
+    query: "使用许可 管理规则"
+    description: "应检索到机场使用许可管理规则"
+    expected_chunks:
+      - content_keywords: ["使用许可"]
         relevance: "must_match"
