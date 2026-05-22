@@ -5,6 +5,14 @@ Settings 会在首次 import 时自动配置。
 """
 
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# 在 import 时自动加载项目根目录的 .env
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+if _env_path.exists():
+    load_dotenv(_env_path)
 
 from llama_index.core import Settings
 from llama_index.core.node_parser import SentenceSplitter
