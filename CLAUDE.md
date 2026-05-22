@@ -24,6 +24,9 @@ uv run python -m cli audit upload --file sample_docs/sample.pdf
 uv run python -m cli audit-task create --doc-id <id> --kb-ids <ids>
 uv run python -m cli qa ask --kb-ids <ids> "问题"            # 知识库问答
 uv run python scripts/import_pdfs.py --kb-id <id> --dir <dir> # 批量导入 PDF
+uv run python scripts/eval_qa.py --kb-ids <ids>              # RAG 评估（检索+答案质量）
+uv run python -m benchmark.cli run --kb-ids <ids>            # 检索 benchmark
+uv run python -m benchmark.cli sweep --kb-ids <ids>          # 参数扫描
 
 # 生成示例文档
 uv run python scripts/generate_sample_doc.py
