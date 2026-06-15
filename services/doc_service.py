@@ -15,7 +15,7 @@ _logger = get_logger(__name__)
 
 def _detect_file_type(filename: str) -> Optional[str]:
     ext = os.path.splitext(filename)[1].lower()
-    mapping = {".pdf": "pdf", ".doc": "doc", ".docx": "docx"}
+    mapping = {".pdf": "pdf", ".doc": "doc", ".docx": "docx", ".md": "md"}
     return mapping.get(ext)
 
 
