@@ -40,10 +40,15 @@ def _ensure_dir(path: Path):
 # ── 索引创建 / 加载 / 缓存 ─────────────────────────────────────────────────────
 
 def _create_index(dim: int = 1024) -> VectorStoreIndex:
-    """创建新的空 FAISS 索引（FlatIP: Inner Product，适用于已 normalize 的向量）。"""
+    """创建新的空 FAISS 索引（HNSW + IDMap，支持高效 ANN 搜索和向量级删除）。"""
     # 确保 embedding 模型已初始化
     get_embed_model()
-    faiss_index = faiss.IndexFlatIP(dim)
+    # HNSW: 高效的近似最近邻索引，O(log n) 搜索
+    hnsw_index = faiss.IndexHNSWFlat(dim, 32)
+    hnsw_index.hnsw.efConstruction = 200  # 建图质量（越大越准）
+    hnsw_index.hnsw.efSearch = 64         # 搜索精度
+    # IDMap 包装支持按 ID 删除向量
+    faiss_index = faiss.IndexIDMap(hnsw_index)
     vector_store = FaissVectorStore(faiss_index=faiss_index)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
     # 直接用 VectorStoreIndex 构造，传入空 nodes + storage_context（含 FaissVectorStore）
@@ -131,6 +136,7 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = ""):
 
     doc = Document(
         text=text,
+        id_=doc_id,
         metadata={"doc_id": doc_id, "source": source_name or doc_id},
     )
 
@@ -155,9 +161,23 @@ def _has_markdown_headings(text: str) -> bool:
 def remove_document(kb_id: str, doc_id: str):
     """从 KB 索引中删除指定文档的所有节点。
 
-    IndexFlatIP 不支持删除单个向量，因此采用重建策略：
-    清空缓存 → 删除向量目录 → 重新索引除目标文档外的所有文档。
+    HNSW + IDMap 支持向量级删除（快速路径），
+    降级到全量重建（兼容旧版 FlatIP 索引或异常场景）。
     """
+    # 快速路径：通过 delete_ref_doc 直接从索引删除
+    try:
+        index = get_kb_index(kb_id)
+        # 检查底层索引是否支持删除（IDMap）
+        if hasattr(index.vector_store, '_faiss_index') and hasattr(index.vector_store._faiss_index, 'remove_ids'):
+            index.delete_ref_doc(doc_id, delete_from_docstore=True)
+            _persist(kb_id, index)
+            _logger.info("removed doc %s from kb %s via delete_ref_doc", doc_id, kb_id)
+            return
+    except Exception as e:
+        _logger.warning("vector-level deletion failed for %s/%s (%s), fallback to rebuild", kb_id, doc_id, e)
+
+    # 降级路径：全量重建（IndexFlatIP 不支持删除）
+    _logger.info("fallback rebuild for kb %s after removing doc %s", kb_id, doc_id)
     _index_cache.pop(kb_id, None)
 
     vectors_dir = _vectors_dir(kb_id)

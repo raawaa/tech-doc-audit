@@ -25,6 +25,7 @@ data/
 
 # Generated output
 audit_report_*.txt
+output/
 
 # IDE
 .idea/

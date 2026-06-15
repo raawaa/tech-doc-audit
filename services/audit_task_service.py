@@ -1,11 +1,18 @@
+import concurrent.futures
 import threading
 from datetime import datetime
 from typing import Optional
 
+from core.logger import get_logger
 from models.audit_task import AuditTask, AuditResult, ResultSummary, AuditType
 import storage.audit_task_repo as repo
 import storage.audit_doc_repo as doc_repo
 import services.topic_audit as topic_audit
+import services.agent_audit as agent_audit
+import services.audit_doc_service as audit_doc_svc
+import services.structure_service as structure_svc
+
+_logger = get_logger(__name__)
 
 
 def create_task(
@@ -65,6 +72,36 @@ def get_result(task_id: str) -> Optional[AuditResult]:
     return task.result
 
 
+def _audit_single_topic(
+    topic: dict,
+    parsed_content: str,
+    kb_ids: list[str],
+    topic_index: int,
+) -> dict:
+    """审核单个主题（供并行执行使用，异常不会透出）。"""
+    try:
+        issues = topic_audit.audit_topic(
+            topic=topic,
+            doc_nav=None,
+            kb_ids=kb_ids,
+            topic_index=topic_index,
+            parsed_content=parsed_content,
+        )
+        return {
+            "name": topic.get("name", f"主题{topic_index}"),
+            "issues": issues,
+            "success": True,
+        }
+    except Exception as e:
+        _logger.warning("topic audit failed (%s): %s", topic.get("id", topic_index), e)
+        return {
+            "name": topic.get("name", f"主题{topic_index}"),
+            "issues": [],
+            "success": False,
+            "error": str(e),
+        }
+
+
 def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
     """执行审核任务。"""
     task = repo.get_task(task_id)
@@ -88,59 +125,70 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
 
         # 确保文档已处理
         if not doc.parsed_content:
-            from services.audit_doc_service import parse_document
-            doc = parse_document(doc.id)
+            doc = audit_doc_svc.parse_document(doc.id)
 
         if not doc.structure:
-            from services.structure_service import analyze_document_structure
             try:
-                doc = analyze_document_structure(doc.id)
+                doc = structure_svc.analyze_document_structure(doc.id)
             except Exception:
                 pass
 
         task.progress = 0.1
         repo.save_task(task)
 
-        # 确保 parsed_content 先于任何使用定义
         parsed_content = doc.parsed_content or ""
 
-        # 执行审核 — 主题式批量审核
         # 1. LLM Agent 分析文档 → 确定审核主题
-        # 2. 关键词定位段落 + 搜 KB → 1 次 LLM 审核
         if hasattr(task, 'audit_topics') and task.audit_topics:
-            topics = task.audit_topics  # 用户指定的主题
+            topics = task.audit_topics
         else:
-            # Agent 动态主题选择，降级到固定主题
-            from services.agent_audit import determine_audit_topics
-            topics = determine_audit_topics(parsed_content, task.kb_ids)
+            topics = agent_audit.determine_audit_topics(parsed_content, task.kb_ids)
             if not topics:
                 topics = topic_audit.AUDIT_TOPICS
 
+        task.progress = 0.15
+        repo.save_task(task)
+
+        # 2. 并行执行各主题审核
+        # 各主题间无依赖，并行化可大幅缩短总耗时
         all_issues = []
         raw_parts = []
-        total = max(len(topics), 1)
+        success_count = 0
+        fail_count = 0
 
-        for i, topic in enumerate(topics):
-            task.progress = 0.1 + 0.8 * (i / total)
-            repo.save_task(task)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(8, len(topics)) if topics else 1
+        ) as executor:
+            futures = [
+                executor.submit(
+                    _audit_single_topic, topic, parsed_content, task.kb_ids, i
+                )
+                for i, topic in enumerate(topics)
+            ]
+            concurrent.futures.wait(futures)
 
-            topic_issues = topic_audit.audit_topic(
-                topic=topic,
-                doc_nav=None,
-                kb_ids=task.kb_ids,
-                topic_index=i,
-                parsed_content=parsed_content,
-            )
-            all_issues.extend(topic_issues)
+        for future in futures:
+            result = future.result()
+            if result["success"]:
+                success_count += 1
+            else:
+                fail_count += 1
+            all_issues.extend(result["issues"])
             raw_parts.append(
-                f"{topic['name']}: 发现 {len(topic_issues)} 个问题"
-                if topic_issues else f"{topic['name']}: 无问题"
+                f"{result['name']}: 发现 {len(result['issues'])} 个问题"
+                if result["issues"]
+                else f"{result['name']}: 无问题"
             )
 
+        task.progress = 0.9
+        repo.save_task(task)
+
+        # 3. 生成结果（即使部分 topic 失败，已完成的结果也不丢失）
         issues = all_issues
         raw_analysis = "\n".join(raw_parts)
+        if fail_count > 0:
+            raw_analysis += f"\n\n⚠️ {fail_count}/{len(topics)} 个主题审核失败"
 
-        # 生成结果
         summary = ResultSummary(
             total_clauses=doc.structure.total_clauses if doc.structure else 0,
             issues_count=len(issues),
@@ -169,6 +217,7 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
         task.status = "failed"
         task.error_message = str(e)
         task.completed_at = datetime.utcnow()
+        _logger.error("audit task %s failed: %s", task_id, e)
 
     repo.save_task(task)
     return task
