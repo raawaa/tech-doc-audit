@@ -1,4 +1,4 @@
-// 知识库类型
+// ── 知识库 ──
 export interface KnowledgeBase {
   id: string
   name: string
@@ -19,7 +19,7 @@ export interface KBDocument {
   index_status: string
 }
 
-// 待审核文档类型
+// ── 待审核文档 ──
 export interface AuditDocument {
   id: string
   name: string
@@ -33,7 +33,7 @@ export interface AuditDocument {
   has_index: boolean
 }
 
-// 审核任务类型
+// ── 审核任务 ──
 export interface AuditTask {
   id: string
   document_id: string
@@ -41,20 +41,9 @@ export interface AuditTask {
   status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled'
   progress: number
   created_at: string
-}
-
-export interface IssueLocation {
-  chapter?: string
-  clause_number?: string
-  page?: number
-  original_text: string
-}
-
-export interface StandardRef {
-  standard_name: string
-  standard_id: string
-  clause?: string
-  requirement?: string
+  started_at?: string
+  completed_at?: string
+  result?: AuditResult
 }
 
 export interface AuditIssue {
@@ -86,18 +75,7 @@ export interface AuditResult {
   generated_at: string
 }
 
-export interface DocumentStructure {
-  doc_id: string
-  title?: string
-  chapters: {
-    number?: string
-    title: string
-    clauses: { number: string; text: string }[]
-  }[]
-  total_clauses: number
-}
-
-// Q&A 问答类型
+// ── 问答 ──
 export interface QASource {
   kb_id: string
   doc_id: string
@@ -109,12 +87,6 @@ export interface QASource {
 export interface QAResponse {
   answer: string
   sources: QASource[]
-}
-
-export interface QARequest {
-  question: string
-  kb_ids: string[]
-  top_k?: number
 }
 
 export interface ChatRequest {
