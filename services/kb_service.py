@@ -23,9 +23,4 @@ def list_kbs(category: Optional[str] = None) -> list[KnowledgeBase]:
 
 def delete_kb(kb_id: str) -> bool:
     """级联删除知识库全部数据（docs + meta + vectors）。"""
-    from pathlib import Path
-    from storage.kb_repo import DATA_DIR
-    kb_dir = DATA_DIR / "kbs" / kb_id
-    if kb_dir.exists():
-        shutil.rmtree(kb_dir)
     return kb_repo.delete(kb_id)

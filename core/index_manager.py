@@ -15,7 +15,7 @@ _logger = get_logger(__name__)
 
 import faiss
 from llama_index.core import VectorStoreIndex, StorageContext, Document, Settings
-from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.node_parser import SentenceSplitter, MarkdownNodeParser
 from llama_index.vector_stores.faiss import FaissVectorStore
 
 from core.settings import get_embed_model
@@ -121,7 +121,8 @@ def clear_cache():
 def index_document(kb_id: str, doc_id: str, text: str, source_name: str = ""):
     """对文档文本分块 → embedding → 写入 KB 索引。
 
-    使用 SentenceSplitter 分块，index.insert_nodes() 自动 embedding + 插入 FAISS。
+    优先使用 MarkdownNodeParser 按标题层级切块（适合带 # 标题的文本），
+    降级到 SentenceSplitter 按 token 数切块。
     """
     if not text or len(text) < 20:
         return
@@ -133,11 +134,22 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = ""):
         metadata={"doc_id": doc_id, "source": source_name or doc_id},
     )
 
-    splitter = SentenceSplitter(chunk_size=512, chunk_overlap=50)
+    # 检测文本是否包含 Markdown 标题，决定使用哪种分块器
+    if _has_markdown_headings(text):
+        splitter = MarkdownNodeParser()
+    else:
+        splitter = SentenceSplitter(chunk_size=512, chunk_overlap=50)
     nodes = splitter.get_nodes_from_documents([doc])
     index.insert_nodes(nodes)
 
     _persist(kb_id, index)
+
+
+def _has_markdown_headings(text: str) -> bool:
+    """快速检测文本是否包含 Markdown 标题层级。"""
+    import re
+    # 检查是否包含至少 2 个带层级的 Markdown 标题（# 或 ## 或 ###）
+    return bool(re.search(r"^#{2,6}\s+\S", text, re.MULTILINE))
 
 
 def remove_document(kb_id: str, doc_id: str):
