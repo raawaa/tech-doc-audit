@@ -10,7 +10,7 @@ async def upload_document(
     kb_id: str,
     file: UploadFile = File(...),
 ):
-    """上传文档到指定知识库（单文件，同步索引）。"""
+    """上传文档到指定知识库（单文件，异步索引，前端轮询进度）。"""
     import services.kb_service as kb_svc
     kb = kb_svc.get_kb(kb_id)
     if not kb:
@@ -18,7 +18,7 @@ async def upload_document(
 
     content = await file.read()
     try:
-        doc = doc_svc.import_document(kb_id, file.filename, content)
+        doc = doc_svc.import_document(kb_id, file.filename, content, async_index=True)
         return {
             "document_id": doc.id,
             "name": doc.name,

@@ -27,7 +27,10 @@ export function KnowledgeBaseDetail() {
 
   const importDoc = useMutation({
     mutationFn: (file: File) => kbApi.documents.import(id!, file),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['kb-docs', id] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['kb-docs', id] })
+      qc.invalidateQueries({ queryKey: ['kb', id] })
+    },
   })
 
   const batchImport = useMutation({

@@ -20,14 +20,27 @@ def _detect_file_type(filename: str) -> Optional[str]:
     return mapping.get(ext)
 
 
-def import_document(kb_id: str, original_name: str, content: bytes) -> KBDocument:
+def import_document(
+    kb_id: str,
+    original_name: str,
+    content: bytes,
+    async_index: bool = False,
+) -> KBDocument:
+    """导入单篇文档。
+
+    Args:
+        kb_id: 知识库 ID。
+        original_name: 原始文件名。
+        content: 文件内容字节。
+        async_index: True 则后台异步索引（上传即返回），
+                     False 则同步等待索引完成（CLI 等场景）。
+    """
     file_type = _detect_file_type(original_name)
     if not file_type:
         raise ValueError(f"不支持的文件格式: {original_name}")
 
     doc = doc_repo.save_doc(kb_id, original_name, content, file_type)
 
-    # 无需预建索引，文档导入即 ready
     doc.index_status = "ready"
     doc_repo._save_doc_meta(doc)
 
@@ -50,14 +63,53 @@ def import_document(kb_id: str, original_name: str, content: bytes) -> KBDocumen
         kb.document_ids.append(doc.id)
         kb_repo.update(kb)
 
-    # 自动建立向量索引（局部导入，免去手动 index rebuild）
+    # 向量索引
     if doc.file_path:
-        try:
-            _index_vec(kb_id, doc.id, doc.file_path)
-        except Exception as e:
-            _logger.warning("vector indexing failed for doc %s: %s", doc.id, e)
+        if async_index:
+            # 异步：后台线程索引，不阻塞 API 响应
+            doc.index_status = "pending_index"
+            doc_repo._save_doc_meta(doc)
+            thread = threading.Thread(
+                target=_index_single_doc_async,
+                args=(kb_id, doc),
+                daemon=True,
+            )
+            thread.start()
+        else:
+            # 同步：等待索引完成（CLI 等场景）
+            try:
+                _index_vec(kb_id, doc.id, doc.file_path)
+            except Exception as e:
+                _logger.warning("vector indexing failed for doc %s: %s", doc.id, e)
 
     return doc
+
+
+def _index_single_doc_async(kb_id: str, doc: KBDocument):
+    """后台索引单篇文档（由 import_document async_index=True 调用）。"""
+    import storage.kb_repo as kb_repo
+
+    kb = kb_repo.get(kb_id)
+    if not kb:
+        return
+
+    # 更新 KB 状态
+    kb.index_status = "building"
+    kb.index_current_doc = doc.original_name
+    kb_repo.update(kb)
+
+    try:
+        _index_vec(kb_id, doc.id, doc.file_path)
+        doc.index_status = "ready"
+    except Exception as e:
+        _logger.warning("async indexing failed for doc %s: %s", doc.id, e)
+        doc.index_status = "failed"
+    doc_repo._save_doc_meta(doc)
+
+    # 更新 KB 状态：检查是否还有其他文档待索引
+    kb.index_status = "ready"
+    kb.index_current_doc = ""
+    kb_repo.update(kb)
 
 
 def batch_import_documents(
