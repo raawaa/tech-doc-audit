@@ -14,6 +14,9 @@ export function KnowledgeBaseDetail() {
     queryKey: ['kb', id],
     queryFn: () => kbApi.get(id!),
     enabled: !!id,
+    // 索引重建中时每 2 秒轮询进度
+    refetchInterval: (query) =>
+      query.state.data?.index_status === 'building' ? 2000 : false,
   })
 
   const { data: docs = [], isLoading: docsLoading } = useQuery({
@@ -29,10 +32,7 @@ export function KnowledgeBaseDetail() {
 
   const reindex = useMutation({
     mutationFn: () => kbApi.reindex(id!),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['kb', id] })
-      qc.invalidateQueries({ queryKey: ['kb-docs', id] })
-    },
+    // 成功后由 refetchInterval 轮询自动获取进度，无需手动 invalidate
   })
 
   const deleteDoc = useMutation({
@@ -51,8 +51,9 @@ export function KnowledgeBaseDetail() {
 
       <Card>
         <CardHeader title="基本信息" action={
-          <button className="btn-secondary btn-sm" onClick={() => reindex.mutate()} disabled={reindex.isPending}>
-            <RefreshCw className={`w-3.5 h-3.5 ${reindex.isPending ? 'animate-spin' : ''}`} /> 重建索引
+          <button className="btn-secondary btn-sm" onClick={() => reindex.mutate()} disabled={kb.index_status === 'building'}>
+            <RefreshCw className={`w-3.5 h-3.5 ${kb.index_status === 'building' ? 'animate-spin' : ''}`} />
+            {kb.index_status === 'building' ? '索引中…' : '重建索引'}
           </button>
         } />
         <CardBody>
@@ -63,6 +64,25 @@ export function KnowledgeBaseDetail() {
             <div><span className="text-slate-500">索引状态</span><p className="mt-0.5"><Badge value={kb.index_status} /></p></div>
             <div><span className="text-slate-500">文档数</span><p className="font-medium mt-0.5">{kb.document_count}</p></div>
           </div>
+
+          {/* 索引重建进度 */}
+          {kb.index_status === 'building' && (
+            <div className="mt-4 pt-4 border-t border-slate-100">
+              <div className="flex items-center justify-between text-xs text-slate-500 mb-2">
+                <span>
+                  <Loader2 className="w-3 h-3 inline animate-spin mr-1" />
+                  正在索引：{kb.index_current_doc || '准备中…'}
+                </span>
+                <span>{Math.round((kb.index_progress ?? 0) * 100)}%</span>
+              </div>
+              <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-blue-600 rounded-full transition-all duration-500"
+                  style={{ width: `${(kb.index_progress ?? 0) * 100}%` }}
+                />
+              </div>
+            </div>
+          )}
         </CardBody>
       </Card>
 

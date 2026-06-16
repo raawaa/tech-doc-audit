@@ -45,6 +45,8 @@ class KBResponse(BaseModel):
     updated_at: str
     document_count: int
     index_status: str
+    index_progress: float = 0.0
+    index_current_doc: str = ""
 
     @classmethod
     def from_kb(cls, kb):
@@ -57,6 +59,8 @@ class KBResponse(BaseModel):
             updated_at=kb.updated_at.isoformat() if hasattr(kb.updated_at, 'isoformat') else str(kb.updated_at),
             document_count=len(kb.document_ids),
             index_status=kb.index_status,
+            index_progress=getattr(kb, 'index_progress', 0.0),
+            index_current_doc=getattr(kb, 'index_current_doc', ''),
         )
 
 
@@ -98,15 +102,45 @@ def delete_kb(kb_id: str):
 
 @router.post("/{kb_id}/reindex")
 def reindex_kb(kb_id: str):
-    """重建知识库索引"""
+    """重建知识库索引（异步：立即返回，后台运行，进度通过 GET 查询）。"""
     kb = kb_svc.get_kb(kb_id)
     if not kb:
         raise HTTPException(status_code=404, detail="知识库不存在")
 
-    # 重建向量索引
-    from services.vector_search import rebuild_kb_index as rebuild_vec
-    rebuild_vec(kb_id)
-    return {"message": "向量索引重建完成"}
+    if kb.index_status == "building":
+        raise HTTPException(status_code=409, detail="索引正在重建中")
+
+    # 标记为 building
+    kb.index_status = "building"
+    kb.index_progress = 0.0
+    kb.index_current_doc = ""
+    kb_svc.update_kb(kb)
+
+    def _on_progress(current: int, total: int, doc_name: str):
+        """每索引完一篇文档的回调，更新 KB 状态供前端轮询。"""
+        kb.index_progress = current / total if total else 0
+        kb.index_current_doc = doc_name
+        kb_svc.update_kb(kb)
+
+    def _run():
+        """后台执行重建。"""
+        import services.vector_search as vs
+        try:
+            vs.rebuild_kb_index(kb_id, progress_callback=_on_progress)
+            # 重建完成
+            kb.index_status = "ready"
+            kb.index_progress = 1.0
+            kb.index_current_doc = ""
+        except Exception as e:
+            kb.index_status = "failed"
+            kb.index_current_doc = f"错误: {e}"
+        kb_svc.update_kb(kb)
+
+    import threading
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    return {"message": "索引重建已启动"}
 
 
 @router.get("/{kb_id}/documents", response_model=list[KBDocumentResponse])

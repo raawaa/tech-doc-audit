@@ -211,8 +211,14 @@ def remove_document(kb_id: str, doc_id: str):
     _persist(kb_id, index)
 
 
-def rebuild_kb_index(kb_id: str):
-    """重建 KB 索引（清除旧索引，重新索引所有文档）。"""
+def rebuild_kb_index(kb_id: str, progress_callback=None):
+    """重建 KB 索引（清除旧索引，重新索引所有文档）。
+
+    Args:
+        kb_id: 知识库 ID。
+        progress_callback: 可选回调 (current_index, total, doc_name) → None，
+                           每处理完一篇文档后调用，用于外部汇报进度。
+    """
     _index_cache.pop(kb_id, None)
 
     vectors_dir = _vectors_dir(kb_id)
@@ -228,16 +234,20 @@ def rebuild_kb_index(kb_id: str):
     _index_cache[kb_id] = index
 
     from storage.doc_repo import get_doc
+    total = len(kb.document_ids)
 
-    for doc_id in kb.document_ids:
+    for i, doc_id in enumerate(kb.document_ids, 1):
         doc = get_doc(kb_id, doc_id)
+        doc_name = doc.original_name if doc and doc.original_name else doc_id
+        if progress_callback:
+            progress_callback(i, total, doc_name)
         if doc and doc.file_path and Path(doc.file_path).exists():
             try:
                 text = _extract_text(doc.file_path)
                 if text:
                     index_document(kb_id, doc_id, text)
             except Exception as e:
-                print(f"  [skip] {doc_id}: {e}")
+                _logger.warning("  [skip] %s: %s", doc_id, e)
 
     _persist(kb_id, index)
 

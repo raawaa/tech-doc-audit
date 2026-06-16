@@ -6,6 +6,8 @@ export interface KnowledgeBase {
   category: 'national' | 'industry' | 'enterprise'
   document_count: number
   index_status: 'none' | 'building' | 'ready' | 'failed'
+  index_progress: number
+  index_current_doc: string
   created_at: string
   updated_at: string
 }

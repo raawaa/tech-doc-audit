@@ -146,9 +146,9 @@ def remove_document_index(kb_id: str, doc_id: str):
     _remove_from_store(kb_id, doc_id)
 
 
-def rebuild_kb_index(kb_id: str):
+def rebuild_kb_index(kb_id: str, progress_callback=None):
     """遍历 KB 全部文档重建向量索引。"""
-    _rebuild_store(kb_id)
+    _rebuild_store(kb_id, progress_callback)
 
 
 # ── 搜索接口 ─────────────────────────────────────────────────────────────

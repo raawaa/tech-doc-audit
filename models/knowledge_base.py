@@ -15,6 +15,8 @@ class KnowledgeBase(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     document_ids: list[str] = Field(default_factory=list)
     index_status: Literal["none", "building", "ready", "failed"] = "none"
+    index_progress: float = 0.0
+    index_current_doc: str = ""
 
     class Config:
         json_encoders = {
