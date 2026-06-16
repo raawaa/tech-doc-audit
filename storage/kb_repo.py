@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -9,6 +10,8 @@ from models.knowledge_base import KnowledgeBase
 
 DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 KBS_DIR = DATA_DIR / "kbs"
+
+_write_lock = threading.Lock()
 
 
 def _ensure_dir(path: Path) -> None:
@@ -60,8 +63,9 @@ def list_all() -> list[KnowledgeBase]:
 
 
 def update(kb: KnowledgeBase) -> KnowledgeBase:
-    kb.updated_at = datetime.utcnow()
-    return create(kb)
+    with _write_lock:
+        kb.updated_at = datetime.utcnow()
+        return create(kb)
 
 
 def delete(kb_id: str) -> bool:

@@ -17,8 +17,8 @@ def cleanup():
     """每个测试后清理数据"""
     yield
     import storage.kb_repo as kb_repo
-    if kb_repo.KB_META_DIR.exists():
-        shutil.rmtree(kb_repo.KB_META_DIR)
+    if kb_repo.KBS_DIR.exists():
+        shutil.rmtree(kb_repo.KBS_DIR)
 
 
 def test_create_kb():

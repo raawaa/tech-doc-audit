@@ -13,6 +13,18 @@ from core.logger import get_logger
 
 _logger = get_logger(__name__)
 
+# per-KB 锁：保护 get(kb) → modify → update(kb) 原子性
+# 防止 import_document 追加 document_ids 与异步线程更新状态交错
+_doc_service_locks: dict[str, threading.Lock] = {}
+_doc_service_locks_lock = threading.Lock()
+
+
+def _get_lock(kb_id: str) -> threading.Lock:
+    with _doc_service_locks_lock:
+        if kb_id not in _doc_service_locks:
+            _doc_service_locks[kb_id] = threading.Lock()
+        return _doc_service_locks[kb_id]
+
 
 def _detect_file_type(filename: str) -> Optional[str]:
     ext = os.path.splitext(filename)[1].lower()
@@ -57,11 +69,12 @@ def import_document(
         except Exception as e:
             _logger.warning("failed to extract page count for %s: %s", doc.id, e)
 
-    # 更新知识库 document_ids
-    kb = kb_repo.get(kb_id)
-    if kb and doc.id not in kb.document_ids:
-        kb.document_ids.append(doc.id)
-        kb_repo.update(kb)
+    # 更新知识库 document_ids（原子 get→modify→update，防与异步线程交错）
+    with _get_lock(kb_id):
+        kb = kb_repo.get(kb_id)
+        if kb and doc.id not in kb.document_ids:
+            kb.document_ids.append(doc.id)
+            kb_repo.update(kb)
 
     # 向量索引
     if doc.file_path:
@@ -89,14 +102,14 @@ def _index_single_doc_async(kb_id: str, doc: KBDocument):
     """后台索引单篇文档（由 import_document async_index=True 调用）。"""
     import storage.kb_repo as kb_repo
 
-    kb = kb_repo.get(kb_id)
-    if not kb:
-        return
-
-    # 更新 KB 状态
-    kb.index_status = "building"
-    kb.index_current_doc = doc.original_name
-    kb_repo.update(kb)
+    # 获取最新 kb 并标记 building（原子 get→modify→update）
+    with _get_lock(kb_id):
+        kb = kb_repo.get(kb_id)
+        if not kb:
+            return
+        kb.index_status = "building"
+        kb.index_current_doc = doc.original_name
+        kb_repo.update(kb)
 
     try:
         _index_vec(kb_id, doc.id, doc.file_path)
@@ -106,10 +119,13 @@ def _index_single_doc_async(kb_id: str, doc: KBDocument):
         doc.index_status = "failed"
     doc_repo._save_doc_meta(doc)
 
-    # 更新 KB 状态：检查是否还有其他文档待索引
-    kb.index_status = "ready"
-    kb.index_current_doc = ""
-    kb_repo.update(kb)
+    # 原子地更新完成状态（锁内 re-read，防覆盖并发 import 追加的 document_ids）
+    with _get_lock(kb_id):
+        kb = kb_repo.get(kb_id)
+        if kb:
+            kb.index_status = "ready"
+            kb.index_current_doc = ""
+            kb_repo.update(kb)
 
 
 def batch_import_documents(
@@ -147,7 +163,9 @@ def batch_import_documents(
 
         docs.append(doc)
 
-    kb_repo.update(kb)
+    # 原子写入 document_ids（防与异步线程的 status 更新交错）
+    with _get_lock(kb_id):
+        kb_repo.update(kb)
 
     if async_index and docs:
         thread = threading.Thread(
@@ -166,40 +184,46 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
     """后台批量索引文档（由 batch_import_documents 调用）。"""
     import storage.kb_repo as kb_repo
 
-    kb = kb_repo.get(kb_id)
-    if not kb:
-        return
+    # 获取最新 kb 并标记 building（原子周期）
+    with _get_lock(kb_id):
+        kb = kb_repo.get(kb_id)
+        if not kb:
+            return
 
-    # 收集需要索引的文档
-    texts = []
-    doc_map = {doc.id: doc for doc in docs}
-    for doc in docs:
-        if doc.file_path and os.path.exists(doc.file_path):
-            try:
-                with open(doc.file_path, "r", encoding="utf-8") as f:
-                    text = f.read()
-                texts.append((doc.id, text, doc.original_name))
-            except Exception as e:
-                _logger.warning("读取文档 %s 失败: %s", doc.id, e)
-                doc_map[doc.id].index_status = "failed"
-                doc_repo._save_doc_meta(doc_map[doc.id])
+        # 收集需要索引的文档
+        texts = []
+        doc_map = {doc.id: doc for doc in docs}
+        for doc in docs:
+            if doc.file_path and os.path.exists(doc.file_path):
+                try:
+                    with open(doc.file_path, "r", encoding="utf-8") as f:
+                        text = f.read()
+                    texts.append((doc.id, text, doc.original_name))
+                except Exception as e:
+                    _logger.warning("读取文档 %s 失败: %s", doc.id, e)
+                    doc_map[doc.id].index_status = "failed"
+                    doc_repo._save_doc_meta(doc_map[doc.id])
 
-    if not texts:
-        kb.index_status = "ready"
+        if not texts:
+            kb.index_status = "ready"
+            kb_repo.update(kb)
+            return
+
+        kb.index_status = "building"
         kb_repo.update(kb)
-        return
-
-    # 建索引前更新 KB 状态
-    kb.index_status = "building"
-    kb_repo.update(kb)
 
     indexed_ids = set()
 
     def _on_progress(current: int, total: int, doc_name: str):
-        kb.index_progress = current / total
-        kb.index_current_doc = doc_name
-        kb_repo.update(kb)
-        # 逐篇更新文档索引状态
+        # 锁内 re-read kb，防覆盖并发 import 追加的 document_ids
+        with _get_lock(kb_id):
+            inner_kb = kb_repo.get(kb_id)
+            if not inner_kb:
+                return
+            inner_kb.index_progress = current / total
+            inner_kb.index_current_doc = doc_name
+            kb_repo.update(inner_kb)
+        # 逐篇更新文档索引状态（文档元数据独立于 kb，无需锁）
         doc_id = texts[current - 1][0]
         if doc_id in doc_map:
             doc_map[doc_id].index_status = "ready"
@@ -209,20 +233,27 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
     try:
         from core.index_manager import index_documents_batch
         index_documents_batch(kb_id, texts, progress_callback=_on_progress)
-        kb.index_status = "ready"
-        kb.index_progress = 1.0
-        kb.index_current_doc = ""
+        # 锁内原子更新完成状态
+        with _get_lock(kb_id):
+            kb = kb_repo.get(kb_id) or kb
+            kb.index_status = "ready"
+            kb.index_progress = 1.0
+            kb.index_current_doc = ""
     except Exception as e:
         _logger.error("batch indexing failed for kb %s: %s", kb_id, e)
-        kb.index_status = "failed"
-        kb.index_current_doc = f"错误: {e}"
-    kb_repo.update(kb)
+        with _get_lock(kb_id):
+            kb = kb_repo.get(kb_id) or kb
+            kb.index_status = "failed"
+            kb.index_current_doc = f"错误: {e}"
+    with _get_lock(kb_id):
+        kb_repo.update(kb)
 
 
 def delete_document(kb_id: str, doc_id: str) -> bool:
-    # 更新知识库 document_ids
-    kb = kb_repo.get(kb_id)
-    if kb and doc_id in kb.document_ids:
-        kb.document_ids.remove(doc_id)
-        kb_repo.update(kb)
+    # 原子地从 document_ids 中移除（防与异步线程交错）
+    with _get_lock(kb_id):
+        kb = kb_repo.get(kb_id)
+        if kb and doc_id in kb.document_ids:
+            kb.document_ids.remove(doc_id)
+            kb_repo.update(kb)
     return doc_repo.delete_doc(kb_id, doc_id)

@@ -5,6 +5,7 @@
 """
 
 import os
+import threading
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,19 @@ DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 # 内存缓存: kb_id -> VectorStoreIndex
 _index_cache: dict[str, VectorStoreIndex] = {}
 
+# per-KB 可重入锁：防止并发索引同一 KB 导致 FAISS 死锁
+# 使用 RLock 因为 rebuild_kb_index/remove_document 会递归调用 index_document
+_index_locks: dict[str, threading.RLock] = {}
+_index_locks_lock = threading.Lock()
+
+
+def _get_index_lock(kb_id: str) -> threading.RLock:
+    """获取 KB 对应的可重入锁（线程安全创建）。"""
+    with _index_locks_lock:
+        if kb_id not in _index_locks:
+            _index_locks[kb_id] = threading.RLock()
+        return _index_locks[kb_id]
+
 
 # ── 内部路径 ────────────────────────────────────────────────────────────────────
 
@@ -40,16 +54,19 @@ def _ensure_dir(path: Path):
 # ── 索引创建 / 加载 / 缓存 ─────────────────────────────────────────────────────
 
 def _create_index(dim: int = 1024) -> VectorStoreIndex:
-    """创建新的空 FAISS 索引（HNSW + IDMap，支持高效 ANN 搜索和向量级删除）。"""
+    """创建新的空 FAISS 索引（HNSW，支持高效 ANN 搜索）。
+
+    注意：不套 IndexIDMap，因为 llama-index 的 FaissVectorStore.add()
+    只使用 faiss `add()` 而非 `add_with_ids()`，IDMap 会导致崩溃。
+    向量级删除（remove_document）降级到全量重建路径，代码已支持。
+    """
     # 确保 embedding 模型已初始化
     get_embed_model()
     # HNSW: 高效的近似最近邻索引，O(log n) 搜索
     hnsw_index = faiss.IndexHNSWFlat(dim, 32)
     hnsw_index.hnsw.efConstruction = 200  # 建图质量（越大越准）
     hnsw_index.hnsw.efSearch = 64         # 搜索精度
-    # IDMap 包装支持按 ID 删除向量
-    faiss_index = faiss.IndexIDMap(hnsw_index)
-    vector_store = FaissVectorStore(faiss_index=faiss_index)
+    vector_store = FaissVectorStore(faiss_index=hnsw_index)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
     # 直接用 VectorStoreIndex 构造，传入空 nodes + storage_context（含 FaissVectorStore）
     index = VectorStoreIndex(
@@ -132,18 +149,19 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = ""):
     if not text or len(text) < 20:
         return
 
-    index = get_kb_index(kb_id)
+    with _get_index_lock(kb_id):
+        index = get_kb_index(kb_id)
 
-    doc = Document(
-        text=text,
-        id_=doc_id,
-        metadata={"doc_id": doc_id, "source": source_name or doc_id},
-    )
+        doc = Document(
+            text=text,
+            id_=doc_id,
+            metadata={"doc_id": doc_id, "source": source_name or doc_id},
+        )
 
-    nodes = _split_document(doc)
-    index.insert_nodes(nodes)
+        nodes = _split_document(doc)
+        index.insert_nodes(nodes)
 
-    _persist(kb_id, index)
+        _persist(kb_id, index)
 
 
 def index_documents_batch(
@@ -161,25 +179,26 @@ def index_documents_batch(
     if not docs:
         return
 
-    index = get_kb_index(kb_id)
-    total = len(docs)
+    with _get_index_lock(kb_id):
+        index = get_kb_index(kb_id)
+        total = len(docs)
 
-    for i, (doc_id, text, source_name) in enumerate(docs, 1):
-        if progress_callback:
-            progress_callback(i, total, source_name or doc_id)
+        for i, (doc_id, text, source_name) in enumerate(docs, 1):
+            if progress_callback:
+                progress_callback(i, total, source_name or doc_id)
 
-        if not text or len(text) < 20:
-            continue
+            if not text or len(text) < 20:
+                continue
 
-        doc = Document(
-            text=text,
-            id_=doc_id,
-            metadata={"doc_id": doc_id, "source": source_name or doc_id},
-        )
-        nodes = _split_document(doc)
-        index.insert_nodes(nodes)
+            doc = Document(
+                text=text,
+                id_=doc_id,
+                metadata={"doc_id": doc_id, "source": source_name or doc_id},
+            )
+            nodes = _split_document(doc)
+            index.insert_nodes(nodes)
 
-    _persist(kb_id, index)
+        _persist(kb_id, index)
 
 
 def _split_document(doc: Document):
@@ -204,51 +223,52 @@ def remove_document(kb_id: str, doc_id: str):
     HNSW + IDMap 支持向量级删除（快速路径），
     降级到全量重建（兼容旧版 FlatIP 索引或异常场景）。
     """
-    # 快速路径：通过 delete_ref_doc 直接从索引删除
-    try:
-        index = get_kb_index(kb_id)
-        # 检查底层索引是否支持删除（IDMap）
-        if hasattr(index.vector_store, '_faiss_index') and hasattr(index.vector_store._faiss_index, 'remove_ids'):
-            index.delete_ref_doc(doc_id, delete_from_docstore=True)
-            _persist(kb_id, index)
-            _logger.info("removed doc %s from kb %s via delete_ref_doc", doc_id, kb_id)
+    with _get_index_lock(kb_id):
+        # 快速路径：通过 delete_ref_doc 直接从索引删除
+        try:
+            index = get_kb_index(kb_id)
+            # 检查底层索引是否支持删除（IDMap）
+            if hasattr(index.vector_store, '_faiss_index') and hasattr(index.vector_store._faiss_index, 'remove_ids'):
+                index.delete_ref_doc(doc_id, delete_from_docstore=True)
+                _persist(kb_id, index)
+                _logger.info("removed doc %s from kb %s via delete_ref_doc", doc_id, kb_id)
+                return
+        except Exception as e:
+            _logger.warning("vector-level deletion failed for %s/%s (%s), fallback to rebuild", kb_id, doc_id, e)
+
+        # 降级路径：全量重建（IndexFlatIP 不支持删除）
+        _logger.info("fallback rebuild for kb %s after removing doc %s", kb_id, doc_id)
+        _index_cache.pop(kb_id, None)
+
+        vectors_dir = _vectors_dir(kb_id)
+        if vectors_dir.exists():
+            shutil.rmtree(str(vectors_dir))
+
+        import storage.kb_repo as kb_repo
+        kb = kb_repo.get(kb_id)
+        if not kb:
             return
-    except Exception as e:
-        _logger.warning("vector-level deletion failed for %s/%s (%s), fallback to rebuild", kb_id, doc_id, e)
 
-    # 降级路径：全量重建（IndexFlatIP 不支持删除）
-    _logger.info("fallback rebuild for kb %s after removing doc %s", kb_id, doc_id)
-    _index_cache.pop(kb_id, None)
+        remaining_ids = [did for did in kb.document_ids if did != doc_id]
+        if not remaining_ids:
+            return  # 已无其他文档，无需重建
 
-    vectors_dir = _vectors_dir(kb_id)
-    if vectors_dir.exists():
-        shutil.rmtree(str(vectors_dir))
+        index = _create_index()
+        _index_cache[kb_id] = index
 
-    import storage.kb_repo as kb_repo
-    kb = kb_repo.get(kb_id)
-    if not kb:
-        return
+        from storage.doc_repo import get_doc
 
-    remaining_ids = [did for did in kb.document_ids if did != doc_id]
-    if not remaining_ids:
-        return  # 已无其他文档，无需重建
+        for did in remaining_ids:
+            doc = get_doc(kb_id, did)
+            if doc and doc.file_path and Path(doc.file_path).exists():
+                try:
+                    text = _extract_text(doc.file_path)
+                    if text:
+                        index_document(kb_id, did, text)
+                except Exception as e:
+                    print(f"  [skip] {did}: {e}")
 
-    index = _create_index()
-    _index_cache[kb_id] = index
-
-    from storage.doc_repo import get_doc
-
-    for did in remaining_ids:
-        doc = get_doc(kb_id, did)
-        if doc and doc.file_path and Path(doc.file_path).exists():
-            try:
-                text = _extract_text(doc.file_path)
-                if text:
-                    index_document(kb_id, did, text)
-            except Exception as e:
-                print(f"  [skip] {did}: {e}")
-
-    _persist(kb_id, index)
+        _persist(kb_id, index)
 
 
 def rebuild_kb_index(kb_id: str, progress_callback=None):
@@ -259,37 +279,38 @@ def rebuild_kb_index(kb_id: str, progress_callback=None):
         progress_callback: 可选回调 (current_index, total, doc_name) → None，
                            每处理完一篇文档后调用，用于外部汇报进度。
     """
-    _index_cache.pop(kb_id, None)
+    with _get_index_lock(kb_id):
+        _index_cache.pop(kb_id, None)
 
-    vectors_dir = _vectors_dir(kb_id)
-    if vectors_dir.exists():
-        shutil.rmtree(str(vectors_dir))
+        vectors_dir = _vectors_dir(kb_id)
+        if vectors_dir.exists():
+            shutil.rmtree(str(vectors_dir))
 
-    import storage.kb_repo as kb_repo
-    kb = kb_repo.get(kb_id)
-    if not kb:
-        return
+        import storage.kb_repo as kb_repo
+        kb = kb_repo.get(kb_id)
+        if not kb:
+            return
 
-    index = _create_index()
-    _index_cache[kb_id] = index
+        index = _create_index()
+        _index_cache[kb_id] = index
 
-    from storage.doc_repo import get_doc
-    total = len(kb.document_ids)
+        from storage.doc_repo import get_doc
+        total = len(kb.document_ids)
 
-    for i, doc_id in enumerate(kb.document_ids, 1):
-        doc = get_doc(kb_id, doc_id)
-        doc_name = doc.original_name if doc and doc.original_name else doc_id
-        if progress_callback:
-            progress_callback(i, total, doc_name)
-        if doc and doc.file_path and Path(doc.file_path).exists():
-            try:
-                text = _extract_text(doc.file_path)
-                if text:
-                    index_document(kb_id, doc_id, text)
-            except Exception as e:
-                _logger.warning("  [skip] %s: %s", doc_id, e)
+        for i, doc_id in enumerate(kb.document_ids, 1):
+            doc = get_doc(kb_id, doc_id)
+            doc_name = doc.original_name if doc and doc.original_name else doc_id
+            if progress_callback:
+                progress_callback(i, total, doc_name)
+            if doc and doc.file_path and Path(doc.file_path).exists():
+                try:
+                    text = _extract_text(doc.file_path)
+                    if text:
+                        index_document(kb_id, doc_id, text)
+                except Exception as e:
+                    _logger.warning("  [skip] %s: %s", doc_id, e)
 
-    _persist(kb_id, index)
+        _persist(kb_id, index)
 
 
 def get_kb_index_built(kb_id: str) -> bool:
@@ -315,9 +336,10 @@ def search(kb_ids: list[str], query: str, top_k: int = 5) -> list[dict]:
         if not get_kb_index_built(kb_id):
             continue
         try:
-            index = get_kb_index(kb_id)
-            retriever = index.as_retriever(similarity_top_k=top_k)
-            nodes = retriever.retrieve(query)
+            with _get_index_lock(kb_id):
+                index = get_kb_index(kb_id)
+                retriever = index.as_retriever(similarity_top_k=top_k)
+                nodes = retriever.retrieve(query)
             for node in nodes:
                 meta = node.metadata or {}
                 hits.append({

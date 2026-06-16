@@ -17,8 +17,8 @@ def cleanup():
     """每个测试后清理数据"""
     yield
     import storage.audit_doc_repo as audit_doc_repo
-    if audit_doc_repo.AUDIT_DOCS_DIR.exists():
-        shutil.rmtree(audit_doc_repo.AUDIT_DOCS_DIR)
+    if audit_doc_repo.DATA_DIR.exists():
+        shutil.rmtree(audit_doc_repo.DATA_DIR)
 
 
 def test_upload_document():
