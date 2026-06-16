@@ -30,10 +30,29 @@ export function KnowledgeBaseDetail() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['kb-docs', id] }),
   })
 
+  const batchImport = useMutation({
+    mutationFn: (files: File[]) => kbApi.documents.batchImport(id!, files),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['kb-docs', id] })
+      qc.invalidateQueries({ queryKey: ['kb', id] })
+    },
+  })
+
   const reindex = useMutation({
     mutationFn: () => kbApi.reindex(id!),
     // 成功后由 refetchInterval 轮询自动获取进度，无需手动 invalidate
   })
+
+  const handleFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || [])
+    if (files.length === 0) return
+    e.target.value = ''
+    if (files.length === 1) {
+      importDoc.mutate(files[0])
+    } else {
+      batchImport.mutate(files)
+    }
+  }
 
   const deleteDoc = useMutation({
     mutationFn: (docId: string) => kbApi.documents.delete(id!, docId),
@@ -88,12 +107,15 @@ export function KnowledgeBaseDetail() {
 
       <Card>
         <CardHeader title="文档管理" action={
-          <label className="btn-secondary btn-sm cursor-pointer">
-            <Upload className="w-3.5 h-3.5" /> 导入文档
-            <input type="file" accept=".pdf,.doc,.docx,.md" className="hidden" onChange={(e) => {
-              const f = e.target.files?.[0]; if (f) importDoc.mutate(f); e.target.value = ''
-            }} />
-          </label>
+          <div className="flex items-center gap-2">
+            <label className="btn-secondary btn-sm cursor-pointer">
+              <Upload className="w-3.5 h-3.5" /> 导入文档
+              <input type="file" accept=".pdf,.doc,.docx,.md" multiple className="hidden" onChange={handleFiles} />
+            </label>
+            {batchImport.isPending && (
+              <span className="text-xs text-blue-600">上传中 ({batchImport.variables?.length || 0} 个文件)…</span>
+            )}
+          </div>
         } />
         <CardBody className="p-0">
           {docsLoading ? (

@@ -27,6 +27,13 @@ export const kbApi = {
         headers: { 'Content-Type': 'multipart/form-data' },
       }).then(r => r.data)
     },
+    batchImport: (kbId: string, files: File[]) => {
+      const form = new FormData()
+      files.forEach((f) => form.append('files', f))
+      return api.post<{ total: number }>(`/documents/${kbId}/batch-upload`, form, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      }).then(r => r.data)
+    },
     delete: (kbId: string, docId: string) =>
       api.delete(`/knowledge-bases/${kbId}/documents/${docId}`),
   },

@@ -140,15 +140,55 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = ""):
         metadata={"doc_id": doc_id, "source": source_name or doc_id},
     )
 
-    # 检测文本是否包含 Markdown 标题，决定使用哪种分块器
-    if _has_markdown_headings(text):
-        splitter = MarkdownNodeParser()
-    else:
-        splitter = SentenceSplitter(chunk_size=512, chunk_overlap=50)
-    nodes = splitter.get_nodes_from_documents([doc])
+    nodes = _split_document(doc)
     index.insert_nodes(nodes)
 
     _persist(kb_id, index)
+
+
+def index_documents_batch(
+    kb_id: str,
+    docs: list[tuple[str, str, str]],
+    progress_callback=None,
+):
+    """批量索引文档，全部处理完再持久化一次。
+
+    Args:
+        kb_id: 知识库 ID。
+        docs: [(doc_id, text, source_name), ...] 列表。
+        progress_callback: 可选回调 (current, total, doc_name) → None。
+    """
+    if not docs:
+        return
+
+    index = get_kb_index(kb_id)
+    total = len(docs)
+
+    for i, (doc_id, text, source_name) in enumerate(docs, 1):
+        if progress_callback:
+            progress_callback(i, total, source_name or doc_id)
+
+        if not text or len(text) < 20:
+            continue
+
+        doc = Document(
+            text=text,
+            id_=doc_id,
+            metadata={"doc_id": doc_id, "source": source_name or doc_id},
+        )
+        nodes = _split_document(doc)
+        index.insert_nodes(nodes)
+
+    _persist(kb_id, index)
+
+
+def _split_document(doc: Document):
+    """根据文档内容选择分块器。"""
+    if _has_markdown_headings(doc.text):
+        splitter = MarkdownNodeParser()
+    else:
+        splitter = SentenceSplitter(chunk_size=512, chunk_overlap=50)
+    return splitter.get_nodes_from_documents([doc])
 
 
 def _has_markdown_headings(text: str) -> bool:
