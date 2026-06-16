@@ -21,6 +21,11 @@ def list_kbs(category: Optional[str] = None) -> list[KnowledgeBase]:
     return kbs
 
 
+def update_kb(kb: KnowledgeBase) -> KnowledgeBase:
+    """更新知识库。"""
+    return kb_repo.update(kb)
+
+
 def delete_kb(kb_id: str) -> bool:
     """级联删除知识库全部数据（docs + meta + vectors）。"""
     return kb_repo.delete(kb_id)
