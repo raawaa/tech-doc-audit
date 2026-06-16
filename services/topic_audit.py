@@ -3,15 +3,18 @@
 流程：
 1. 预定义关键词在 parsed_content 全文定位相关段落
 2. KB 搜索
-3. 1 次 LLM 审核调用
+3. 1 次 LLM 审核调用（ChatPromptTemplate + structured output）
 """
 
 import re
-import json
+from llama_index.core.llms import ChatMessage, MessageRole
+from llama_index.core.prompts import ChatPromptTemplate
 
 from models.audit_task import AuditIssue, IssueLocation, StandardRef
+from models.llm_schemas import TopicIssueList
 from services.document_nav import DocumentNav
 from core.logger import get_logger
+from core.settings import get_llm
 
 _logger = get_logger(__name__)
 
@@ -99,10 +102,27 @@ def locate_paragraphs(content: str, keywords: list[str]) -> str:
 
 AUDIT_SYSTEM_PROMPT = """你是一个严格的技术文档审核专家。请对给定主题审核文档中的相关段落。
 
-对于每个发现的问题，返回 JSON：
-{"issues": [{"type": "compliance|completeness|consistency", "clause_number": "条款编号", "description": "描述", "severity": "high|medium|low", "standard_reference": {"standard_name": "", "standard_id": "", "clause": "", "requirement": ""}, "suggestion": "建议"}]}
+对于每个发现的问题，按要求的格式输出。没有问题的主题返回空列表。"""
 
-没有问题的主题返回 {"issues": []}。"""
+# 结构化输出模板
+_audit_prompt = ChatPromptTemplate(
+    message_templates=[
+        ChatMessage(role=MessageRole.SYSTEM, content=AUDIT_SYSTEM_PROMPT),
+        ChatMessage(
+            role=MessageRole.USER,
+            content="""审核主题：{topic_name}
+审核要求：{topic_prompt}
+
+【文档相关段落】
+{chapter_body}
+
+【知识库参考依据】
+{kb_reference}
+
+请参照知识库中的标准/制度内容，审核文档中的相关段落是否合规。对比检查是否存在不一致、违规或遗漏之处。""",
+        ),
+    ]
+)
 
 
 def audit_topic(
@@ -118,38 +138,59 @@ def audit_topic(
     if not chapter_body:
         chapter_body = "（文档中未找到匹配内容）"
 
-    # 从知识库检索相关标准/制度条文（用预定义关键词直接搜索）
     kb_reference = _search_kb_by_keywords(kb_ids, keywords, topic["name"])
 
-    user_prompt = f"""审核主题：{topic['name']}
-审核要求：{topic['prompt']}
-
-【文档相关段落】
-{chapter_body}
-
-【知识库参考依据】
-{kb_reference}
-
-请参照知识库中的标准/制度内容，审核文档中的相关段落是否合规。对比检查是否存在不一致、违规或遗漏之处。"""
+    messages = _audit_prompt.format_messages(
+        topic_name=topic["name"],
+        topic_prompt=topic.get("prompt", ""),
+        chapter_body=chapter_body,
+        kb_reference=kb_reference,
+    )
 
     try:
-        from core.settings import get_llm
-        from llama_index.core.llms import ChatMessage, MessageRole
+        structured_llm = get_llm().as_structured_llm(output_cls=TopicIssueList)
+        response = structured_llm.chat(messages)
+        result: TopicIssueList = response.raw
+    except Exception:
+        # 降级：手调 .chat() + JSON 解析
+        try:
+            response = get_llm().chat(messages)
+            result = _parse_json_fallback(response.message.content or "")
+        except Exception as e:
+            _logger.warning("topic audit failed (%s): %s", topic.get("id", "?"), e)
+            return []
 
-        messages = [
-            ChatMessage(role=MessageRole.SYSTEM, content=AUDIT_SYSTEM_PROMPT),
-            ChatMessage(role=MessageRole.USER, content=user_prompt),
-        ]
-        response = get_llm().chat(messages)
-        content = response.message.content or ""
+    if not result or not result.issues:
+        return []
 
-        match = re.search(r'\{.*\}', content, re.DOTALL)
-        if match:
-            data = json.loads(match.group(0))
-            return _parse_issues(data, topic_index)
-    except Exception as e:
-        _logger.warning("topic audit failed (%s): %s", topic.get("id", "?"), e)
-    return []
+    return _issues_from_schema(result, topic_index)
+
+
+def _issues_from_schema(result: TopicIssueList, topic_index: int) -> list[AuditIssue]:
+    """将结构化 LLM 输出映射为 AuditIssue 列表。"""
+    issues = []
+    for i, item in enumerate(result.issues):
+        std_ref = item.standard_reference
+        issue = AuditIssue(
+            id=topic_index * 1000 + i + 1,
+            type=item.type if item.type in ("compliance", "completeness", "consistency") else "completeness",
+            location=IssueLocation(
+                clause_number=item.clause_number,
+                original_text=item.description[:200],
+            ),
+            description=item.description,
+            severity=item.severity if item.severity in ("high", "medium", "low") else "medium",
+            suggestion=item.suggestion,
+        )
+        if std_ref:
+            issue.standard_reference = StandardRef(
+                standard_name=std_ref.standard_name or "",
+                standard_id=std_ref.standard_id or "",
+                clause=std_ref.clause,
+                requirement=std_ref.requirement,
+            )
+        issues.append(issue)
+    return issues
 
 
 def _search_kb(kb_ids: list[str], query: str) -> str:
@@ -169,31 +210,17 @@ def _search_kb_by_keywords(kb_ids: list[str], keywords: list[str], topic_name: s
             return result
     except Exception:
         pass
-    # 降级到普通搜索
     return _search_kb(kb_ids, topic_name)
 
 
-def _parse_issues(data: dict, topic_index: int) -> list[AuditIssue]:
-    issues = []
-    for i, item in enumerate(data.get("issues", [])):
-        std_ref = item.get("standard_reference")
-        issue = AuditIssue(
-            id=topic_index * 1000 + i + 1,
-            type=item.get("type", "completeness"),
-            location=IssueLocation(
-                clause_number=item.get("clause_number"),
-                original_text=item.get("description", "")[:200],
-            ),
-            description=item.get("description", ""),
-            severity=item.get("severity", "medium"),
-            suggestion=item.get("suggestion"),
-        )
-        if std_ref:
-            issue.standard_reference = StandardRef(
-                standard_name=std_ref.get("standard_name", ""),
-                standard_id=std_ref.get("standard_id", ""),
-                clause=std_ref.get("clause"),
-                requirement=std_ref.get("requirement"),
-            )
-        issues.append(issue)
-    return issues
+def _parse_json_fallback(content: str) -> TopicIssueList | None:
+    """当 structured_llm 不可用时的降级解析。"""
+    import json
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+        return TopicIssueList.model_validate(data)
+    except Exception:
+        return None

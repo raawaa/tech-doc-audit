@@ -1,6 +1,6 @@
 """LlamaIndex 全局配置。
 
-所有 embedding / chunking / LLM 配置在此处统一管理。
+所有 embedding / chunking / LLM / 可观测性 在此处统一管理。
 Settings 会在首次 import 时自动配置。
 """
 
@@ -16,6 +16,7 @@ if _env_path.exists():
 
 from llama_index.core import Settings
 from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.callbacks import CallbackManager, LlamaDebugHandler
 
 
 def _init():
@@ -24,6 +25,13 @@ def _init():
     ]
     Settings.chunk_size = 512
     Settings.chunk_overlap = 50
+
+    # 全局 CallbackManager：追踪 LLM 调用耗时与 token 用量
+    debug_handler = LlamaDebugHandler()
+    Settings.callback_manager = CallbackManager([debug_handler])
+
+    # 将 callback_manager 关联到全局 Settings
+    # 后续 get_llm() 创建的 LLM 实例会自动继承此 callback_manager
 
 
 _init()
