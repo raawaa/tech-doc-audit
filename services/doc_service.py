@@ -120,6 +120,7 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
 
     # 收集需要索引的文档
     texts = []
+    doc_map = {doc.id: doc for doc in docs}
     for doc in docs:
         if doc.file_path and os.path.exists(doc.file_path):
             try:
@@ -128,18 +129,30 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
                 texts.append((doc.id, text, doc.original_name))
             except Exception as e:
                 _logger.warning("读取文档 %s 失败: %s", doc.id, e)
+                doc_map[doc.id].index_status = "failed"
+                doc_repo._save_doc_meta(doc_map[doc.id])
 
     if not texts:
+        kb.index_status = "ready"
+        kb_repo.update(kb)
         return
 
     # 建索引前更新 KB 状态
     kb.index_status = "building"
     kb_repo.update(kb)
 
+    indexed_ids = set()
+
     def _on_progress(current: int, total: int, doc_name: str):
         kb.index_progress = current / total
         kb.index_current_doc = doc_name
         kb_repo.update(kb)
+        # 逐篇更新文档索引状态
+        doc_id = texts[current - 1][0]
+        if doc_id in doc_map:
+            doc_map[doc_id].index_status = "ready"
+            doc_repo._save_doc_meta(doc_map[doc_id])
+            indexed_ids.add(doc_id)
 
     try:
         from core.index_manager import index_documents_batch

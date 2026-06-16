@@ -11,13 +11,13 @@ class KBDocument(BaseModel):
     kb_id: str
     name: str
     original_name: str
-    file_type: Literal["pdf", "doc", "docx"]
+    file_type: Literal["pdf", "doc", "docx", "md"]
     file_path: str
     tree_index_path: Optional[str] = None
     page_count: Optional[int] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
-    index_status: Literal["none", "building", "ready", "failed"] = "none"
+    index_status: Literal["none", "building", "ready", "failed", "pending_index"] = "none"
     metadata: dict = Field(default_factory=dict)
 
     class Config:

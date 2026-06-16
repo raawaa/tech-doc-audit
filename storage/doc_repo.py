@@ -73,9 +73,12 @@ def list_docs(kb_id: str) -> list[KBDocument]:
     results = []
     for f in meta_dir.iterdir():
         if f.suffix == ".json" and f.stem != "kb":
-            with open(f, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            results.append(KBDocument.from_dict(data))
+            try:
+                with open(f, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                results.append(KBDocument.from_dict(data))
+            except Exception:
+                continue
     return results
 
 

@@ -36,6 +36,7 @@ export function KnowledgeBaseDetail() {
       qc.invalidateQueries({ queryKey: ['kb-docs', id] })
       qc.invalidateQueries({ queryKey: ['kb', id] })
     },
+    onError: (err) => console.error('批量上传失败:', err),
   })
 
   const reindex = useMutation({
