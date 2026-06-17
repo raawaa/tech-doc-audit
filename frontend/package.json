@@ -9,13 +9,18 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@ai-sdk/react": "^3.0.209",
     "@tanstack/react-query": "^5.0.0",
+    "ai": "^6.0.207",
     "axios": "^1.6.0",
     "clsx": "^2.1.1",
     "lucide-react": "^1.18.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "react-markdown": "^10.1.0",
     "react-router-dom": "^6.22.0",
+    "remark-gfm": "^4.0.1",
+    "sonner": "^2.0.7",
     "tailwind-merge": "^3.6.0"
   },
   "devDependencies": {

@@ -5,6 +5,7 @@ import { DefaultChatTransport } from 'ai'
 import { Send, Loader2, MessageSquare, ChevronDown, ChevronRight, Copy, RefreshCw, Square } from 'lucide-react'
 import { kbApi } from '../api/endpoints'
 import { Card, CardBody } from '../components/Card'
+import { Markdown } from '../components/Markdown'
 
 import type { QASource } from '../api/types'
 
@@ -158,7 +159,7 @@ export function QA() {
                       <div className={`max-w-[70%] rounded-lg px-4 py-3 text-sm ${
                         msg.role === 'user' ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-900'
                       }`}>
-                        <p className="whitespace-pre-wrap leading-relaxed">{getMessageText(msg)}</p>
+                        <div className="markdown-body"><Markdown content={getMessageText(msg)} /></div>
                         {msg.role === 'assistant' && sourcesMap.has(msg.id) && (
                         <div className="mt-2 pt-2 border-t border-slate-200/60">
                           <button
@@ -250,9 +251,7 @@ export function QA() {
               {isStreaming && chat.messages[chat.messages.length - 1]?.role === 'assistant' && (
                 <div className="flex justify-start">
                   <div className="max-w-[70%] rounded-lg px-4 py-3 text-sm bg-slate-100 text-slate-900">
-                    <p className="whitespace-pre-wrap leading-relaxed">
-                      {getMessageText(chat.messages[chat.messages.length - 1])}
-                    </p>
+                    <div className="markdown-body"><Markdown content={getMessageText(chat.messages[chat.messages.length - 1])} /></div>
                     {!getMessageText(chat.messages[chat.messages.length - 1]) && (
                       <div className="flex items-center gap-2">
                         <Loader2 className="w-4 h-4 animate-spin text-slate-400" />
