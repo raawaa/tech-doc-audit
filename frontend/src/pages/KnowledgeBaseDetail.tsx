@@ -31,6 +31,7 @@ export function KnowledgeBaseDetail() {
       qc.invalidateQueries({ queryKey: ['kb-docs', id] })
       qc.invalidateQueries({ queryKey: ['kb', id] })
     },
+    onError: (err) => alert('导入失败：' + (err as Error).message),
   })
 
   const batchImport = useMutation({
@@ -39,7 +40,7 @@ export function KnowledgeBaseDetail() {
       qc.invalidateQueries({ queryKey: ['kb-docs', id] })
       qc.invalidateQueries({ queryKey: ['kb', id] })
     },
-    onError: (err) => console.error('批量上传失败:', err),
+    onError: (err) => alert('批量导入失败：' + (err as Error).message),
   })
 
   const reindex = useMutation({

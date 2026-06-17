@@ -80,7 +80,6 @@ export function AuditDocDetail() {
                       </p>
                       <p className="text-xs text-slate-400 mt-0.5">
                         {new Date(task.created_at).toLocaleString('zh-CN')}
-                        {task.status === 'processing' && ` · ${Math.round(task.progress * 100)}%`}
                       </p>
                     </div>
                   </div>
@@ -95,8 +94,8 @@ export function AuditDocDetail() {
                         查看结果
                       </button>
                     )}
-                    {task.status === 'processing' && task.result?.issues && (
-                      <span className="text-xs text-slate-400">已发现 {task.result.issues.length} 个问题</span>
+                    {task.status === 'processing' && (
+                      <span className="text-xs text-slate-400">处理中 {Math.round(task.progress * 100)}%</span>
                     )}
                   </div>
                 </div>

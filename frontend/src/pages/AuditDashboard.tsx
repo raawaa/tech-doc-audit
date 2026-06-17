@@ -35,7 +35,10 @@ export function AuditDashboard() {
 
   const upload = useMutation({
     mutationFn: (file: File) => auditDocApi.upload(file),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['audit-docs'] }),
+    onSuccess: (doc) => {
+      qc.invalidateQueries({ queryKey: ['audit-docs'] })
+      if (doc?.id) processDoc.mutate(doc.id)
+    },
   })
 
   const processDoc = useMutation({
@@ -50,10 +53,14 @@ export function AuditDashboard() {
 
   const createAudit = useMutation({
     mutationFn: (data: { document_id: string; kb_ids: string[] }) => auditTaskApi.create(data),
-    onSuccess: (task) => {
+    onSuccess: async (task) => {
       setShowAuditModal(false)
       setSelectedKBs([])
-      auditTaskApi.run(task.id, true)
+      try {
+        await auditTaskApi.run(task.id, true)
+      } catch (e) {
+        alert('启动审核失败：' + (e as Error).message)
+      }
       qc.invalidateQueries({ queryKey: ['audit-docs'] })
       qc.invalidateQueries({ queryKey: ['audit-tasks'] })
     },
@@ -143,7 +150,9 @@ export function AuditDashboard() {
                         {statusActions[doc.status] && (
                           <button className="btn-ghost btn-sm" onClick={() => handleAction(doc)}>
                             {statusActions[doc.status].action === 'process' ? (
-                              <><Loader2 className="w-3.5 h-3.5" /> 解析</>
+                              processDoc.isPending
+                                ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> 解析</>
+                                : <><FileText className="w-3.5 h-3.5" /> 解析</>
                             ) : (
                               <><Play className="w-3.5 h-3.5" /> 审核</>
                             )}
