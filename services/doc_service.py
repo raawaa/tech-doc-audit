@@ -212,6 +212,8 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
             return
 
         kb.index_status = "building"
+        kb.index_progress = 0.0
+        kb.index_current_doc = texts[0][2] if texts else "准备中…"
         kb_repo.update(kb)
 
     indexed_ids = set()
