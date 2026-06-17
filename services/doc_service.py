@@ -108,6 +108,7 @@ def _index_single_doc_async(kb_id: str, doc: KBDocument):
         if not kb:
             return
         kb.index_status = "building"
+        kb.index_progress = 0.0
         kb.index_current_doc = doc.original_name
         kb_repo.update(kb)
 
@@ -124,6 +125,7 @@ def _index_single_doc_async(kb_id: str, doc: KBDocument):
         kb = kb_repo.get(kb_id)
         if kb:
             kb.index_status = "ready"
+            kb.index_progress = 1.0
             kb.index_current_doc = ""
             kb_repo.update(kb)
 
