@@ -14,6 +14,11 @@ _env_path = Path(__file__).resolve().parent.parent / ".env"
 if _env_path.exists():
     load_dotenv(_env_path)
 
+# ── 内存控制 ──────────────────────────────────────────────────────────────────
+# 在导入 PyTorch / sentence-transformers 前设置，控制 CPU 线程数以减少内存峰值
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+
 from llama_index.core import Settings
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.callbacks import CallbackManager, LlamaDebugHandler
@@ -56,6 +61,8 @@ def get_embed_model():
         model_name=_model_path,
         normalize=True,
         device="cpu",
+        embed_batch_size=2,   # 默认 10，减少为 2 以降低峰值内存 ~80%
+        max_length=512,       # 匹配 chunk_size，防止超长序列拉高内存
     )
     Settings.embed_model = _embed_model
     return _embed_model

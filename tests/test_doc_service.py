@@ -122,6 +122,75 @@ def test_batch_import_documents_async():
     assert kb.index_status == "ready"
 
 
+# ── Markdown 文档导入 ────────────────────────────────────────────────────────
+
+
+def test_import_markdown_document():
+    """测试导入 .md 文件（同步索引，含 ## 标题触发 MarkdownNodeParser）。"""
+    kb = kb_svc.create_kb(name="测试MD导入", category="national")
+
+    content = "# 设计说明\n\n## 第一章 总则\n\n这是总则内容。\n\n## 第二章 要求\n\n这是具体要求内容。".encode()
+    doc = doc_svc.import_document(kb.id, "设计说明.md", content)
+
+    assert doc.name == "设计说明.md"
+    assert doc.file_type == "md"
+    assert doc.kb_id == kb.id
+    assert doc.index_status == "ready"
+
+
+def test_import_markdown_document_async():
+    """测试异步导入 .md 文件。"""
+    import storage.kb_repo as kb_repo
+
+    kb = kb_svc.create_kb(name="测试MD异步", category="national")
+
+    content = "# 施工规范\n\n## 第一章 总则\n\n施工规范测试内容。\n\n## 第二章 要求\n\n具体要求内容。".encode()
+    doc = doc_svc.import_document(kb.id, "施工规范.md", content, async_index=True)
+
+    assert doc.index_status == "pending_index"
+
+    # 等待后台线程完成（MD 提取快速返回）
+    for _ in range(50):
+        if doc.index_status != "pending_index":
+            break
+        time.sleep(0.1)
+
+    assert doc.index_status in ("ready", "failed"), f"expected ready/failed, got {doc.index_status}"
+
+    # 验证 KB 状态恢复 ready
+    kb = kb_repo.get(kb.id)
+    assert kb is not None
+    assert doc.id in kb.document_ids
+    assert kb.index_status == "ready"
+
+
+def test_batch_import_markdown_documents():
+    """测试批量导入 .md 文件（同步索引，避免后台线程竞态）。"""
+    import storage.kb_repo as kb_repo
+
+    kb = kb_svc.create_kb(name="测试MD批量", category="national")
+
+    files = [
+        ("设计说明.md", "# 设计说明\n\n## 第一章\n\n内容一。\n\n## 第二章\n\n内容二。".encode()),
+        ("施工规范.md", "# 施工规范\n\n## 第一章\n\n内容三。\n\n## 第二章\n\n内容四。".encode()),
+    ]
+
+    docs = doc_svc.batch_import_documents(kb.id, files, async_index=False)
+    assert len(docs) == 2
+
+    # 同步索引完成后验证
+    kb = kb_repo.get(kb.id)
+    assert kb is not None
+    assert len(kb.document_ids) == 2
+    for doc in docs:
+        assert doc.id in kb.document_ids, f"doc {doc.id} not in document_ids"
+    assert doc.index_status == "ready"
+    assert kb.index_status == "ready"
+
+
+# ── 删除 / 异常 ──────────────────────────────────────────────────────────────
+
+
 def test_delete_document():
     """测试删除文档"""
     kb = kb_svc.create_kb(name="测试", category="national")

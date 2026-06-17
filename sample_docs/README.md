@@ -4,9 +4,12 @@
 
 ## 需准备的文档
 
-1. `sample_standard.pdf` - 示例标准规范文档
+1. `sample_standard.pdf` - 示例标准规范文档（PDF）
    - 建议使用一份真实的技术标准文档（如国家标准 GB 文档）
    - 或使用下面提供的生成脚本创建测试文档
+2. `sample.md` - 示例标准规范文档（Markdown）
+   - 内容与 `sample_standard.pdf` 一致，含多级标题结构
+   - 用于测试 Markdown 文件导入和标题感知分块路径
 
 ## 文档要求
 

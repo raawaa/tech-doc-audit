@@ -45,7 +45,7 @@ class KBResponse(BaseModel):
     updated_at: str
     document_count: int
     index_status: str
-    index_progress: float = 0.0
+    index_progress: Optional[float] = None
     index_current_doc: str = ""
 
     @classmethod

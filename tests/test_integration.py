@@ -37,32 +37,45 @@ def test_full_workflow():
     assert kb.name == "测试知识库"
     print(f"✓ 知识库创建成功: {kb.id}")
 
-    # 2. 导入文档到知识库
+    # 2. 导入文档到知识库（PDF）
     import services.doc_service as doc_svc
-    sample_path = "sample_docs/sample_standard.pdf"
-    if os.path.exists(sample_path):
-        with open(sample_path, "rb") as f:
+    sample_pdf = "sample_docs/sample_standard.pdf"
+    if os.path.exists(sample_pdf):
+        with open(sample_pdf, "rb") as f:
             content = f.read()
         kb_doc = doc_svc.import_document(kb.id, "标准文档.pdf", content)
         assert kb_doc.id is not None
-        print(f"✓ 文档导入知识库成功: {kb_doc.id}")
+        assert kb_doc.file_type == "pdf"
+        print(f"✓ PDF 文档导入知识库成功: {kb_doc.id}")
 
-    # 3. 上传待审核文档
+    # 3. 导入 Markdown 文档到知识库
+    sample_md = "sample_docs/sample.md"
+    if os.path.exists(sample_md):
+        with open(sample_md, "rb") as f:
+            content = f.read()
+        md_doc = doc_svc.import_document(kb.id, "技术标准.md", content)
+        assert md_doc.id is not None
+        assert md_doc.file_type == "md"
+        assert md_doc.index_status == "ready"
+        print(f"✓ MD 文档导入知识库成功: {md_doc.id}")
+
+    # 4. 上传待审核文档
     import services.audit_doc_service as audit_doc_svc
-    if os.path.exists(sample_path):
-        with open(sample_path, "rb") as f:
+    sample_audit_path = "sample_docs/sample_standard.pdf"
+    if os.path.exists(sample_audit_path):
+        with open(sample_audit_path, "rb") as f:
             content = f.read()
         audit_doc = audit_doc_svc.upload_document("待审核文档.pdf", content)
         assert audit_doc.id is not None
         print(f"✓ 待审核文档上传成功: {audit_doc.id}")
 
-        # 4. 解析文档
+        # 5. 解析文档
         audit_doc = audit_doc_svc.parse_document(audit_doc.id)
         assert audit_doc.status == "parsed"
         assert audit_doc.page_count is not None
         print(f"✓ 文档解析成功: {audit_doc.page_count} 页")
 
-        # 5. 创建审核任务
+        # 6. 创建审核任务
         import services.audit_task_service as task_svc
         task = task_svc.create_task(
             document_id=audit_doc.id,
@@ -71,7 +84,7 @@ def test_full_workflow():
         assert task.id is not None
         print(f"✓ 审核任务创建成功: {task.id}")
 
-        # 6. 列出任务
+        # 7. 列出任务
         tasks = task_svc.list_tasks(audit_doc.id)
         assert len(tasks) == 1
         print(f"✓ 任务列表查询成功")

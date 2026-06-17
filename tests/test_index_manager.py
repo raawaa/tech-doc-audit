@@ -133,10 +133,12 @@ def test_rebuild_kb_index():
     kb = kb_svc.create_kb(name="测试重建", category="national")
 
     doc_001 = doc_svc.import_document(
-        kb.id, "设计说明.md", "建筑工程设计文件编制深度规定内容与标准要求".encode(),
+        kb.id, "设计说明.md",
+        "# 设计说明\n\n## 第一章 总则\n\n建筑工程设计文件编制深度规定内容与标准要求。\n\n## 第二章 要求\n\n各项设计应符合国家标准。".encode(),
     )
     doc_002 = doc_svc.import_document(
-        kb.id, "施工规范.md", "建筑施工组织设计规范标准要求与实施指南内容".encode(),
+        kb.id, "施工规范.md",
+        "# 施工规范\n\n## 第一章 总则\n\n建筑施工组织设计规范标准要求与实施指南内容。\n\n## 第二章 验收\n\n施工质量应符合设计文件要求。".encode(),
     )
 
     # 确认两条 doc_id 都在 KB 中
@@ -182,3 +184,49 @@ def test_index_same_doc_twice():
     # 不应报错，搜索结果应正常
     results = search([kb_id], "重复", top_k=5)
     assert len(results) >= 1
+
+
+def test_index_markdown_with_headings():
+    """测试带 ## 标题的 Markdown 内容触发 MarkdownNodeParser 分块路径。"""
+    from core.index_manager import _has_markdown_headings
+
+    kb_id = "test_kb_md_headings"
+
+    md_text = """# 技术标准
+
+## 第一章 总则
+
+### 1.1 范围
+
+本标准规定技术要求与验收标准。
+
+### 1.2 引用文件
+
+下列文件对本文件的应用是必不可少的。
+
+## 第二章 术语和定义
+
+### 2.1 术语一
+
+术语一的定义和解释说明。
+
+### 2.2 术语二
+
+术语二的定义和解释说明。
+"""
+
+    # 验证 _has_markdown_headings 能正确检测 ## 标题
+    assert _has_markdown_headings(md_text), "应检测到 Markdown 标题"
+
+    index_document(kb_id, "doc_md", md_text, source_name="standard.md")
+
+    # 搜索总则章节内容
+    r1 = search([kb_id], "技术标准", top_k=5)
+    assert len(r1) >= 1
+
+    # 搜索不同章节内容，验证分块后各章节均可检索
+    r2 = search([kb_id], "术语定义", top_k=5)
+    assert len(r2) >= 1
+
+    r3 = search([kb_id], "引用文件", top_k=5)
+    assert len(r3) >= 1

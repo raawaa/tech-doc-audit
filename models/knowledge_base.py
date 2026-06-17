@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Optional
 from pydantic import BaseModel, Field
 from ulid import ULID
 
@@ -15,7 +15,7 @@ class KnowledgeBase(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     document_ids: list[str] = Field(default_factory=list)
     index_status: Literal["none", "building", "ready", "failed"] = "none"
-    index_progress: float = 0.0
+    index_progress: Optional[float] = None
     index_current_doc: str = ""
 
     class Config:

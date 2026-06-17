@@ -4,6 +4,7 @@
 索引加载后缓存在内存中，避免重复读盘。
 """
 
+import gc
 import os
 import threading
 import shutil
@@ -161,6 +162,10 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = ""):
         nodes = _split_document(doc)
         index.insert_nodes(nodes)
 
+        # 释放临时对象并回收内存
+        del doc, nodes
+        gc.collect()
+
         _persist(kb_id, index)
 
 
@@ -197,6 +202,11 @@ def index_documents_batch(
             )
             nodes = _split_document(doc)
             index.insert_nodes(nodes)
+
+            # 主动释放大对象，防止批量索引时内存堆积
+            del doc, nodes
+            if i % 5 == 0:
+                gc.collect()
 
         _persist(kb_id, index)
 
