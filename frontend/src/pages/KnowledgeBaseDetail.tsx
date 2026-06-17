@@ -24,7 +24,7 @@ export function KnowledgeBaseDetail() {
     queryFn: () => kbApi.documents.list(id!),
     enabled: !!id,
     // 索引进行中时轮询文档状态（pending_index → ready/failed）
-    refetchInterval: kb?.index_status === 'building' ? 3000 : false,
+    refetchInterval: kb?.index_status === 'building' ? 2000 : false,
   })
 
   const importDoc = useMutation({

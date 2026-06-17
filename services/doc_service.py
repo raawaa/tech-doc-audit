@@ -118,10 +118,10 @@ def _index_single_doc_async(kb_id: str, doc: KBDocument):
     except Exception as e:
         _logger.warning("async indexing failed for doc %s: %s", doc.id, e)
         doc.index_status = "failed"
-    doc_repo._save_doc_meta(doc)
 
-    # 原子地更新完成状态（锁内 re-read，防覆盖并发 import 追加的 document_ids）
+    # 原子地更新文档和 KB 状态（同一锁内，防止前端看到 doc ready 而 KB 还在 building）
     with _get_lock(kb_id):
+        doc_repo._save_doc_meta(doc)
         kb = kb_repo.get(kb_id)
         if kb:
             kb.index_status = "ready"
@@ -217,7 +217,7 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
     indexed_ids = set()
 
     def _on_progress(current: int, total: int, doc_name: str):
-        # 锁内 re-read kb，防覆盖并发 import 追加的 document_ids
+        # 锁内更新 KB 进度 + 文档状态，防止前端看到 doc ready 而 KB 还在 building
         with _get_lock(kb_id):
             inner_kb = kb_repo.get(kb_id)
             if not inner_kb:
@@ -225,12 +225,11 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
             inner_kb.index_progress = current / total
             inner_kb.index_current_doc = doc_name
             kb_repo.update(inner_kb)
-        # 逐篇更新文档索引状态（文档元数据独立于 kb，无需锁）
-        doc_id = texts[current - 1][0]
-        if doc_id in doc_map:
-            doc_map[doc_id].index_status = "ready"
-            doc_repo._save_doc_meta(doc_map[doc_id])
-            indexed_ids.add(doc_id)
+            doc_id = texts[current - 1][0]
+            if doc_id in doc_map:
+                doc_map[doc_id].index_status = "ready"
+                doc_repo._save_doc_meta(doc_map[doc_id])
+                indexed_ids.add(doc_id)
 
     try:
         from core.index_manager import index_documents_batch
