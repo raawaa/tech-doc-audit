@@ -33,15 +33,15 @@ services:
       - OLLAMA_BASE_URL=http://ollama:11434
       - OLLAMA_MODEL=qwen3.5:0.8b
       - AUDIT_DATA_DIR=/app/data
-    depends_on:
-      ollama:
-        condition: service_healthy
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      - EMBED_DEVICE=cuda
+      - MINERU_DEVICE_MODE=cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   # 前端服务
   frontend:

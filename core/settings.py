@@ -60,7 +60,7 @@ def get_embed_model():
     _embed_model = HuggingFaceEmbedding(
         model_name=_model_path,
         normalize=True,
-        device="cpu",
+        device=os.getenv("EMBED_DEVICE", None),
         embed_batch_size=2,   # 默认 10，减少为 2 以降低峰值内存 ~80%
         max_length=512,       # 匹配 chunk_size，防止超长序列拉高内存
     )

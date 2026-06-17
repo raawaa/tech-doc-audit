@@ -23,6 +23,7 @@ dependencies = [
     # 工具库
     "python-ulid>=2.0.0",
     "sentence-transformers>=5.5.0",
+    "torch>=2.4.0,<2.8.0",
     "modelscope>=1.36.3",
     "llama-index-core>=0.14.22",
     "llama-index-vector-stores-faiss>=0.6.0",
