@@ -52,7 +52,7 @@ def get_doc(doc_id: str) -> Optional[AuditDocument]:
 
 
 def list_docs() -> list[AuditDocument]:
-    """列出所有待审核文档。"""
+    """列出所有待审核文档（仅元数据，不含大字段）。"""
     audits_dir = DATA_DIR / "audits"
     _ensure_dir(audits_dir)
     results = []
@@ -61,6 +61,11 @@ def list_docs() -> list[AuditDocument]:
         if meta.exists():
             with open(meta, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
+            # 剥离大字段避免轮询时反复反序列化消耗内存。
+            # parsed_content 可达 50KB-2MB/篇，structure 同样庞大，
+            # 只有 get_doc() 才需要加载它们。
+            data.pop("parsed_content", None)
+            data.pop("structure", None)
             results.append(AuditDocument.from_dict(data))
     results.sort(key=lambda d: d.created_at, reverse=True)
     return results

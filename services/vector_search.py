@@ -19,6 +19,7 @@ from core.index_manager import (
     remove_document as _remove_from_store,
     rebuild_kb_index as _rebuild_store,
     get_kb_index_built,
+    _get_index_lock,
 )
 from core.logger import get_logger
 
@@ -112,17 +113,26 @@ def _text_search(paths: list[str], keywords: list[str], max_results: int = 5) ->
 
 
 def _ensure_kb_index(kb_id: str):
-    """确保 KB 索引存在，必要时重建。"""
-    if not get_kb_index_built(kb_id):
-        _rebuild_store(kb_id)
+    """确保 KB 索引存在，必要时重建（线程安全）。"""
+    if get_kb_index_built(kb_id):
+        return
+    # 在 per-KB 锁内二次检查，避免多个线程同时触发冗余重建
+    with _get_index_lock(kb_id):
+        if not get_kb_index_built(kb_id):
+            _rebuild_store(kb_id)
 
 
-def vec_search(kb_ids: list[str], query: str, top_k: int = 5) -> list[dict]:
-    """向量搜索主干 — 内部调用 LlamaIndex VectorStoreIndex。"""
+def vec_search(kb_ids: list[str], query: str, top_k: int = 5, rebuild_if_missing: bool = True) -> list[dict]:
+    """向量搜索主干 — 内部调用 LlamaIndex VectorStoreIndex。
+
+    rebuild_if_missing: 索引文件不存在时是否自动重建。QA 请求应设为 False
+                        以避免同步重建阻塞 HTTP 线程。
+    """
     if not query or not kb_ids:
         return []
     for kb_id in kb_ids:
-        _ensure_kb_index(kb_id)
+        if rebuild_if_missing:
+            _ensure_kb_index(kb_id)
     return _vec_search(kb_ids, query, top_k)
 
 
@@ -154,9 +164,9 @@ def rebuild_kb_index(kb_id: str, progress_callback=None):
 # ── 搜索接口 ─────────────────────────────────────────────────────────────
 
 
-def search(kb_ids: list[str], query: str, max_results: int = 5) -> list[dict]:
+def search(kb_ids: list[str], query: str, max_results: int = 5, rebuild_if_missing: bool = True) -> list[dict]:
     """向量搜索（与旧版兼容）。"""
-    return vec_search(kb_ids, query, max_results)
+    return vec_search(kb_ids, query, max_results, rebuild_if_missing=rebuild_if_missing)
 
 
 def search_by_keywords(kb_ids: list[str], keywords: list[str], topic_name: str = "") -> str:

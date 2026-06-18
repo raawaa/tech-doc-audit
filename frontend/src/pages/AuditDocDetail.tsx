@@ -1,14 +1,18 @@
+import { useRef, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, Play, Loader2, FileText } from 'lucide-react'
+import { ArrowLeft, Play, Loader2, FileText, XCircle } from 'lucide-react'
+import { toast } from 'sonner'
 import { auditDocApi, auditTaskApi } from '../api/endpoints'
 import { Card, CardHeader, CardBody } from '../components/Card'
 import { Badge } from '../components/Badge'
+import { ProgressBar } from '../components/ProgressBar'
 
 export function AuditDocDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const qc = useQueryClient()
+  const prevTaskStatus = useRef<Record<string, string>>({})
 
   const { data: doc, isLoading } = useQuery({
     queryKey: ['audit-doc', id],
@@ -20,8 +24,36 @@ export function AuditDocDetail() {
     queryKey: ['audit-tasks', id],
     queryFn: () => auditTaskApi.list(id),
     enabled: !!id,
-    refetchInterval: 2000,
+    refetchInterval: (query) => {
+      const data = query.state.data
+      if (!data) return 2000
+      // 有活跃任务时继续轮询，否则停止
+      if (data.some(t => t.status === 'processing' || t.status === 'pending')) return 2000
+      return false
+    },
   })
+
+  // 检测任务状态变更 → toast 通知
+  useEffect(() => {
+    for (const task of tasks) {
+      const prev = prevTaskStatus.current[task.id]
+      if (!prev) {
+        prevTaskStatus.current[task.id] = task.status
+        continue
+      }
+      if (prev === 'processing' && task.status === 'completed') {
+        toast.success('审核完成！', {
+          action: {
+            label: '查看结果',
+            onClick: () => navigate(`/audit/${id}/result/${task.id}`),
+          },
+        })
+      } else if (prev === 'processing' && task.status === 'failed') {
+        toast.error('审核失败')
+      }
+      prevTaskStatus.current[task.id] = task.status
+    }
+  }, [tasks, id, navigate])
 
   const processDoc = useMutation({
     mutationFn: () => auditDocApi.process(id!),
@@ -31,6 +63,17 @@ export function AuditDocDetail() {
   const runTask = useMutation({
     mutationFn: (taskId: string) => auditTaskApi.run(taskId, true),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['audit-tasks', id] }),
+  })
+
+  const cancelTask = useMutation({
+    mutationFn: (taskId: string) => auditTaskApi.cancel(taskId),
+    onSuccess: () => {
+      toast.success('任务已取消')
+      qc.invalidateQueries({ queryKey: ['audit-tasks', id] })
+    },
+    onError: (err) => {
+      toast.error('取消失败：' + (err as Error).message)
+    },
   })
 
   if (isLoading) return <div className="flex justify-center py-20"><Loader2 className="w-6 h-6 animate-spin text-slate-400" /></div>
@@ -95,7 +138,29 @@ export function AuditDocDetail() {
                       </button>
                     )}
                     {task.status === 'processing' && (
-                      <span className="text-xs text-slate-400">处理中 {Math.round(task.progress * 100)}%</span>
+                      <div className="flex items-center gap-2">
+                        <div className="w-24">
+                          <ProgressBar value={task.progress} />
+                        </div>
+                        <span className="text-xs text-slate-500 min-w-[4rem]">
+                          {task.progress_label ?? `处理中 ${Math.round(task.progress * 100)}%`}
+                        </span>
+                        <button
+                          className="btn-ghost btn-sm !text-red-400 hover:!text-red-600"
+                          onClick={() => cancelTask.mutate(task.id)}
+                          title="取消任务"
+                        >
+                          <XCircle className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    )}
+                    {task.status === 'failed' && (
+                      <button
+                        className="btn-ghost btn-sm !text-red-500"
+                        onClick={() => cancelTask.mutate(task.id)}
+                      >
+                        删除
+                      </button>
                     )}
                   </div>
                 </div>

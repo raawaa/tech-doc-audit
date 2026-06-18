@@ -21,17 +21,20 @@ class CrossKBRetriever(BaseRetriever):
     Args:
         kb_ids: 知识库 ID 列表。
         top_k: 每个 KB 的检索数量（最终合并后取 top_k）。
+        use_reranker: 是否使用 reranker 重排序检索结果。
     """
 
     def __init__(
         self,
         kb_ids: list[str],
         top_k: int = 5,
+        use_reranker: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)  # type: ignore[call-arg]
         self.kb_ids = kb_ids
         self.top_k = top_k
+        self.use_reranker = use_reranker
 
     def _retrieve(self, query_bundle: QueryBundle) -> list[NodeWithScore]:
         """在多个 KB 中检索，合并排序后返回 top_k 个结果。"""
@@ -56,4 +59,18 @@ class CrossKBRetriever(BaseRetriever):
                 continue
 
         results = sorted(all_nodes.values(), key=lambda n: n.score or 0, reverse=True)
+
+        # ── Reranker 重排序 ────────────────────────────────────────────────
+        # 用 cross-encoder 对候选结果精确打分，弥补 bi-encoder ANN 精度损失
+        if self.use_reranker and results:
+            try:
+                from core.settings import get_reranker
+                reranker = get_reranker()
+                if reranker is not None:
+                    reranked = reranker.postprocess_nodes(results, query_str=query)
+                    if reranked:
+                        results = reranked
+            except Exception as e:
+                _logger.warning("reranker postprocess failed, using raw ranking: %s", e)
+
         return results[: self.top_k]

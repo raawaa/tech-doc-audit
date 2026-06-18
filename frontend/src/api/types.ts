@@ -42,6 +42,7 @@ export interface AuditTask {
   document_name: string
   status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled'
   progress: number
+  progress_label?: string
   created_at: string
   started_at?: string
   completed_at?: string

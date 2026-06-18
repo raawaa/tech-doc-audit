@@ -70,6 +70,7 @@ class AuditTask(BaseModel):
     audit_types: list[AuditType] = Field(default_factory=lambda: ["compliance", "completeness", "consistency"])
     status: Literal["pending", "processing", "completed", "failed", "cancelled"] = "pending"
     progress: float = 0.0
+    progress_label: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     result: Optional[AuditResult] = None

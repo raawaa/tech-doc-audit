@@ -5,6 +5,7 @@ Settings 会在首次 import 时自动配置。
 """
 
 import os
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -22,6 +23,9 @@ os.environ.setdefault("MKL_NUM_THREADS", "2")
 from llama_index.core import Settings
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.callbacks import CallbackManager, LlamaDebugHandler
+from core.logger import get_logger
+
+_logger = get_logger(__name__)
 
 
 def _init():
@@ -43,29 +47,94 @@ _init()
 
 
 _embed_model = None
+_embed_model_lock = threading.Lock()
+# 全局 GPU 推理锁：HuggingFaceEmbedding / SentenceTransformerRerank 的 GPU
+# forward 非线程安全。此锁确保同时只有一个线程执行模型前向传播，
+# 避免 N 个并发线程各自分配完整激活张量撑爆显存。
+_gpu_inference_lock = threading.RLock()
+
+
+def get_gpu_inference_lock() -> threading.RLock:
+    """获取全局 GPU 推理锁。"""
+    return _gpu_inference_lock
 
 
 def get_embed_model():
-    """延迟加载 embedding 模型（首次调用时加载 ~2GB bge-m3）。"""
+    """线程安全地延迟加载 embedding 模型（首次调用时加载 ~2GB bge-m3）。
+
+    get_embed_model 可能被多个线程同时调用（例如 ThreadPoolExecutor
+    中 8 个 topic audit 并行），必须保证模型只被加载一次。
+    """
     global _embed_model
     if _embed_model is not None:
         return _embed_model
-    from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-    _modelscope_path = os.path.expanduser("~/.cache/modelscope/hub/BAAI/bge-m3")
-    if os.path.isdir(_modelscope_path):
-        # ModelScope 本地缓存优先（无网络环境）
-        _model_path = _modelscope_path
-    else:
-        _model_path = "BAAI/bge-m3"
-    _embed_model = HuggingFaceEmbedding(
-        model_name=_model_path,
-        normalize=True,
-        device=os.getenv("EMBED_DEVICE", None),
-        embed_batch_size=2,   # 默认 10，减少为 2 以降低峰值内存 ~80%
-        max_length=512,       # 匹配 chunk_size，防止超长序列拉高内存
-    )
-    Settings.embed_model = _embed_model
+    with _embed_model_lock:
+        # 双检锁：避免多个线程同时进入后各自加载一份模型
+        if _embed_model is not None:
+            return _embed_model
+        from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+        _modelscope_path = os.path.expanduser("~/.cache/modelscope/hub/BAAI/bge-m3")
+        if os.path.isdir(_modelscope_path):
+            # ModelScope 本地缓存优先（无网络环境）
+            _model_path = _modelscope_path
+        else:
+            _model_path = "BAAI/bge-m3"
+        _embed_model = HuggingFaceEmbedding(
+            model_name=_model_path,
+            normalize=True,
+            device=os.getenv("EMBED_DEVICE", None),
+            embed_batch_size=2,   # 默认 10，减少为 2 以降低峰值内存 ~80%
+            max_length=512,       # 匹配 chunk_size，防止超长序列拉高内存
+        )
+        Settings.embed_model = _embed_model
     return _embed_model
+
+
+# ── Reranker ────────────────────────────────────────────────────────────────────
+
+_reranker = None
+_reranker_lock = threading.Lock()
+
+
+def get_reranker():
+    """线程安全地延迟加载 reranker 模型（用于检索结果重排序，提升精度）。
+
+    Reranker 是一种 cross-encoder，对 query-doc 对做精确打分重排，
+    弥补 bi-encoder（bge-m3）ANN 检索的精度损失。
+
+    如果加载失败（模型未下载 / OOM / 依赖缺失），静默降级不阻断裂。
+    """
+    global _reranker
+    if _reranker is not None:
+        return _reranker
+    with _reranker_lock:
+        if _reranker is not None:
+            return _reranker
+
+    model_name = os.environ.get("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+    top_n = int(os.environ.get("RERANKER_TOP_N", "5"))
+    # 默认自动检测 GPU（None → SentenceTransformerRerank 自动选 cuda 或 cpu）
+    # 如果设置了 EMBED_DEVICE 但没单独设 RERANKER_DEVICE，跟随 EMBED_DEVICE
+    device = os.environ.get("RERANKER_DEVICE") or os.environ.get("EMBED_DEVICE", None)
+
+    try:
+        # ModelScope 本地缓存优先（同 bge-m3 策略）
+        _modelscope_path = os.path.expanduser(f"~/.cache/modelscope/hub/{model_name}")
+        if os.path.isdir(_modelscope_path):
+            model_name = _modelscope_path
+
+        from llama_index.core.postprocessor import SentenceTransformerRerank
+        _reranker = SentenceTransformerRerank(
+            model=model_name,
+            top_n=top_n,
+            device=device,
+            trust_remote_code=True,
+        )
+    except Exception as e:
+        _logger.warning("reranker init failed (%s), degraded to raw ranking: %s", model_name, e)
+        _reranker = None  # type: ignore[assignment]
+
+    return _reranker
 
 
 # ── LLM ────────────────────────────────────────────────────────────────────────
@@ -110,6 +179,7 @@ def get_llm():
         )
     elif provider == "deepseek":
         from llama_index.llms.openai import OpenAI as OpenAILLM
+        import httpx
         base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
         api_key = os.environ.get("DEEPSEEK_API_KEY", "")
         model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
@@ -117,10 +187,21 @@ def get_llm():
         from llama_index.llms.openai import utils as _openai_utils
         _openai_utils.ALL_AVAILABLE_MODELS[model] = 128000
         _openai_utils.CHAT_MODELS[model] = 128000
-        _llm = OpenAILLM(
-            model=model, api_base=base_url, api_key=api_key,
-            request_timeout=timeout, is_chat_model=True,
-        )
+        # 创建 httpx client 时 trust_env=False，绕过 SOCKS 代理干扰
+        # 与 _SafeOllama 的 trust_env=False 原理一致
+        http_client = httpx.Client(trust_env=False, timeout=httpx.Timeout(timeout))
+        # 临时移除代理环境变量防止 httpx Client() 初始化时读取
+        _orig = os.environ.pop("ALL_PROXY", None)
+        os.environ.pop("all_proxy", None)
+        try:
+            _llm = OpenAILLM(
+                model=model, api_base=base_url, api_key=api_key,
+                request_timeout=timeout, is_chat_model=True,
+                http_client=http_client,
+            )
+        finally:
+            if _orig is not None:
+                os.environ["ALL_PROXY"] = _orig
     else:
         raise ValueError(f"Unknown LLM_PROVIDER: {provider}")
 

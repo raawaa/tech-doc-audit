@@ -22,6 +22,7 @@ class TaskResponse(BaseModel):
     document_name: str
     status: str
     progress: float
+    progress_label: Optional[str] = None
     created_at: str
 
     @classmethod
@@ -32,6 +33,7 @@ class TaskResponse(BaseModel):
             document_name=task.document_name,
             status=task.status,
             progress=task.progress,
+            progress_label=task.progress_label,
             created_at=str(task.created_at),
         )
 

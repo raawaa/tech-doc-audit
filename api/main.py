@@ -44,6 +44,20 @@ for kb_dir in (kb_repo.KBS_DIR.iterdir() if kb_repo.KBS_DIR.exists() else []):
 
 del _stuck_kbs
 
+# 审核任务：将因上次服务器重启中断的 processing 任务标记为 failed
+import storage.audit_task_repo as audit_task_repo
+from datetime import datetime
+
+_stuck_tasks = [t for t in audit_task_repo.list_tasks() if t.status == "processing"]
+for task in _stuck_tasks:
+    task.status = "failed"
+    task.error_message = "审核任务因服务重启中断"
+    task.completed_at = datetime.utcnow()
+    audit_task_repo.save_task(task)
+    print(f"[startup] 恢复卡住的审核任务: {task.document_name} ({task.id}) → failed")
+
+del _stuck_tasks
+
 # ─────────────────────────────────────────────────────────────
 
 # CORS — 从环境变量读取允许的 origin 列表（逗号分隔）

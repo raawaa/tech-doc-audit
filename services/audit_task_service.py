@@ -151,6 +151,7 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
 
         # 2. 并行执行各主题审核
         # 各主题间无依赖，并行化可大幅缩短总耗时
+        # 使用 as_completed 逐个跟踪进度，每个主题完成后更新 progress
         all_issues = []
         raw_parts = []
         success_count = 0
@@ -159,27 +160,34 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(8, len(topics)) if topics else 1
         ) as executor:
-            futures = [
+            future_map = {
                 executor.submit(
                     _audit_single_topic, topic, parsed_content, task.kb_ids, i
-                )
+                ): topic
                 for i, topic in enumerate(topics)
-            ]
-            concurrent.futures.wait(futures)
+            }
+            total = len(future_map)
+            for future in concurrent.futures.as_completed(future_map):
+                topic = future_map[future]
+                result = future.result()
+                if result["success"]:
+                    success_count += 1
+                else:
+                    fail_count += 1
+                all_issues.extend(result["issues"])
+                raw_parts.append(
+                    f"{result['name']}: 发现 {len(result['issues'])} 个问题"
+                    if result["issues"]
+                    else f"{result['name']}: 无问题"
+                )
+                # 每完成一个主题就更新一次进度
+                completed = success_count + fail_count
+                task.progress = 0.15 + (completed / total) * 0.75
+                task.progress_label = result["name"] if result["success"] else f"失败：{result['name']}"
+                repo.save_task(task)
 
-        for future in futures:
-            result = future.result()
-            if result["success"]:
-                success_count += 1
-            else:
-                fail_count += 1
-            all_issues.extend(result["issues"])
-            raw_parts.append(
-                f"{result['name']}: 发现 {len(result['issues'])} 个问题"
-                if result["issues"]
-                else f"{result['name']}: 无问题"
-            )
-
+        topic_progress = sum(1 for r in raw_parts)
+        task.progress_label = f"已完成 {topic_progress}/{total} 个主题"
         task.progress = 0.9
         repo.save_task(task)
 

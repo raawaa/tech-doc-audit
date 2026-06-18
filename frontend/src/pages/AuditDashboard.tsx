@@ -1,12 +1,14 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Upload, FileText, Trash2, Play, Eye, Loader2 } from 'lucide-react'
+import { toast } from 'sonner'
 import { auditDocApi, auditTaskApi, kbApi } from '../api/endpoints'
 import type { AuditDocument } from '../api/types'
 import { Card, CardHeader, CardBody } from '../components/Card'
 import { Badge } from '../components/Badge'
 import { Modal } from '../components/Modal'
+import { ProgressBar } from '../components/ProgressBar'
 
 const statusActions: Record<string, { label: string; action: 'process' | 'audit' }> = {
   uploaded: { label: '解析', action: 'process' },
@@ -33,6 +35,24 @@ export function AuditDashboard() {
     queryFn: () => kbApi.list(),
   })
 
+  // 轮询所有任务，用于在仪表盘显示进度
+  const { data: allTasks = [] } = useQuery({
+    queryKey: ['audit-tasks-all'],
+    queryFn: () => auditTaskApi.list(),
+    refetchInterval: 3000,
+  })
+
+  // 建立 doc_id → 进度信息的映射
+  const taskProgressMap = useMemo(() => {
+    const map = new Map<string, { progress: number; label?: string }>()
+    for (const task of allTasks) {
+      if (task.status === 'processing') {
+        map.set(task.document_id, { progress: task.progress, label: task.progress_label })
+      }
+    }
+    return map
+  }, [allTasks])
+
   const upload = useMutation({
     mutationFn: (file: File) => auditDocApi.upload(file),
     onSuccess: (doc) => {
@@ -56,13 +76,20 @@ export function AuditDashboard() {
     onSuccess: async (task) => {
       setShowAuditModal(false)
       setSelectedKBs([])
+      toast.success('审核任务已创建，正在后台处理')
       try {
         await auditTaskApi.run(task.id, true)
       } catch (e) {
-        alert('启动审核失败：' + (e as Error).message)
+        toast.error('启动审核失败：' + (e as Error).message)
+        return
       }
+      // 自动跳转到详情页，让用户能看到实时进度
+      navigate(`/audit/${task.document_id}`)
       qc.invalidateQueries({ queryKey: ['audit-docs'] })
       qc.invalidateQueries({ queryKey: ['audit-tasks'] })
+    },
+    onError: (err) => {
+      toast.error('创建审核任务失败：' + (err as Error).message)
     },
   })
 
@@ -144,7 +171,22 @@ export function AuditDashboard() {
                     </td>
                     <td className="px-5 py-3.5 text-sm text-slate-500">{doc.file_type?.toUpperCase()}</td>
                     <td className="px-5 py-3.5 text-sm text-slate-500">{doc.page_count ?? '-'}</td>
-                    <td className="px-5 py-3.5"><Badge value={doc.status} /></td>
+                    <td className="px-5 py-3.5">
+                      <div className="flex flex-col gap-1.5">
+                        <Badge value={doc.status} />
+                        {(() => {
+                          const p = taskProgressMap.get(doc.id)
+                          return p ? (
+                            <div className="flex flex-col gap-0.5 min-w-[80px]">
+                              <ProgressBar value={p.progress} className="h-1.5" />
+                              <span className="text-[10px] text-slate-400 leading-tight">
+                                {p.label ?? `处理中 ${Math.round(p.progress * 100)}%`}
+                              </span>
+                            </div>
+                          ) : null
+                        })()}
+                      </div>
+                    </td>
                     <td className="px-5 py-3.5">
                       <div className="flex items-center justify-end gap-1">
                         {statusActions[doc.status] && (

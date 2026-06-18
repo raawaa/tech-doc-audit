@@ -330,39 +330,75 @@ def get_kb_index_built(kb_id: str) -> bool:
 
 # ── 搜索 ────────────────────────────────────────────────────────────────────────
 
-def search(kb_ids: list[str], query: str, top_k: int = 5) -> list[dict]:
+def search(kb_ids: list[str], query: str, top_k: int = 5, use_reranker: bool = True) -> list[dict]:
     """跨 KB 向量搜索。
 
     返回格式与旧版 vec_search() 兼容：
     [{source, kb_id, doc_id, content, doc_source, relevance}, ...]
+
+    当 reranker 可用时，用 cross-encoder 对候选结果重排序提升精度。
     """
     if not query or not kb_ids:
         return []
 
-    hits = []
     # 确保 embed_model 已加载，防止 LlamaIndex 默认解析到 OpenAI
     get_embed_model()
-    for kb_id in kb_ids:
-        if not get_kb_index_built(kb_id):
-            continue
-        try:
-            with _get_index_lock(kb_id):
-                index = get_kb_index(kb_id)
-                retriever = index.as_retriever(similarity_top_k=top_k)
-                nodes = retriever.retrieve(query)
-            for node in nodes:
-                meta = node.metadata or {}
-                hits.append({
-                    "source": "vec_search",
-                    "kb_id": kb_id,
-                    "doc_id": meta.get("doc_id", ""),
-                    "content": node.text,
-                    "doc_source": meta.get("source", ""),
-                    "relevance": round(node.get_score() or 0, 4),
-                })
-        except Exception as e:
-            _logger.warning("vector search failed for kb %s: %s", kb_id, e)
-            continue
 
-    hits.sort(key=lambda x: -x["relevance"])
-    return hits[:top_k]
+    from core.settings import get_gpu_inference_lock
+    gpu_lock = get_gpu_inference_lock()
+
+    # 将整个 GPU 相关操作置于锁内。HuggingFaceEmbedding 和
+    # SentenceTransformerRerank 的 forward 非线程安全，并发调用会各自
+    # 分配完整激活张量撑爆显存。此锁确保同时只有一个进程执行模型前向传播，
+    # LLM 调用（DeepSeek API 不走 GPU）不受影响仍可并行。
+    with gpu_lock:
+        # 先收集 NodeWithScore 对象，保留完整 score 信息
+        from llama_index.core.schema import NodeWithScore
+        all_nodes: list[NodeWithScore] = []
+        for kb_id in kb_ids:
+            if not get_kb_index_built(kb_id):
+                continue
+            try:
+                with _get_index_lock(kb_id):
+                    index = get_kb_index(kb_id)
+                    retriever = index.as_retriever(similarity_top_k=top_k)
+                    nodes = retriever.retrieve(query)
+                for node in nodes:
+                    node.node.metadata["kb_id"] = kb_id
+                    all_nodes.append(node)
+            except Exception as e:
+                _logger.warning("vector search failed for kb %s: %s", kb_id, e)
+                continue
+
+        if not all_nodes:
+            return []
+
+        all_nodes.sort(key=lambda n: n.score or 0, reverse=True)
+        all_nodes = all_nodes[: top_k * 2]  # 多留候选给 reranker
+
+        # ── Reranker 重排序 ────────────────────────────────────────────────
+        if use_reranker:
+            try:
+                from core.settings import get_reranker
+                reranker = get_reranker()
+                if reranker is not None:
+                    reranked = reranker.postprocess_nodes(all_nodes, query_str=query)
+                    if reranked:
+                        all_nodes = reranked
+            except Exception as e:
+                _logger.warning("reranker failed in search, using raw ranking: %s", e)
+
+    # 转换为 dict 返回格式
+    hits = []
+    for node in all_nodes[:top_k]:
+        meta = node.metadata or {}
+        hits.append({
+            "source": "vec_search",
+            "kb_id": meta.get("kb_id", ""),
+            "doc_id": meta.get("doc_id", ""),
+            "content": node.text,
+            "doc_source": meta.get("source", ""),
+            "relevance": round(node.get_score() or 0, 4),
+        })
+
+    return hits

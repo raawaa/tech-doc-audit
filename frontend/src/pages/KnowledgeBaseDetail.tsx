@@ -1,9 +1,11 @@
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, Upload, FileText, RefreshCw, Trash2, Loader2 } from 'lucide-react'
+import { toast } from 'sonner'
 import { kbApi } from '../api/endpoints'
 import { Card, CardHeader, CardBody } from '../components/Card'
 import { Badge } from '../components/Badge'
+import { ProgressBar } from '../components/ProgressBar'
 
 export function KnowledgeBaseDetail() {
   const { id } = useParams<{ id: string }>()
@@ -33,7 +35,7 @@ export function KnowledgeBaseDetail() {
       qc.invalidateQueries({ queryKey: ['kb-docs', id] })
       qc.invalidateQueries({ queryKey: ['kb', id] })
     },
-    onError: (err) => alert('导入失败：' + (err as Error).message),
+    onError: (err) => toast.error('导入失败：' + (err as Error).message),
   })
 
   const batchImport = useMutation({
@@ -42,7 +44,7 @@ export function KnowledgeBaseDetail() {
       qc.invalidateQueries({ queryKey: ['kb-docs', id] })
       qc.invalidateQueries({ queryKey: ['kb', id] })
     },
-    onError: (err) => alert('批量导入失败：' + (err as Error).message),
+    onError: (err) => toast.error('批量导入失败：' + (err as Error).message),
   })
 
   const reindex = useMutation({
@@ -101,12 +103,7 @@ export function KnowledgeBaseDetail() {
                 </span>
                 <span>{Math.round((kb.index_progress ?? 0) * 100)}%</span>
               </div>
-              <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-blue-600 rounded-full transition-all duration-500"
-                  style={{ width: `${(kb.index_progress ?? 0) * 100}%` }}
-                />
-              </div>
+              <ProgressBar value={kb.index_progress ?? 0} />
             </div>
           )}
         </CardBody>
