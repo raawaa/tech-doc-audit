@@ -20,9 +20,9 @@ if _env_path.exists():
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
 # huggingface_hub 离线模式：禁止 HEAD 请求 huggingface.co 检查文件元数据。
-# 本机无法直连 HF（见 settings.py _SafeOllama 需绕 SOCKS），HF 请求会触发
-# 5 次指数退避重试（1+2+4+8+16≈31s/文件），导致 get_reranker() 等函数挂死数分钟。
-# 设为 1 后仅使用本地缓存，失败即快速报错（被各加载函数的 try/except 降级处理）。
+# 本机无法直连 HF，默认离线以 ModelScope 本地缓存优先；如需首次下载模型，
+# 在 .env 中设 HF_HUB_OFFLINE=0 + HF_ENDPOINT=https://hf-mirror.com。
+# 下载完成后切回 1（或不设，走默认）。
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 from llama_index.core import Settings
@@ -69,6 +69,9 @@ def get_embed_model():
 
     get_embed_model 可能被多个线程同时调用（例如 ThreadPoolExecutor
     中 8 个 topic audit 并行），必须保证模型只被加载一次。
+
+    加载失败时降级为 None（与 get_reranker() 行为一致），不抛异常。
+    上游调用方（index_manager 等）需检查返回值并处理。
     """
     global _embed_model
     if _embed_model is not None:
@@ -84,14 +87,24 @@ def get_embed_model():
             _model_path = _modelscope_path
         else:
             _model_path = "BAAI/bge-m3"
-        _embed_model = HuggingFaceEmbedding(
-            model_name=_model_path,
-            normalize=True,
-            device=os.getenv("EMBED_DEVICE", None),
-            embed_batch_size=2,   # 默认 10，减少为 2 以降低峰值内存 ~80%
-            max_length=512,       # 匹配 chunk_size，防止超长序列拉高内存
-        )
-        Settings.embed_model = _embed_model
+        try:
+            _embed_model = HuggingFaceEmbedding(
+                model_name=_model_path,
+                normalize=True,
+                device=os.getenv("EMBED_DEVICE", None),
+                embed_batch_size=2,   # 默认 10，减少为 2 以降低峰值内存 ~80%
+                max_length=512,       # 匹配 chunk_size，防止超长序列拉高内存
+            )
+            Settings.embed_model = _embed_model
+        except Exception as e:
+            _logger.warning(
+                "embed_model init failed (%s). "
+                "Please download bge-m3 first: "
+                "modelscope download BAAI/bge-m3 --local_dir %s  "
+                "or set HF_HUB_OFFLINE=0 HF_ENDPOINT=https://hf-mirror.com in .env",
+                e, _modelscope_path,
+            )
+            _embed_model = None  # type: ignore[assignment]
     return _embed_model
 
 
