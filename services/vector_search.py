@@ -169,16 +169,23 @@ def search(kb_ids: list[str], query: str, max_results: int = 5, rebuild_if_missi
     return vec_search(kb_ids, query, max_results, rebuild_if_missing=rebuild_if_missing)
 
 
+def _format_kb_results(results: list[dict], prefix: str = "知识库参考依据（向量检索）") -> str:
+    """统一格式化 KB 向量搜索结果（用于注入 LLM prompt）。"""
+    if not results:
+        return ""
+    parts = [f"【{prefix}】"]
+    for i, r in enumerate(results, 1):
+        label = f"【{r.get('doc_source', '')}】" if r.get("doc_source") else ""
+        parts.append(f"\n{i}. {label}\n{r.get('content', '')[:1000]}")
+    return "\n".join(parts)
+
+
 def search_by_keywords(kb_ids: list[str], keywords: list[str], topic_name: str = "") -> str:
     """向量搜索 → 低分降级到纯文本。"""
     query = topic_name or " ".join(k for k in keywords if k)[:200]
     results = vec_search(kb_ids, query, top_k=3)
     if results and any(r.get("relevance", 0) > 0.35 for r in results):
-        parts = ["【知识库参考依据（向量检索）】"]
-        for i, r in enumerate(results, 1):
-            label = f"【{r.get('doc_source', '')}】" if r.get("doc_source") else ""
-            parts.append(f"\n{i}. {label}\n{r.get('content', '')[:1000]}")
-        return "\n".join(parts)
+        return _format_kb_results(results)
     return _text_search_fallback(kb_ids, keywords or [topic_name])
 
 
@@ -196,8 +203,4 @@ def get_kb_content(kb_ids: list[str], query: str) -> str:
     results = vec_search(kb_ids, query, top_k=3)
     if not results:
         return "未找到相关标准依据。"
-    parts = ["【参考标准依据（向量检索）】"]
-    for i, r in enumerate(results, 1):
-        label = f"【{r.get('doc_source', '')}】" if r.get("doc_source") else ""
-        parts.append(f"\n{i}. {label}\n{r.get('content', '')[:1000]}")
-    return "\n".join(parts)
+    return _format_kb_results(results, prefix="参考标准依据（向量检索）")

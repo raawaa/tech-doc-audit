@@ -78,29 +78,46 @@ def evaluate_batch(
     queries: list[str],
     responses: list[str],
     contexts_list: list[list[str]],
+    references: list[str] | None = None,
 ) -> dict[str, list[dict]]:
-    """用 BatchEvalRunner 并行评估 Faithfulness + Relevancy。"""
+    """用 BatchEvalRunner 并行评估 Faithfulness + Relevancy + Correctness。
+
+    当提供 reference 答案时自动添加 CorrectnessEvaluator。
+    """
     from llama_index.core.evaluation import (
         FaithfulnessEvaluator,
         RelevancyEvaluator,
+        CorrectnessEvaluator,
         BatchEvalRunner,
     )
 
     llm = get_llm()
+    evaluators = {
+        "faithfulness": FaithfulnessEvaluator(llm=llm),
+        "relevancy": RelevancyEvaluator(llm=llm),
+    }
+    if references:
+        evaluators["correctness"] = CorrectnessEvaluator(llm=llm)
+
     runner = BatchEvalRunner(
-        evaluators={
-            "faithfulness": FaithfulnessEvaluator(llm=llm),
-            "relevancy": RelevancyEvaluator(llm=llm),
-        },
+        evaluators=evaluators,
         workers=2,
         show_progress=True,
     )
 
-    results = runner.evaluate_response_strs(
-        queries=queries,
-        response_strs=responses,
-        contexts_list=contexts_list,
-    )
+    if references:
+        results = runner.evaluate_response_strs(
+            queries=queries,
+            response_strs=responses,
+            contexts_list=contexts_list,
+            reference=references,
+        )
+    else:
+        results = runner.evaluate_response_strs(
+            queries=queries,
+            response_strs=responses,
+            contexts_list=contexts_list,
+        )
 
     output = {}
     for eval_name, eval_results in results.items():
@@ -142,6 +159,7 @@ def run_eval(kb_ids: list[str], cases_path: str):
     eval_queries = []
     eval_responses = []
     eval_contexts = []
+    eval_references = []  # 可选参考答案
     eval_details = []
 
     for i, tc in enumerate(cases, 1):
@@ -174,11 +192,16 @@ def run_eval(kb_ids: list[str], cases_path: str):
             for s_result in results:
                 full_texts.append(s_result.get("content", "")[:5000])
             eval_contexts.append(full_texts if full_texts else full_contexts)
+            # 可选参考答案（用于 CorrectnessEvaluator）
+            ref = tc.get("reference_answer", "")
+            if ref:
+                eval_references.append(ref)
             eval_details.append({
                 "id": tc.get("id", ""),
                 "query": q,
                 "retrieval": rm,
                 "answer_preview": answer[:200],
+                "reference": ref,
             })
         else:
             eval_details.append({
@@ -195,7 +218,8 @@ def run_eval(kb_ids: list[str], cases_path: str):
     if eval_queries:
         print(f"\n  Running BatchEvalRunner ({len(eval_queries)} cases)...")
         try:
-            gen_results = evaluate_batch(eval_queries, eval_responses, eval_contexts)
+            refs = eval_references if len(eval_references) == len(eval_queries) else None
+            gen_results = evaluate_batch(eval_queries, eval_responses, eval_contexts, references=refs)
         except Exception as e:
             print(f"  生成评估失败: {e}")
 
@@ -214,7 +238,7 @@ def run_eval(kb_ids: list[str], cases_path: str):
 
         if gen_results:
             print(f"\n■ 答案质量（BatchEvalRunner）")
-            for eval_name in ("faithfulness", "relevancy"):
+            for eval_name in ("faithfulness", "relevancy", "correctness"):
                 scores = [r["passing"] for r in gen_results.get(eval_name, []) if r["passing"] is not None]
                 if scores:
                     print(f"  {eval_name.capitalize()}:     {sum(scores) / len(scores):.0%}")
@@ -234,7 +258,7 @@ def run_eval(kb_ids: list[str], cases_path: str):
             print(f"    Answer: {ans[:100]}...")
         # 从 gen_results 查评分
         if gen_results:
-            for eval_name in ("faithfulness", "relevancy"):
+            for eval_name in ("faithfulness", "relevancy", "correctness"):
                 idx = eval_details.index(d)
                 if idx < len(gen_results.get(eval_name, [])):
                     r = gen_results[eval_name][idx]
