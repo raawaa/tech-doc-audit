@@ -26,6 +26,27 @@ def _get_lock(kb_id: str) -> threading.Lock:
         return _doc_service_locks[kb_id]
 
 
+def _append_doc_ids_atomic(kb_id: str, doc_ids: list[str]) -> None:
+    """原子地把 doc_ids 追加到 kb.document_ids（锁内 read-modify-write）。
+
+    跳过已存在的 id；KB 不存在时静默返回。集中表达「document_ids 追加必须
+    在 _get_lock 内完成」这一约束，避免 import_document / batch_import_documents
+    与异步索引线程交错时 document_ids 被陈旧对象覆盖（见 review_report.md #2
+    TOCTOU 残留）。
+    """
+    with _get_lock(kb_id):
+        kb = kb_repo.get(kb_id)
+        if kb is None:
+            return
+        changed = False
+        for doc_id in doc_ids:
+            if doc_id not in kb.document_ids:
+                kb.document_ids.append(doc_id)
+                changed = True
+        if changed:
+            kb_repo.update(kb)
+
+
 def _detect_file_type(filename: str) -> Optional[str]:
     ext = os.path.splitext(filename)[1].lower()
     mapping = {".pdf": "pdf", ".doc": "doc", ".docx": "docx", ".md": "md"}
@@ -70,11 +91,7 @@ def import_document(
             _logger.warning("failed to extract page count for %s: %s", doc.id, e)
 
     # 更新知识库 document_ids（原子 get→modify→update，防与异步线程交错）
-    with _get_lock(kb_id):
-        kb = kb_repo.get(kb_id)
-        if kb and doc.id not in kb.document_ids:
-            kb.document_ids.append(doc.id)
-            kb_repo.update(kb)
+    _append_doc_ids_atomic(kb_id, [doc.id])
 
     # 向量索引
     if doc.file_path:
@@ -159,15 +176,10 @@ def batch_import_documents(
         doc = doc_repo.save_doc(kb_id, original_name, content, file_type)
         doc.index_status = "pending_index"
         doc_repo._save_doc_meta(doc)
-
-        if doc.id not in kb.document_ids:
-            kb.document_ids.append(doc.id)
-
         docs.append(doc)
 
-    # 原子写入 document_ids（防与异步线程的 status 更新交错）
-    with _get_lock(kb_id):
-        kb_repo.update(kb)
+    # 原子追加 document_ids（锁内 read-modify-write，防与异步索引线程交错覆盖）
+    _append_doc_ids_atomic(kb_id, [d.id for d in docs])
 
     if async_index and docs:
         thread = threading.Thread(
@@ -236,20 +248,22 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
     try:
         from core.index_manager import index_documents_batch
         index_documents_batch(kb_id, texts, progress_callback=_on_progress)
-        # 锁内原子更新完成状态
+        # 锁内 read-modify-write 原子更新完成状态；KB 已删则跳过（不写回陈旧对象）
         with _get_lock(kb_id):
-            kb = kb_repo.get(kb_id) or kb
-            kb.index_status = "ready"
-            kb.index_progress = 1.0
-            kb.index_current_doc = ""
+            kb = kb_repo.get(kb_id)
+            if kb is not None:
+                kb.index_status = "ready"
+                kb.index_progress = 1.0
+                kb.index_current_doc = ""
+                kb_repo.update(kb)
     except Exception as e:
         _logger.error("batch indexing failed for kb %s: %s", kb_id, e)
         with _get_lock(kb_id):
-            kb = kb_repo.get(kb_id) or kb
-            kb.index_status = "failed"
-            kb.index_current_doc = f"错误: {e}"
-    with _get_lock(kb_id):
-        kb_repo.update(kb)
+            kb = kb_repo.get(kb_id)
+            if kb is not None:
+                kb.index_status = "failed"
+                kb.index_current_doc = f"错误: {e}"
+                kb_repo.update(kb)
 
 
 def delete_document(kb_id: str, doc_id: str) -> bool:

@@ -210,3 +210,51 @@ def test_import_unsupported_format():
         doc_svc.import_document(kb.id, "test.exe", b"binary")
 
     assert "不支持的文件格式" in str(exc_info.value)
+
+
+# ── 并发 / TOCTOU 回归 ──────────────────────────────────────────────────────────
+
+
+def test_append_doc_ids_atomic():
+    """_append_doc_ids_atomic：去重追加、KB 不存在时静默返回。"""
+    import storage.kb_repo as kb_repo
+    from services.doc_service import _append_doc_ids_atomic
+
+    kb = kb_svc.create_kb(name="原子追加", category="national")
+    _append_doc_ids_atomic(kb.id, ["d1", "d2", "d1"])  # d1 重复
+    kb = kb_repo.get(kb.id)
+    assert kb.document_ids == ["d1", "d2"]
+
+    # KB 不存在 → 静默返回，不抛异常
+    _append_doc_ids_atomic("nonexistent-kb-id", ["d3"])
+
+
+def test_concurrent_batch_imports_no_orphans(monkeypatch):
+    """并发批量导入同一 KB → 所有 doc_id 都保留，无陈旧覆盖丢失。
+
+    回归 review_report.md #2 的 TOCTOU：batch_import_documents 此前在锁外用
+    陈旧 kb 对象追加 document_ids 再写回，并发批量会互相覆盖丢失 id。改用
+    _append_doc_ids_atomic（锁内 read-modify-write）后，4 批 × 3 篇全部保留。
+
+    mock 掉真实索引（避免触发 embedding 模型加载），只验证 document_ids 一致性。
+    """
+    import threading
+    import storage.kb_repo as kb_repo
+
+    monkeypatch.setattr("core.index_manager.index_documents_batch", lambda *a, **k: None)
+
+    kb = kb_svc.create_kb(name="并发批量", category="national")
+
+    def batch_one(i):
+        files = [(f"doc_{i}_{j}.pdf", b"%PDF-1.4 content") for j in range(3)]
+        doc_svc.batch_import_documents(kb.id, files, async_index=False)
+
+    threads = [threading.Thread(target=batch_one, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    kb_final = kb_repo.get(kb.id)
+    assert kb_final is not None
+    assert len(kb_final.document_ids) == 12  # 4 批 × 3 篇，全部保留无丢失

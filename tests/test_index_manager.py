@@ -226,3 +226,35 @@ def test_index_markdown_with_headings():
 
     r3 = search([kb_id], "引用文件", top_k=5)
     assert len(r3) >= 1
+
+
+def test_async_md_index_builds_faiss():
+    """异步导入真实 .md 内容（非空文本）→ FAISS 索引实际建立。
+
+    现有 async 测试（test_import_document_async 等）用假 PDF，提取为空文本，
+    索引线程因 ``len(text) < 20`` 提前返回、不建索引。本用例补上真实内容的
+    异步索引路径，验证 index_status → ready 且 FAISS 索引确实建立。
+    """
+    import time
+    import services.kb_service as kb_svc
+    import services.doc_service as doc_svc
+    import storage.kb_repo as kb_repo
+
+    kb = kb_svc.create_kb(name="异步MD建索引", category="national")
+    content = (
+        "# 技术规范\n\n## 第一章 总则\n\n本规范规定技术要求与验收标准内容。\n\n"
+        "## 第二章 要求\n\n各项参数应符合国家标准规定要求。"
+    ).encode()
+    doc = doc_svc.import_document(kb.id, "技术规范.md", content, async_index=True)
+
+    # 等待后台索引线程完成
+    for _ in range(100):
+        if doc.index_status != "pending_index":
+            break
+        time.sleep(0.1)
+
+    assert doc.index_status == "ready", f"expected ready, got {doc.index_status}"
+    assert get_kb_index_built(kb.id), "FAISS 索引应已建立"
+
+    kb = kb_repo.get(kb.id)
+    assert doc.id in kb.document_ids
