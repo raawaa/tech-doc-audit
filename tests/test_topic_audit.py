@@ -1,19 +1,22 @@
-"""topic_audit 纯逻辑测试 — 关键词定位、JSON 降级解析、结构化结果映射。
+"""topic_audit 测试 — 纯逻辑（关键词定位 / JSON 降级 / 结果映射）+ mock 化 audit_topic。
 
-这些测试不触发 LLM / embedding 模型加载，只覆盖 ``services/topic_audit.py``
-里无副作用的纯函数，正好对应架构复盘 §6.5 标记为「未校准 / 未验证」的
-关键词定位逻辑（KEYWORD_CONTEXT_CHARS=1500）。
+纯逻辑部分不触发任何模型加载；audit_topic 的 mock 部分通过 monkeypatch
+替换 ``get_llm`` 和 ``_search_kb_by_keywords``（后者避免触发 vector_search
+→ embedding 模型），覆盖结构化输出主路径与两条降级路径。
 """
+
+from unittest.mock import MagicMock
 
 from services.topic_audit import (
     locate_paragraphs,
     _parse_json_fallback,
     _issues_from_schema,
+    audit_topic,
 )
 from models.llm_schemas import TopicIssueList, TopicIssue
 
 
-# ── locate_paragraphs ──────────────────────────────────────────────────────────
+# ── locate_paragraphs（纯逻辑）──────────────────────────────────────────────────
 
 
 def test_locate_paragraphs_finds_keyword():
@@ -58,7 +61,7 @@ def test_locate_paragraphs_no_match():
     assert locate_paragraphs("完全无关的招标内容", ["增值税", "保证金"]) == ""
 
 
-# ── _parse_json_fallback ───────────────────────────────────────────────────────
+# ── _parse_json_fallback（纯逻辑）───────────────────────────────────────────────
 
 
 def test_parse_json_fallback_valid():
@@ -81,7 +84,7 @@ def test_parse_json_fallback_malformed():
     assert _parse_json_fallback("{这不是合法 json}") is None
 
 
-# ── _issues_from_schema ────────────────────────────────────────────────────────
+# ── _issues_from_schema（纯逻辑）────────────────────────────────────────────────
 
 
 def test_issues_from_schema_maps_fields():
@@ -118,3 +121,88 @@ def test_issues_from_schema_empty():
     """空 issues 列表 → 返回空列表。"""
     result = TopicIssueList(issues=[])
     assert _issues_from_schema(result, topic_index=0) == []
+
+
+# ── audit_topic（mock 化）───────────────────────────────────────────────────────
+#
+# 关键：patch services.topic_audit._search_kb_by_keywords 避免触发
+# vector_search → embedding 模型加载；patch get_llm 返回 MagicMock。
+
+
+def _make_llm_with_structured(raw):
+    """构造一个 get_llm() 返回值：as_structured_llm 路径返回 raw。"""
+    llm = MagicMock()
+    structured = MagicMock()
+    structured.chat.return_value.raw = raw
+    llm.as_structured_llm.return_value = structured
+    return llm
+
+
+def test_audit_topic_structured_path(monkeypatch):
+    """as_structured_llm 主路径：返回 TopicIssueList → 映射为 AuditIssue。"""
+    monkeypatch.setattr(
+        "services.topic_audit._search_kb_by_keywords", lambda *a, **k: "KB参考"
+    )
+    fake_result = TopicIssueList(
+        issues=[TopicIssue(type="compliance", description="测试问题", severity="medium")]
+    )
+    monkeypatch.setattr(
+        "services.topic_audit.get_llm", lambda: _make_llm_with_structured(fake_result)
+    )
+
+    topic = {"id": "t1", "name": "测试主题", "prompt": "...", "keywords": ["测试"]}
+    issues = audit_topic(topic, None, ["kb1"], topic_index=1, parsed_content="测试内容")
+
+    assert len(issues) == 1
+    assert issues[0].description == "测试问题"
+    assert issues[0].id == 1001  # topic_index=1, i=0 → 1*1000+0+1
+
+
+def test_audit_topic_fallback_to_chat(monkeypatch):
+    """as_structured_llm 抛错 → 降级到 .chat() + _parse_json_fallback。"""
+    monkeypatch.setattr(
+        "services.topic_audit._search_kb_by_keywords", lambda *a, **k: ""
+    )
+    llm = MagicMock()
+    llm.as_structured_llm.side_effect = RuntimeError("structured unavailable")
+    chat_resp = MagicMock()
+    chat_resp.message.content = (
+        '{"issues": [{"type": "completeness", "description": "降级问题", "severity": "low"}]}'
+    )
+    llm.chat.return_value = chat_resp
+    monkeypatch.setattr("services.topic_audit.get_llm", lambda: llm)
+
+    topic = {"id": "t1", "name": "测试", "keywords": ["测试"]}
+    issues = audit_topic(topic, None, ["kb1"], topic_index=0, parsed_content="测试内容")
+
+    assert len(issues) == 1
+    assert issues[0].description == "降级问题"
+    assert issues[0].severity == "low"
+
+
+def test_audit_topic_both_fail_returns_empty(monkeypatch):
+    """structured 与 chat 两条路径都抛错 → 返回空列表（不向外抛）。"""
+    monkeypatch.setattr(
+        "services.topic_audit._search_kb_by_keywords", lambda *a, **k: ""
+    )
+    llm = MagicMock()
+    llm.as_structured_llm.side_effect = RuntimeError("fail")
+    llm.chat.side_effect = RuntimeError("fail")
+    monkeypatch.setattr("services.topic_audit.get_llm", lambda: llm)
+
+    topic = {"id": "t1", "name": "测试", "keywords": ["测试"]}
+    assert audit_topic(topic, None, ["kb1"], topic_index=0, parsed_content="测试内容") == []
+
+
+def test_audit_topic_empty_issues_returns_empty(monkeypatch):
+    """LLM 返回空 issues 列表 → 返回空列表。"""
+    monkeypatch.setattr(
+        "services.topic_audit._search_kb_by_keywords", lambda *a, **k: ""
+    )
+    monkeypatch.setattr(
+        "services.topic_audit.get_llm",
+        lambda: _make_llm_with_structured(TopicIssueList(issues=[])),
+    )
+
+    topic = {"id": "t1", "name": "测试", "keywords": ["测试"]}
+    assert audit_topic(topic, None, ["kb1"], topic_index=0, parsed_content="测试内容") == []
