@@ -1,22 +1,23 @@
 """知识问答服务 — RAG 管线 + 多轮对话。
 
 - ask(): 单轮问答，使用 LlamaIndex RetrieverQueryEngine
-- chat(): 多轮对话，使用 CrossKBRetriever + 外部历史管理
+- chat(): 多轮对话，使用 LlamaIndex ContextChatEngine + ChatMemoryBuffer
+- chat_stream(): 流式多轮对话
 """
 
-import json
 import logging
 import time
 import uuid
 from typing import Any, Generator
 
 from llama_index.core import PromptTemplate
+from llama_index.core.chat_engine import ContextChatEngine
+from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.response_synthesizers import get_response_synthesizer
 
 from core.retriever import CrossKBRetriever
 from core.settings import get_llm, get_embed_model
-from llama_index.core.llms import ChatMessage, MessageRole
 
 _logger = logging.getLogger(__name__)
 
@@ -118,7 +119,7 @@ def ask(kb_ids: list[str], question: str, top_k: int = 5) -> dict[str, Any]:
     return {"answer": answer, "sources": sources}
 
 
-# ── 多轮对话（按 session 记忆）───────────────────────────────────────────────────
+# ── 多轮对话（ContextChatEngine + ChatMemoryBuffer）─────────────────────────────
 
 MAX_SESSION_AGE = 7200
 _sessions: dict[str, dict] = {}
@@ -131,60 +132,53 @@ def _cleanup_sessions():
         del _sessions[sid]
 
 
-def _get_or_create_session(session_id: str | None, kb_ids: list[str]) -> tuple[str, list[dict]]:
+def _build_chat_engine(kb_ids: list[str], top_k: int) -> ContextChatEngine:
+    """创建 ContextChatEngine 实例。
+
+    内置 ChatMemoryBuffer 管理对话历史，自动进行 token 感知的截断。
+    """
+    retriever = CrossKBRetriever(kb_ids=kb_ids, top_k=top_k)
+    memory = ChatMemoryBuffer.from_defaults(token_limit=4000)
+    node_postprocessors = []
+    try:
+        from core.settings import get_reranker
+        reranker = get_reranker()
+        if reranker:
+            node_postprocessors.append(reranker)
+    except Exception:
+        pass
+    return ContextChatEngine.from_defaults(
+        retriever=retriever,
+        memory=memory,
+        system_prompt=CHAT_SYSTEM_PROMPT,
+        node_postprocessors=node_postprocessors,
+    )
+
+
+def _get_or_create_engine(
+    session_id: str | None, kb_ids: list[str], top_k: int
+) -> tuple[str, ContextChatEngine]:
+    """获取或按 session 创建 ChatEngine（每个 session 独立记忆）。"""
     if not session_id:
         session_id = uuid.uuid4().hex[:12]
     _cleanup_sessions()
+
     if session_id in _sessions:
         session = _sessions[session_id]
         if session["kb_ids"] != kb_ids:
-            session["history"] = []
+            # KB 列表变更 → 重建引擎（历史重置）
+            session["engine"] = _build_chat_engine(kb_ids, top_k)
             session["kb_ids"] = kb_ids
-    else:
-        _sessions[session_id] = {
-            "history": [],
-            "kb_ids": kb_ids,
-            "created_at": time.time(),
-        }
-    return session_id, _sessions[session_id]["history"]
+            session["created_at"] = time.time()
+        return session_id, session["engine"]
 
-
-def _format_history(history: list[dict]) -> str:
-    if not history:
-        return ""
-    lines = []
-    for msg in history:
-        role = "用户" if msg["role"] == "user" else "助手"
-        lines.append(f"{role}：{msg['content']}")
-    return "\n".join(lines)
-
-
-def _search(kb_ids: list[str], query: str, top_k: int) -> list[dict]:
-    """向量检索（用于多轮对话的上下文构建）。"""
-    from services.vector_search import search as vec_search
-    return vec_search(kb_ids, query, max_results=top_k, rebuild_if_missing=False)
-
-
-def _build_context(chunks: list[dict]) -> str:
-    context_parts = []
-    for i, c in enumerate(chunks, 1):
-        src = c.get("doc_source", "未知来源")
-        content = c.get("content", "")[:1000]
-        context_parts.append(f"[{i}] 来源：{src}\n{content}")
-    return "\n\n---\n\n".join(context_parts)
-
-
-def _build_sources(chunks: list[dict]) -> list[dict]:
-    return [
-        {
-            "kb_id": c.get("kb_id", ""),
-            "doc_id": c.get("doc_id", ""),
-            "doc_source": c.get("doc_source", ""),
-            "content_snippet": (c.get("content", "") or "")[:300],
-            "relevance": float(c.get("relevance", 0)),
-        }
-        for c in chunks
-    ]
+    engine = _build_chat_engine(kb_ids, top_k)
+    _sessions[session_id] = {
+        "engine": engine,
+        "kb_ids": kb_ids,
+        "created_at": time.time(),
+    }
+    return session_id, engine
 
 
 def _extract_suggestions(text: str) -> list[str]:
@@ -203,14 +197,27 @@ def _strip_suggestions(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _sources_from_nodes(source_nodes) -> list[dict]:
+    """从 NodeWithScore 列表构建 sources 响应（与 ask() 格式一致）。"""
+    return [
+        {
+            "kb_id": n.metadata.get("kb_id", ""),
+            "doc_id": n.metadata.get("doc_id", ""),
+            "doc_source": n.metadata.get("source", ""),
+            "content_snippet": n.node.text[:300],
+            "relevance": round(n.score or 0, 4),
+        }
+        for n in source_nodes
+    ]
+
+
 def chat(
     session_id: str | None,
     question: str,
     kb_ids: list[str],
     top_k: int = 5,
 ) -> dict[str, Any]:
-    """多轮对话。自动管理会话历史，支持追问。"""
-    # 确保 LLM 和 Embed 已初始化
+    """多轮对话。使用 ContextChatEngine（自动管理历史 + 来源追踪）。"""
     global _embed_initialized
     if not _embed_initialized:
         try:
@@ -221,51 +228,23 @@ def chat(
             _logger.warning("embed/llm init failed in chat: %s", e)
             raise RuntimeError(f"模型初始化失败: {e}")
 
-    session_id, history = _get_or_create_session(session_id, kb_ids)
-    chunks = _search(kb_ids, question, top_k)
+    session_id, engine = _get_or_create_engine(session_id, kb_ids, top_k)
 
-    answer = ""
-    sources = []
+    try:
+        response = engine.chat(question)
+        raw_answer = str(response.response or "")
+        suggestions = _extract_suggestions(raw_answer)
+        clean_answer = _strip_suggestions(raw_answer)
+        sources = _sources_from_nodes(response.source_nodes)
+    except Exception as e:
+        _logger.warning("qa llm call failed: %s", e)
+        clean_answer = "抱歉，回答生成失败。"
+        sources = []
 
-    if not chunks:
-        answer = "根据现有制度库，未找到相关信息。"
-    else:
-        context = _build_context(chunks)
-        history_text = _format_history(history) if history else None
+    if not sources and not clean_answer:
+        clean_answer = "根据现有制度库，未找到相关信息。"
 
-        parts = []
-        if history_text:
-            parts.append(f"## 对话历史\n\n{history_text}\n")
-        parts.append(f"## 知识库内容\n\n{context}")
-        parts.append(f"## 用户问题\n\n{question}")
-        parts.append("请回答用户问题，严格遵循以上回答规则。")
-
-        user_prompt = "\n\n".join(parts)
-        try:
-            messages = [
-                ChatMessage(role=MessageRole.SYSTEM, content=CHAT_SYSTEM_PROMPT),
-                ChatMessage(role=MessageRole.USER, content=user_prompt),
-            ]
-            response = get_llm().chat(messages)
-            answer = response.message.content or ""
-            # 从回答中提取并移除追问建议
-            suggestions = _extract_suggestions(answer)
-            answer = _strip_suggestions(answer)
-        except Exception as e:
-            _logger.warning("qa llm call failed: %s", e)
-            answer = ""
-
-        if not answer:
-            answer = "抱歉，回答生成失败。"
-
-        sources = _build_sources(chunks)
-
-    history.append({"role": "user", "content": question})
-    history.append({"role": "assistant", "content": answer})
-    if len(history) > 10:
-        history[:] = history[-10:]
-
-    return {"session_id": session_id, "answer": answer, "sources": sources}
+    return {"session_id": session_id, "answer": clean_answer, "sources": sources}
 
 
 def chat_stream(
@@ -274,12 +253,9 @@ def chat_stream(
     kb_ids: list[str],
     top_k: int = 5,
 ) -> Generator[dict[str, Any], None, None]:
-    """多轮对话流式版本。
+    """多轮对话流式版本。使用 ContextChatEngine。
 
     将处理阶段和 LLM 回答按事件 yield，供 SSE 端点消费。
-    与 chat() 共享相同逻辑，但：
-    - 用 stream_chat 逐 token 产出回答
-    - 每阶段开始时 yield progress 事件
     """
     global _embed_initialized
     if not _embed_initialized:
@@ -293,55 +269,27 @@ def chat_stream(
             yield {"type": "error", "message": f"模型初始化失败: {e}"}
             return
 
-    session_id, history = _get_or_create_session(session_id, kb_ids)
+    session_id, engine = _get_or_create_engine(session_id, kb_ids, top_k)
 
     yield {"type": "progress", "stage": "search", "label": "正在检索知识库..."}
-    chunks = _search(kb_ids, question, top_k)
+    yield {"type": "progress", "stage": "llm", "label": "正在生成回答..."}
 
-    if not chunks:
-        answer = "根据现有制度库，未找到相关信息。"
-        sources = []
-    else:
-        context = _build_context(chunks)
-        history_text = _format_history(history) if history else None
+    answer = ""
+    try:
+        response = engine.stream_chat(question)
+        for chunk in response:
+            delta = chunk.delta or ""
+            if delta:
+                answer += delta
+                yield {"type": "token", "text": delta}
+    except Exception as e:
+        _logger.warning("qa llm stream failed: %s", e)
+        if not answer:
+            yield {"type": "error", "message": "回答生成失败。"}
+            return
 
-        parts = []
-        if history_text:
-            parts.append(f"## 对话历史\n\n{history_text}\n")
-        parts.append(f"## 知识库内容\n\n{context}")
-        parts.append(f"## 用户问题\n\n{question}")
-        parts.append("请回答用户问题，严格遵循以上回答规则。")
-
-        user_prompt = "\n\n".join(parts)
-        messages = [
-            ChatMessage(role=MessageRole.SYSTEM, content=CHAT_SYSTEM_PROMPT),
-            ChatMessage(role=MessageRole.USER, content=user_prompt),
-        ]
-
-        yield {"type": "progress", "stage": "llm", "label": "正在生成回答..."}
-
-        answer = ""
-        try:
-            response = get_llm().stream_chat(messages)
-            for chunk in response:
-                delta = chunk.delta or ""
-                if delta:
-                    answer += delta
-                    yield {"type": "token", "text": delta}
-        except Exception as e:
-            _logger.warning("qa llm stream failed: %s", e)
-            if not answer:
-                answer = "抱歉，回答生成失败。"
-
-        sources = _build_sources(chunks)
-
-    # 从回答中提取追问建议（不修改已流式发送的 text-delta）
+    # 回答完成 → 构建 sources 和 suggestions
+    sources = _sources_from_nodes(response.source_nodes)
     suggestions = _extract_suggestions(answer)
-    clean_answer = _strip_suggestions(answer)
-
-    history.append({"role": "user", "content": question})
-    history.append({"role": "assistant", "content": clean_answer})
-    if len(history) > 10:
-        history[:] = history[-10:]
 
     yield {"type": "done", "session_id": session_id, "sources": sources, "suggestions": suggestions}
