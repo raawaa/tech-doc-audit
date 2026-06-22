@@ -1,7 +1,9 @@
 test_cases:
+  # ── 机场运营管理域（既有 case，补充 reference_answer 让 CorrectnessEvaluator 可触发）──
   - id: "emergency_response"
     query: "突发事件 应急预案 处置"
     description: "应检索到突发事件应急预案相关制度"
+    reference_answer: "应说明突发事件应急预案的组织架构、响应分级、处置流程与上报机制，明确各部门在应急中的职责。"
     expected_chunks:
       - content_keywords: ["突发事件", "应急预案"]
         relevance: "must_match"
@@ -9,6 +11,7 @@ test_cases:
   - id: "gate_management"
     query: "航站楼 门禁 管理"
     description: "应检索到航站楼门禁管理办法"
+    reference_answer: "应说明航站楼门禁的权限分级、通行证管理、人员通行与访客登记要求。"
     expected_chunks:
       - content_keywords: ["航站楼", "门禁"]
         relevance: "must_match"
@@ -16,6 +19,7 @@ test_cases:
   - id: "duty_management"
     query: "值班管理规定 要求"
     description: "应检索到值班管理规定"
+    reference_answer: "应说明值班岗位设置、值班时间安排、交接班制度与值班期间的职责和突发事件处理要求。"
     expected_chunks:
       - content_keywords: ["值班管理"]
         relevance: "must_match"
@@ -53,4 +57,31 @@ test_cases:
     description: "应检索到机场使用许可管理规则"
     expected_chunks:
       - content_keywords: ["使用许可"]
+        relevance: "must_match"
+
+  # ── 招标/采购审核域（匹配 topic_audit.AUDIT_TOPICS，覆盖系统目标业务场景）──
+  # 注：这些 case 在加载招标/采购类知识库后方可完整跑通；目的让 eval harness
+  # 覆盖审核目标域，而非仅机场运营域。
+  - id: "tax_clause_search"
+    query: "增值税税率 合规 投标报价"
+    description: "应检索到投标报价中增值税税率相关条款与合规要求"
+    reference_answer: "应说明投标报价中增值税税率应符合税法规定、税率调整机制是否合理、是否明确含税/不含税价格及发票要求。"
+    expected_chunks:
+      - content_keywords: ["增值税", "税率"]
+        relevance: "must_match"
+
+  - id: "payment_terms_search"
+    query: "投标保证金 缴纳 退还 付款"
+    description: "应检索到投标保证金与付款条件相关条款"
+    reference_answer: "应说明投标保证金的缴纳金额与形式、退还条件与时限、付款方式与进度款安排是否明确合理。"
+    expected_chunks:
+      - content_keywords: ["保证金", "付款"]
+        relevance: "must_match"
+
+  - id: "brand_restriction_search"
+    query: "品牌 指定 同等品牌 公平竞争"
+    description: "应检索到技术规格中的品牌指定与公平竞争条款"
+    reference_answer: "应说明技术规格是否存在指定或变相指定品牌、是否允许同等品牌参与、是否构成对竞争的不合理限制。"
+    expected_chunks:
+      - content_keywords: ["品牌", "同等"]
         relevance: "must_match"
