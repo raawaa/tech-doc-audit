@@ -36,7 +36,10 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=7.0.0"]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-timeout>=2.4.0",
+]
 
 [build-system]
 requires = ["setuptools>=75.0"]
@@ -50,3 +53,8 @@ exclude = ["tests*", "scripts*", "sample_docs*", "frontend*", "data*", "logs*"]
 # 所有依赖通过 PyPI 安装，无需额外源
 
 [tool.uv]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 防止模型加载（bge-m3 / MinerU）偶发挂起时无限阻塞：单测试超 180s 判失败
+timeout = 180

@@ -2,16 +2,10 @@
 
 import os
 import shutil
-import tempfile
 
 import pytest
 from fastapi.testclient import TestClient
 
-# 设置测试数据目录
-test_dir = tempfile.mkdtemp()
-os.environ["AUDIT_DATA_DIR"] = test_dir
-
-# 导入 app（在设置环境变量之后）
 from api.main import app
 
 client = TestClient(app)
@@ -21,6 +15,7 @@ client = TestClient(app)
 def cleanup():
     """每个测试后清理数据"""
     yield
+    test_dir = os.environ["AUDIT_DATA_DIR"]
     for item in os.listdir(test_dir):
         path = os.path.join(test_dir, item)
         if os.path.isdir(path):

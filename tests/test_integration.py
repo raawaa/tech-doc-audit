@@ -2,13 +2,8 @@
 
 import os
 import shutil
-import tempfile
 
 import pytest
-
-# 设置测试数据目录
-test_dir = tempfile.mkdtemp()
-os.environ["AUDIT_DATA_DIR"] = test_dir
 
 
 @pytest.fixture(autouse=True)
@@ -16,6 +11,7 @@ def cleanup():
     """每个测试后清理数据"""
     yield
     # 清理数据目录
+    test_dir = os.environ["AUDIT_DATA_DIR"]
     for item in os.listdir(test_dir):
         path = os.path.join(test_dir, item)
         if os.path.isdir(path):

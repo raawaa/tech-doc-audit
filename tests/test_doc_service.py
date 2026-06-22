@@ -1,14 +1,9 @@
 """文档服务单元测试"""
 
-import os
 import shutil
-import tempfile
 import time
 
 import pytest
-
-# 设置测试数据目录
-os.environ["AUDIT_DATA_DIR"] = tempfile.mkdtemp()
 
 import services.kb_service as kb_svc
 import services.doc_service as doc_svc

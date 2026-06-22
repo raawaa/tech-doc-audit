@@ -2,12 +2,8 @@
 
 import os
 import shutil
-import tempfile
 
 import pytest
-
-# 设置测试数据目录
-os.environ["AUDIT_DATA_DIR"] = tempfile.mkdtemp()
 
 import services.audit_doc_service as audit_doc_svc
 
