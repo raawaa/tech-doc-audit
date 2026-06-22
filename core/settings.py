@@ -19,6 +19,11 @@ if _env_path.exists():
 # 在导入 PyTorch / sentence-transformers 前设置，控制 CPU 线程数以减少内存峰值
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
+# huggingface_hub 离线模式：禁止 HEAD 请求 huggingface.co 检查文件元数据。
+# 本机无法直连 HF（见 settings.py _SafeOllama 需绕 SOCKS），HF 请求会触发
+# 5 次指数退避重试（1+2+4+8+16≈31s/文件），导致 get_reranker() 等函数挂死数分钟。
+# 设为 1 后仅使用本地缓存，失败即快速报错（被各加载函数的 try/except 降级处理）。
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 from llama_index.core import Settings
 from llama_index.core.node_parser import SentenceSplitter
