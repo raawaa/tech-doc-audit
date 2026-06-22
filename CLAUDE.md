@@ -56,6 +56,7 @@ models/               → Pydantic 数据模型
 cli/                  → Typer CLI（覆盖全部 API 功能）
 frontend/             → React + Vite + Tailwind CSS SPA
 benchmark/            → 检索质量评估与参数扫描
+docs/retrospectives/  → 开发复盘系列文档（`YYYY-MM-DD-title.md`，含 draw.io 导出的配图）
 ```
 
 ### 数据流（审核管线）
@@ -73,7 +74,7 @@ benchmark/            → 检索质量评估与参数扫描
 - **LLM 调用**: `core/settings.get_llm()` 统一封装（LlamaIndex LLM），支持 Ollama / MiniMax / OpenAI / DeepSeek 四种 provider，通过 `LLM_PROVIDER` 环境变量切换。参见 `.env.example` 了解配置项。
 - **两个域**: 知识库文档（`models/document.py` — KBDocument）和待审核文档（`models/audit_document.py` — AuditDocument）相互独立
 - **存储**: 所有数据存为 JSON 文件在 `data/` 目录下，向量索引存为 FAISS 单文件。无外部数据库。
-- **异步审核**: `audit_task_service.run_audit_async()` 通过 `threading.Thread` 实现后台执行
+- **异步审核（两级并发）**: 任务级 `audit_task_service.run_audit_async()` 用 `threading.Thread(daemon=True)` 后台执行；主题级用 `ThreadPoolExecutor(max_workers=min(8, len(topics)))` 并行审核，每完成一个主题即更新进度。Daemon 线程在服务重启时被强杀，FastAPI 启动时有重置卡住任务的恢复逻辑。
 - **审核方式**: Agent 动态审核（`agent_audit.py`）或 8 个预定义审核主题（税率合规、品牌限制、支付条款等），每主题用关键词在全文定位相关段落，结合 FAISS 检索结果提交 LlamaIndex LLM 审核
 
 ### 核心降级链（Graceful Degradation）
@@ -98,6 +99,23 @@ benchmark/            → 检索质量评估与参数扫描
 - Ollama 使用自定义 `_SafeOllama` 子类绕过 SOCKS 代理问题
 - 所有 LLM prompt 均为中文，匹配中文企业治理文档领域
 
+### 并发与 GPU 资源
+
+修改 embedding / reranker / 索引 / 主题审核并发相关代码前必读（曾因并发 GPU 推理导致 OOM kill）：
+
+- **全局 GPU 锁** `core/settings.get_gpu_inference_lock()` 返回一个 `threading.RLock`。HuggingFace embedding 与 reranker 的 forward 非线程安全，所有 GPU 推理（含 `index_manager` 的批量 embedding）必须先持有该锁——多线程同时前向会各自分配完整激活张量，撑爆显存。
+- **两个 GPU 模型**: bge-m3 embedding + `BAAI/bge-reranker-v2-m3` reranker（`RERANKER_TOP_N` 默认 5），均延迟加载 + 全局缓存，均在 GPU 锁下推理。
+- **入口线程上限**: `core/settings.py` 顶部用 `os.environ.setdefault` 设 `OMP_NUM_THREADS=2` / `MKL_NUM_THREADS=2`，限制 CPU 线程数以降低内存峰值，勿删除。
+- **两级并发**: 见上文"异步审核"。LLM 走 HTTP API 不占 GPU，线程在等 GPU 锁时 LLM 调用仍可进行。
+
+### 几个尚未校准的魔数（已知债）
+
+- 向量搜索接受阈值 `relevance > 0.35`（`vector_search.search_by_keywords()`），低于此值降级到文本搜索——未经 benchmark 系统校准。
+- Agent 选主题只送文档前 **8000 字符**给 LLM（`agent_audit.determine_audit_topics()`），长文档后半段可能被遗漏。
+- 关键词段落定位取关键词前后各 **1500 字符**（`topic_audit.KEYWORD_CONTEXT_CHARS`），未按文档类型自适应。
+
 ### 项目状态
 
 已完成 LlamaIndex 迁移（向量检索 + LLM 调用 + Agent 动态审核）。后续方向：审核报告交互追问（ChatEngine）、检索质量评估（eval）、外部数据源 Tool。
+
+> 架构全貌、降级链、并发模型与完整技术债清单见 `docs/retrospectives/2026-06-18-architecture-and-debt.md`（含配图），是比本文件更详细的架构参考。
