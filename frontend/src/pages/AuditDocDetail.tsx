@@ -57,11 +57,13 @@ export function AuditDocDetail() {
     }
   }, [tasks, id, navigate])
 
-  // 自动检测 processing 状态的任务，开启流式展示
+  // 自动检测 pending/processing 状态的任务，开启流式展示
   useEffect(() => {
-    const processingTask = tasks.find(t => t.status === 'processing')
-    if (processingTask && !streamingTaskId) {
-      setStreamingTaskId(processingTask.id)
+    const activeTask = tasks.find(
+      t => t.status === 'processing' || t.status === 'pending'
+    )
+    if (activeTask && !streamingTaskId) {
+      setStreamingTaskId(activeTask.id)
     }
   }, [tasks, streamingTaskId])
 
