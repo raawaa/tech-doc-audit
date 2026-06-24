@@ -1,6 +1,13 @@
 import typer
 from typing import Optional, Literal
 
+# 加载 .env 配置（与 api/main.py 保持一致）
+from pathlib import Path as _Path
+from dotenv import load_dotenv as _load_dotenv
+_env_path = _Path(__file__).resolve().parent.parent / ".env"
+if _env_path.exists():
+    _load_dotenv(_env_path)
+
 import services.kb_service as kb_svc
 import services.doc_service as doc_svc
 import services.audit_doc_service as audit_doc_svc

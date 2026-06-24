@@ -16,6 +16,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("AUDIT_DATA_DIR", "data")
 
+# 加载 .env 配置
+from dotenv import load_dotenv as _load_dotenv
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+if _env_path.exists():
+    _load_dotenv(_env_path)
+
 import storage.kb_repo as kb_repo
 from services.doc_service import import_document
 
