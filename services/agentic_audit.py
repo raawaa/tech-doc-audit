@@ -16,7 +16,7 @@ Agent 自主调用工具逐章审核文档：
 import json
 import os
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 from llama_index.core.llms import ChatMessage, MessageRole
 
@@ -240,7 +240,7 @@ def _tool_search_kb(kb_ids: list[str], query: str, top_k: int = 5) -> str:
         doc = r.get("doc_source", "") or r.get("doc_id", "")
         clause = r.get("clause_number", "")
         section = r.get("section_path", "")
-        content = (r.get("content", "") or "")[:800]
+        content = (r.get("content", "") or "")[:500]
 
         label_parts = []
         if doc:
@@ -579,6 +579,7 @@ def _run_native_tool_calling(
     doc_name: str,
     task_id: str,
     doc_id: str,
+    event_callback: Callable[[dict], None] | None = None,
 ) -> AuditResult:
     """使用 DeepSeek 原生 function calling + thinking 模式执行审核。
 
@@ -588,14 +589,27 @@ def _run_native_tool_calling(
     - 支持一次请求内连续调用多个工具
     """
     from openai import OpenAI
+    import httpx
+
+    def _emit(event: dict):
+        if event_callback:
+            try:
+                event_callback(event)
+            except Exception:
+                pass
+
+    _emit({"type": "start", "message": "Agentic 审核开始 (DeepSeek thinking 模式)"})
 
     api_key = os.environ.get("DEEPSEEK_API_KEY", "")
     base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
     model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    # 绕过 SOCKS 代理（与 settings.py 中 DeepSeek provider 行为一致）
+    http_client = httpx.Client(trust_env=False, timeout=httpx.Timeout(300))
+    client = OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
 
     issues: list[AuditIssue] = []
+    issue_count_before = 0
     messages: list[dict] = [
         {"role": "system", "content": NATIVE_SYSTEM_PROMPT},
         {
@@ -610,19 +624,38 @@ def _run_native_tool_calling(
     ]
 
     raw_analysis = ""
-    max_iterations = 100  # 工具调用总次数上限（一次请求可能多次调用）
+    max_iterations = 100
 
-    for _ in range(max_iterations):
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=_TOOLS_SPEC,
-            extra_body={"thinking": {"type": "enabled"}},
-        )
+    # 上下文窗口管理：保留 system prompt + 最近的消息
+    # 避免 thinking 模式 + 工具返回导致上下文膨胀 OOM
+    MAX_CONTEXT_MESSAGES = 15  # 保留最近 15 条消息（不含 system prompt）
+
+    for iteration in range(max_iterations):
+        # 上下文裁剪：保留 system + 最近 N 条
+        if len(messages) > MAX_CONTEXT_MESSAGES + 1:
+            # 保留 system prompt + 最近的消息
+            messages = [messages[0]] + messages[-(MAX_CONTEXT_MESSAGES):]
+            _logger.debug("context trimmed to %d messages", len(messages))
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=_TOOLS_SPEC,
+                extra_body={"thinking": {"type": "enabled"}},
+            )
+        except Exception as e:
+            _emit({"type": "error", "message": f"LLM 调用失败: {e}"})
+            _logger.warning("native tool calling: chat.completions failed: %s", e)
+            break
 
         msg = response.choices[0].message
 
-        # 追加 assistant 消息（含 reasoning_content 和 tool_calls）
+        # 发送 reasoning 事件
+        if msg.reasoning_content:
+            rc = msg.reasoning_content
+            _emit({"type": "reasoning", "content": rc[:2000]})
+
+        # 追加 assistant 消息
         assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
         if msg.reasoning_content:
             assistant_msg["reasoning_content"] = msg.reasoning_content
@@ -643,6 +676,7 @@ def _run_native_tool_calling(
         # 没有工具调用 → 模型给出了最终回答
         if not msg.tool_calls:
             raw_analysis = msg.content or "审核完成"
+            _emit({"type": "complete", "summary": raw_analysis, "issues_count": len(issues)})
             _logger.info(
                 "native agentic audit finished, %d issues found",
                 len(issues),
@@ -657,11 +691,35 @@ def _run_native_tool_calling(
             except json.JSONDecodeError:
                 func_args = {}
 
+            _emit({"type": "tool_call", "tool": func_name, "args": func_args})
             _logger.debug("native tool call: %s(%s)", func_name, func_args)
-            tool_result = _execute_native_tool(
-                func_name, func_args,
-                parsed_content, structure, kb_ids, doc_name, issues,
-            )
+
+            try:
+                tool_result = _execute_native_tool(
+                    func_name, func_args,
+                    parsed_content, structure, kb_ids, doc_name, issues,
+                )
+            except Exception as e:
+                tool_result = f"工具执行失败: {e}"
+                _emit({"type": "error", "message": f"{func_name} 执行失败: {e}"})
+
+            _emit({"type": "tool_result", "tool": func_name, "content": tool_result})
+
+            # 检测 flag_issue 产生的新问题
+            if func_name == "flag_issue" and len(issues) > issue_count_before:
+                new_issue = issues[-1]
+                _emit({
+                    "type": "issue_found",
+                    "issue": {
+                        "id": new_issue.id,
+                        "type": new_issue.type,
+                        "severity": new_issue.severity,
+                        "description": new_issue.description[:300],
+                        "standard_name": new_issue.standard_reference.standard_name if new_issue.standard_reference else None,
+                        "standard_clause": new_issue.standard_reference.clause if new_issue.standard_reference else None,
+                    },
+                })
+                issue_count_before = len(issues)
 
             messages.append({
                 "role": "tool",
@@ -675,6 +733,7 @@ def _run_native_tool_calling(
             f"审核在 {max_iterations} 次工具调用后强制终止，"
             f"已完成 {len(issues)} 个问题的记录。"
         )
+        _emit({"type": "complete", "summary": raw_analysis, "issues_count": len(issues)})
 
     return _build_result(task_id, doc_id, doc_name, issues, raw_analysis)
 
@@ -690,16 +749,27 @@ def _run_structured_llm_loop(
     doc_name: str,
     task_id: str,
     doc_id: str,
+    event_callback: Callable[[dict], None] | None = None,
 ) -> AuditResult:
     """使用 structured_llm + AgentAction 模型执行审核（降级路径）。
 
     通过 as_structured_llm 让 LLM 输出 AgentAction JSON 来表达工具调用意图。
     适用非 DeepSeek provider（MiniMax、OpenAI 等）或 DeepSeek 原生路径失败时。
     """
+    def _emit(event: dict):
+        if event_callback:
+            try:
+                event_callback(event)
+            except Exception:
+                pass
+
+    _emit({"type": "start", "message": "Agentic 审核开始 (structured_llm 模式)"})
+
     llm = get_llm()
     try:
         structured_llm = llm.as_structured_llm(output_cls=AgentAction)
     except Exception as e:
+        _emit({"type": "error", "message": f"structured_llm 初始化失败: {e}"})
         _logger.warning("as_structured_llm failed: %s, agentic audit unavailable", e)
         return _build_result(
             task_id, doc_id, doc_name, [],
@@ -707,6 +777,7 @@ def _run_structured_llm_loop(
         )
 
     issues: list[AuditIssue] = []
+    issue_count_before = 0
     messages = [
         _build_system_msg(),
         _build_init_msg(doc_name, structure),
@@ -741,12 +812,16 @@ def _run_structured_llm_loop(
                         f"Agentic 审核在 {turn} 轮后因连续解析失败中止，"
                         f"已记录 {len(issues)} 个问题。"
                     )
+                    _emit({"type": "error", "message": raw_analysis})
                     break
                 continue
             else:
                 consecutive_failures = 0
 
         consecutive_failures = 0
+
+        # 发送 thought 事件
+        _emit({"type": "reasoning", "content": action.thought})
 
         messages.append(ChatMessage(
             role=MessageRole.ASSISTANT,
@@ -755,16 +830,46 @@ def _run_structured_llm_loop(
 
         if action.action == "finish":
             raw_analysis = action.final_summary or "审核完成（Agent 未提供总结）"
+            _emit({"type": "complete", "summary": raw_analysis, "issues_count": len(issues)})
             _logger.info(
                 "agentic audit finished after %d turns, %d issues found",
                 turn + 1, len(issues),
             )
             break
 
+        # 执行工具前发送 tool_call 事件
+        if action.action != "flag_issue":
+            tool_name = action.action
+            tool_args = {}
+            if tool_name == "read_chapter":
+                tool_args = {"chapter_index": action.chapter_index}
+            elif tool_name == "search_kb":
+                tool_args = {"query": action.search_query, "top_k": action.search_top_k}
+            _emit({"type": "tool_call", "tool": tool_name, "args": tool_args})
+
         tool_result = _execute_tool(
             action, parsed_content, structure, kb_ids, doc_name, issues,
         )
         messages.append(_build_tool_result_msg(tool_result))
+
+        # 发送 tool_result 或 issue_found 事件
+        if action.action == "flag_issue":
+            if len(issues) > issue_count_before:
+                new_issue = issues[-1]
+                _emit({
+                    "type": "issue_found",
+                    "issue": {
+                        "id": new_issue.id,
+                        "type": new_issue.type,
+                        "severity": new_issue.severity,
+                        "description": new_issue.description[:300],
+                        "standard_name": new_issue.standard_reference.standard_name if new_issue.standard_reference else None,
+                        "standard_clause": new_issue.standard_reference.clause if new_issue.standard_reference else None,
+                    },
+                })
+                issue_count_before = len(issues)
+        else:
+            _emit({"type": "tool_result", "tool": action.action, "content": tool_result})
 
     else:
         _deg_record("agentic_audit", "max_turns_exhausted",
@@ -772,6 +877,7 @@ def _run_structured_llm_loop(
         raw_analysis = (
             f"审核在 {MAX_TURNS} 轮后强制终止，已完成 {len(issues)} 个问题的记录。"
         )
+        _emit({"type": "complete", "summary": raw_analysis, "issues_count": len(issues)})
 
     return _build_result(task_id, doc_id, doc_name, issues, raw_analysis)
 
@@ -783,11 +889,15 @@ def run_agentic_audit(
     doc_name: str,
     task_id: str,
     doc_id: str,
+    event_callback: Callable[[dict], None] | None = None,
 ) -> AuditResult:
     """Agentic 审核主入口。
 
     DeepSeek provider → 原生 function calling + thinking 模式（更稳定、更准确）。
     其他 provider   → structured_llm + AgentAction JSON（降级路径）。
+
+    Args:
+        event_callback: 流式事件回调，接收 {"type": ..., ...} 字典。
     """
     provider = os.environ.get("LLM_PROVIDER", "").lower()
 
@@ -797,15 +907,22 @@ def run_agentic_audit(
             return _run_native_tool_calling(
                 parsed_content, structure, kb_ids,
                 doc_name, task_id, doc_id,
+                event_callback=event_callback,
             )
         except Exception as e:
             _logger.warning(
                 "Native function calling failed (%s), falling back to structured_llm", e,
             )
+            if event_callback:
+                try:
+                    event_callback({"type": "progress", "message": f"原生路径失败，降级到 structured_llm: {e}"})
+                except Exception:
+                    pass
             _deg_record("agentic_audit", "native_failed_fallback",
                         f"Native path failed: {e}, falling back to structured_llm")
 
     return _run_structured_llm_loop(
         parsed_content, structure, kb_ids,
         doc_name, task_id, doc_id,
+        event_callback=event_callback,
     )

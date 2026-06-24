@@ -73,6 +73,7 @@ export const auditTaskApi = {
     api.post<AuditTask>('/audit-tasks', data).then(r => r.data),
   run: (id: string, asyncMode = true) =>
     api.post<AuditTask>(`/audit-tasks/${id}/run`, null, { params: { async_mode: asyncMode } }).then(r => r.data),
+  streamUrl: (id: string) => `/api/v1/audit-tasks/${id}/stream`,
   getResult: (id: string) =>
     api.get<AuditResult>(`/audit-tasks/${id}/result`).then(r => r.data),
   cancel: (id: string) =>

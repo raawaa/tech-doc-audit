@@ -98,7 +98,25 @@ export interface AuditResult {
   generated_at: string
 }
 
-// ── 问答 ──
+// ── 流式审核事件 ──
+export interface AuditEventIssue {
+  id: number
+  type: string
+  severity: string
+  description: string
+  standard_name?: string
+  standard_clause?: string
+}
+
+export type AuditEvent =
+  | { type: 'start'; message: string }
+  | { type: 'reasoning'; content: string }
+  | { type: 'tool_call'; tool: string; args: Record<string, unknown> }
+  | { type: 'tool_result'; tool: string; content: string; truncated?: boolean }
+  | { type: 'issue_found'; issue: AuditEventIssue }
+  | { type: 'progress'; message: string }
+  | { type: 'complete'; summary: string; issues_count: number }
+  | { type: 'error'; message: string }
 export interface QASource {
   kb_id: string
   doc_id: string

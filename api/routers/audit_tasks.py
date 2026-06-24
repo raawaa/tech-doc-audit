@@ -1,7 +1,13 @@
 from typing import Optional
 from pydantic import BaseModel
 
+import asyncio
+import json
+import queue
+import threading
+
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 import services.audit_task_service as audit_task_svc
 import storage.audit_doc_repo as doc_repo
@@ -174,3 +180,55 @@ def run_audit_task(task_id: str, async_mode: bool = True):
     else:
         task = audit_task_svc.run_audit(task_id)
         return TaskResponse.from_task(task)
+
+
+@router.get("/{task_id}/stream")
+async def stream_audit_progress(task_id: str):
+    """流式返回 Agentic 审核的实时进度（SSE）。"""
+    task = audit_task_svc.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    event_queue: queue.Queue = queue.Queue()
+
+    def run_with_stream():
+        try:
+            audit_task_svc.run_audit(task_id, event_callback=event_queue.put)
+        except Exception as e:
+            event_queue.put({"type": "error", "message": str(e)})
+        finally:
+            event_queue.put(None)  # sentinel
+
+    thread = threading.Thread(target=run_with_stream, daemon=True)
+    thread.start()
+
+    async def event_generator():
+        while True:
+            try:
+                event = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: event_queue.get(timeout=120)
+                )
+            except queue.Empty:
+                yield f"data: {json.dumps({'type': 'error', 'message': '审核超时'}, ensure_ascii=False)}\n\n"
+                break
+
+            if event is None:
+                break
+
+            # 截断过长的 tool_result 内容
+            if isinstance(event, dict) and event.get("type") == "tool_result":
+                content = event.get("content", "")
+                if len(content) > 2000:
+                    event = {**event, "content": content[:2000] + "\n... [截断]", "truncated": True}
+
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

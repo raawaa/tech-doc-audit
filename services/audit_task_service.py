@@ -2,7 +2,7 @@ import concurrent.futures
 import os
 import threading
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 from core.logger import get_logger
 from models.audit_task import AuditTask, AuditIssue, AuditResult, ResultSummary, AuditType
@@ -224,7 +224,7 @@ def _deduplicate_issues(issues: list) -> list:
     return deduped
 
 
-def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
+def run_audit(task_id: str, use_quick_mode: bool = True, event_callback: Callable[[dict], None] | None = None) -> AuditTask:
     """执行审核任务。"""
     task = repo.get_task(task_id)
     if not task:
@@ -300,6 +300,7 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
                     doc_name=doc.name,
                     task_id=task.id,
                     doc_id=doc.id,
+                    event_callback=event_callback,
                 )
                 all_issues = agentic_result.issues
                 raw_parts.append(

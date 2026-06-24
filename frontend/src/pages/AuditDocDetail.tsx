@@ -7,12 +7,14 @@ import { auditDocApi, auditTaskApi } from '../api/endpoints'
 import { Card, CardHeader, CardBody } from '../components/Card'
 import { Badge } from '../components/Badge'
 import { ProgressBar } from '../components/ProgressBar'
+import { AuditStream } from '../components/AuditStream'
 
 export function AuditDocDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const qc = useQueryClient()
   const prevTaskStatus = useRef<Record<string, string>>({})
+  const [streamingTaskId, setStreamingTaskId] = useState<string | null>(null)
 
   const { data: doc, isLoading } = useQuery({
     queryKey: ['audit-doc', id],
@@ -70,7 +72,10 @@ export function AuditDocDetail() {
 
   const runTask = useMutation({
     mutationFn: (taskId: string) => auditTaskApi.run(taskId, true),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['audit-tasks', id] }),
+    onSuccess: (_data, taskId) => {
+      setStreamingTaskId(taskId)
+      qc.invalidateQueries({ queryKey: ['audit-tasks', id] })
+    },
   })
 
   const cancelTask = useMutation({
@@ -219,6 +224,11 @@ export function AuditDocDetail() {
           )}
         </CardBody>
       </Card>
+
+      {/* Agentic 审核流式面板 */}
+      {streamingTaskId && (
+        <AuditStream taskId={streamingTaskId} docId={doc.id} />
+      )}
     </div>
   )
 }
