@@ -184,23 +184,78 @@ def run_audit_task(task_id: str, async_mode: bool = True):
 
 @router.get("/{task_id}/stream")
 async def stream_audit_progress(task_id: str):
-    """流式返回 Agentic 审核的实时进度（SSE）。"""
+    """流式返回 Agentic 审核的实时进度（SSE）。
+
+    - pending: 启动审核，通过 event_callback 推送详细事件
+    - processing: 任务已在执行，轮询等待完成
+    - completed/failed: 直接返回结果
+    """
     task = audit_task_svc.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
 
     event_queue: queue.Queue = queue.Queue()
 
-    def run_with_stream():
-        try:
-            audit_task_svc.run_audit(task_id, event_callback=event_queue.put)
-        except Exception as e:
-            event_queue.put({"type": "error", "message": str(e)})
-        finally:
-            event_queue.put(None)  # sentinel
+    if task.status == "pending":
+        def run_with_stream():
+            try:
+                audit_task_svc.run_audit(task_id, event_callback=event_queue.put)
+            except Exception as e:
+                event_queue.put({"type": "error", "message": str(e)})
+            finally:
+                event_queue.put(None)
 
-    thread = threading.Thread(target=run_with_stream, daemon=True)
-    thread.start()
+        thread = threading.Thread(target=run_with_stream, daemon=True)
+        thread.start()
+
+    elif task.status == "processing":
+        import time
+
+        def poll_for_completion():
+            last_progress = -1
+            for _ in range(300):  # 最多等 5 分钟
+                t = audit_task_svc.get_task(task_id)
+                if not t:
+                    event_queue.put({"type": "error", "message": "任务丢失"})
+                    event_queue.put(None)
+                    return
+                if t.status == "completed":
+                    result = t.result
+                    event_queue.put({
+                        "type": "complete",
+                        "summary": result.raw_analysis if result else "审核完成",
+                        "issues_count": result.summary.issues_count if result else 0,
+                    })
+                    event_queue.put(None)
+                    return
+                if t.status == "failed":
+                    event_queue.put({
+                        "type": "error",
+                        "message": t.error_message or "审核失败",
+                    })
+                    event_queue.put(None)
+                    return
+                if t.progress != last_progress:
+                    event_queue.put({
+                        "type": "progress",
+                        "message": t.progress_label or f"处理中 {int(t.progress * 100)}%",
+                    })
+                    last_progress = t.progress
+                time.sleep(1)
+            event_queue.put({"type": "error", "message": "审核超时"})
+            event_queue.put(None)
+
+        thread = threading.Thread(target=poll_for_completion, daemon=True)
+        thread.start()
+
+    else:
+        result = task.result
+        event_queue.put({
+            "type": "complete",
+            "summary": result.raw_analysis if result else "审核完成",
+            "issues_count": result.summary.issues_count if result else 0,
+        })
+        event_queue.put(None)
 
     async def event_generator():
         while True:
