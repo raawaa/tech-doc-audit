@@ -53,7 +53,6 @@ class TopicIssueList(BaseModel):
 # ── Agentic 审核 ──
 
 AuditActionType = Literal[
-    "get_structure",
     "read_chapter",
     "search_kb",
     "flag_issue",

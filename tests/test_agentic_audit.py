@@ -10,11 +10,6 @@ from models.llm_schemas import AgentAction
 class TestAgentAction:
     """测试 AgentAction 模型。"""
 
-    def test_get_structure_action(self):
-        a = AgentAction(thought="查看文档结构", action="get_structure")
-        assert a.action == "get_structure"
-        assert a.chapter_index is None
-
     def test_read_chapter_action(self):
         a = AgentAction(thought="读第3章", action="read_chapter", chapter_index=3)
         assert a.action == "read_chapter"
@@ -255,10 +250,10 @@ class TestFallbackParser:
     def test_json_parse(self):
         from services.agentic_audit import _parse_action_fallback
         result = _parse_action_fallback(
-            '{"thought": "查看结构", "action": "get_structure"}'
+            '{"thought": "读取章节", "action": "read_chapter", "chapter_index": 1}'
         )
         assert result is not None
-        assert result.action == "get_structure"
+        assert result.action == "read_chapter"
 
     def test_markdown_wrapped_json(self):
         from services.agentic_audit import _parse_action_fallback

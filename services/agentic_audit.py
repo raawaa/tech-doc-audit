@@ -41,40 +41,38 @@ MAX_CONSECUTIVE_FAILURES = 3
 # System Prompt
 # ═══════════════════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """你是一个严格的技术文档审核专家。你的任务是对照知识库中的标准规范，逐章审核文档，发现不合规、不完整、不一致的问题。
+SYSTEM_PROMPT = """你是一个严格的技术文档审核专家。你的任务是对照知识库中的标准规范，审核文档是否合规。
 
-## 必须遵守的审核流程
+## 审核流程
 
-1. 首先调用 get_structure 了解文档结构
-2. 逐章审核（从第1章到最后一章），不要跳过任何章节：
-   a. 调用 read_chapter 读取本章全文
-   b. 根据章节具体内容提炼 2-3 个不同的搜索关键词，逐次调用 search_kb 搜索相关标准
-   c. 仔细比对文档内容与搜索到的标准条款
-   d. 发现问题立即调用 flag_issue 记录
-3. 全部章节审核完毕后，调用 finish 输出审核总结
+1. 仔细阅读下方的文档全文（或文档开头部分）
+2. 从文档内容中提炼具体的技术关键词，调用 search_kb 搜索相关标准规范
+3. 逐条比对文档内容与搜索到的标准条款
+4. 发现问题立即调用 flag_issue 记录
+5. 对文档的不同主题/技术点，使用不同的关键词多角度搜索
+6. 如果文档很长，当前未显示完整内容，可调用 read_chapter 查看更多
 
 ## 搜索策略
-- 从章节内容中提取具体技术术语作为 search_query（如"防护等级IP65"而非章节名"技术规格"）
-- 每个章节至少搜索 2 次，使用不同角度/关键词
+- 从文档内容中提取具体技术术语作为 search_query（如"防护等级IP65"）
+- 使用不同角度和关键词多次搜索
 - 搜索结果 relevance < 0.3 可视为不相关，换词重搜
-- 如果连续 2 次搜索均无相关结果，该章节可能与标准无关，继续下一章
 
 ## 判断标准
 - compliance: 文档内容违反标准规定（数值不达标、方法错误等）
 - completeness: 文档缺少标准要求的内容（缺失必要条款、参数未明确等）
 - consistency: 文档内部数据矛盾，或与标准条文不一致
 - insufficient_evidence: 证据不足，无法做出确定判断
-- 无问题的章节不需要强行找问题
+- 无问题的内容不需要强行找问题
 
 ## flag_issue 要求
 - cited_excerpt 必须从文档原文逐字引用作为证据
 - standard_name 和 standard_clause 必须来自 search_kb 的返回结果
-- document_position 必须使用 read_chapter 返回的章节名称（如"第一部分 通用要求"），不要使用编号
+- document_position 必须使用文档中的实际章节名称，不要使用编号
 - issue_description 清晰说明问题和标准依据
 
 ## 注意事项
 - 每次只执行一个操作（一个 action）
-- thought 中简要说明当前进度和推理
+- thought 中简要说明当前推理
 - 直接输出 JSON 格式，不要用 Markdown 包裹"""
 
 
@@ -300,10 +298,7 @@ def _execute_tool(
     """根据 action 分发到对应工具函数。"""
     tool_name = action.action
 
-    if tool_name == "get_structure":
-        return _tool_get_structure(structure, doc_name)
-
-    elif tool_name == "read_chapter":
+    if tool_name == "read_chapter":
         idx = action.chapter_index or 1
         return _tool_read_chapter(parsed_content, structure, idx)
 
@@ -351,14 +346,25 @@ def _build_system_msg() -> ChatMessage:
 def _build_init_msg(
     doc_name: str,
     structure: DocumentStructure | None,
+    parsed_content: str = "",
 ) -> ChatMessage:
-    structure_preview = _tool_get_structure(structure, doc_name)
-    content = (
-        f"请审核文档《{doc_name}》。\n\n"
-        f"文档结构如下（也可调用 get_structure 重新获取）：\n"
-        f"{structure_preview}\n\n"
-        f"请从 get_structure 开始审核流程。"
-    )
+    DOC_FULL_THRESHOLD = 30000
+    structure_text = _tool_get_structure(structure, doc_name)
+
+    if len(parsed_content) <= DOC_FULL_THRESHOLD:
+        content = (
+            f"请审核文档《{doc_name}》。\n\n"
+            f"文档结构：\n{structure_text}\n\n"
+            f"=== 文档全文 ===\n{parsed_content}"
+        )
+    else:
+        content = (
+            f"请审核文档《{doc_name}》。\n\n"
+            f"文档结构：\n{structure_text}\n\n"
+            f"=== 文档开头（共{len(parsed_content)}字）===\n"
+            f"{parsed_content[:8000]}\n"
+            f"\n（文档较长，如需查看更多内容请使用 read_chapter 工具）"
+        )
     return ChatMessage(role=MessageRole.USER, content=content)
 
 
@@ -404,16 +410,8 @@ _TOOLS_SPEC = [
     {
         "type": "function",
         "function": {
-            "name": "get_structure",
-            "description": "获取文档的章节结构（章名、条款数），了解文档全貌",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "read_chapter",
-            "description": "读取指定章节的全文内容",
+            "description": "读取文档指定章节的全文。仅在文档过长需要查看更多内容时使用。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -504,35 +502,33 @@ _TOOLS_SPEC = [
     },
 ]
 
-NATIVE_SYSTEM_PROMPT = """你是一个严格的技术文档审核专家。你的任务是对照知识库中的标准规范，逐章审核文档，发现不合规、不完整、不一致的问题。
+NATIVE_SYSTEM_PROMPT = """你是一个严格的技术文档审核专家。你的任务是对照知识库中的标准规范，审核文档是否合规。
 
-## 必须遵守的审核流程
+## 审核流程
 
-1. 首先调用 get_structure 了解文档结构
-2. 逐章审核（从第 1 章到最后一章），不要跳过任何章节：
-   a. 调用 read_chapter 读取本章全文
-   b. 根据章节具体内容提炼 2-3 个不同的搜索关键词，逐次调用 search_kb 搜索相关标准
-   c. 仔细比对文档内容与搜索到的标准条款
-   d. 发现问题立即调用 flag_issue 记录
-3. 全部章节审核完毕后，直接输出审核总结（不再调用工具）
+1. 仔细阅读下方的文档全文（或文档开头部分）
+2. 从文档内容中提炼具体的技术关键词，调用 search_kb 搜索相关标准规范
+3. 逐条比对文档内容与搜索到的标准条款
+4. 发现问题立即调用 flag_issue 记录
+5. 对文档的不同章节/主题，使用不同的关键词多角度搜索
+6. 如果文档很长，当前未显示的部分需要查看更多时，调用 read_chapter 读取
 
 ## 搜索策略
-- 从章节内容中提取具体技术术语作为 search_query（如"防护等级IP65"而非章节名"技术规格"）
-- 每个章节至少搜索 2 次，使用不同角度/关键词
+- 从文档内容中提取具体技术术语作为 search_query（如"防护等级IP65"）
+- 使用不同角度和关键词多次搜索
 - 搜索结果 relevance < 0.3 可视为不相关，换词重搜
-- 如果连续 2 次搜索均无相关结果，该章节可能与标准无关，继续下一章
 
 ## 判断标准
 - compliance: 文档内容违反标准规定（数值不达标、方法错误等）
 - completeness: 文档缺少标准要求的内容（缺失必要条款、参数未明确等）
 - consistency: 文档内部数据矛盾，或与标准条文不一致
 - insufficient_evidence: 证据不足，无法做出确定判断
-- 无问题的章节不需要强行找问题
+- 无问题的内容不需要强行找问题
 
 ## flag_issue 要求
 - cited_excerpt 必须从文档原文逐字引用作为证据
 - standard_name 和 standard_clause 必须来自 search_kb 的返回结果
-- document_position 必须使用 read_chapter 返回的章节名称（如"第一部分 通用要求"），不要使用编号
+- document_position 必须使用文档中的实际章节名称，不要使用编号
 - description 清晰说明问题和标准依据"""
 
 
@@ -546,9 +542,7 @@ def _execute_native_tool(
     issues: list[AuditIssue],
 ) -> str:
     """原生 function calling 的工具分发。"""
-    if func_name == "get_structure":
-        return _tool_get_structure(structure, doc_name)
-    elif func_name == "read_chapter":
+    if func_name == "read_chapter":
         return _tool_read_chapter(
             parsed_content, structure,
             args.get("chapter_index", 1),
@@ -615,17 +609,27 @@ def _run_native_tool_calling(
 
     issues: list[AuditIssue] = []
     issue_count_before = 0
+    # 按文档长度构建初始消息
+    DOC_FULL_THRESHOLD = 30000  # 短文档阈值（字符数）
+    structure_text = _tool_get_structure(structure, doc_name)
+    if len(parsed_content) <= DOC_FULL_THRESHOLD:
+        user_content = (
+            f"请审核文档《{doc_name}》。\n\n"
+            f"文档结构：\n{structure_text}\n\n"
+            f"=== 文档全文 ===\n{parsed_content}"
+        )
+    else:
+        user_content = (
+            f"请审核文档《{doc_name}》。\n\n"
+            f"文档结构：\n{structure_text}\n\n"
+            f"=== 文档开头（共{len(parsed_content)}字）===\n"
+            f"{parsed_content[:8000]}\n"
+            f"\n（文档较长，如需查看更多内容请使用 read_chapter 工具）"
+        )
+
     messages: list[dict] = [
         {"role": "system", "content": NATIVE_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"请审核文档《{doc_name}》。\n\n"
-                f"文档结构如下（也可调用 get_structure 重新获取）：\n"
-                f"{_tool_get_structure(structure, doc_name)}\n\n"
-                f"请从 get_structure 开始审核流程。"
-            ),
-        },
+        {"role": "user", "content": user_content},
     ]
 
     raw_analysis = ""
@@ -788,7 +792,7 @@ def _run_structured_llm_loop(
     issue_count_before = 0
     messages = [
         _build_system_msg(),
-        _build_init_msg(doc_name, structure),
+        _build_init_msg(doc_name, structure, parsed_content),
     ]
 
     raw_analysis = ""
