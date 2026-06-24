@@ -55,6 +55,7 @@ class TopicIssueList(BaseModel):
 AuditActionType = Literal[
     "read_chapter",
     "search_kb",
+    "search_kb_text",
     "flag_issue",
     "finish",
 ]

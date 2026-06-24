@@ -13,6 +13,7 @@ const toolIcons: Record<string, React.ReactNode> = {
   get_structure: <FileSearch className="w-3.5 h-3.5 text-blue-500" />,
   read_chapter: <FileSearch className="w-3.5 h-3.5 text-indigo-500" />,
   search_kb: <FileSearch className="w-3.5 h-3.5 text-emerald-500" />,
+  search_kb_text: <FileSearch className="w-3.5 h-3.5 text-teal-500" />,
   flag_issue: <AlertTriangle className="w-3.5 h-3.5 text-red-500" />,
 }
 
@@ -20,6 +21,7 @@ const toolLabels: Record<string, string> = {
   get_structure: '查看文档结构',
   read_chapter: '读取章节',
   search_kb: '搜索知识库',
+  search_kb_text: '文本搜索知识库',
   flag_issue: '记录问题',
 }
 
