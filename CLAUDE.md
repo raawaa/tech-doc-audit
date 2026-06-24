@@ -13,6 +13,18 @@ uv run python scripts/verify_all.py  # 运行所有 pytest 测试
 uv run pytest tests/ -v --tb=short   # 运行全部测试
 uv run pytest tests/test_xxx.py -v   # 运行单个测试文件
 
+# ⚠️ 运行测试前必须释放 GPU 显存
+# 后端进程（uvicorn）加载 bge-m3 模型后会占用 ~2-5GB 显存，
+# 测试脚本需另开进程加载模型，会导致 CUDA OOM。
+# 每次运行测试或独立 Python 脚本前，先杀掉后端：
+#   pkill -f "uvicorn api.main"
+#   sleep 2
+#   # 验证显存释放：
+#   nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader
+# 测试完成后重启后端：
+#   nohup uvicorn api.main:app --port 8000 > /tmp/backend.log 2>&1 &
+#   # 或 docker-compose up
+
 # 启动 API 服务
 uv run uvicorn api.main:app --reload --port 8000
 
@@ -116,6 +128,7 @@ docs/retrospectives/  → 开发复盘系列文档（`YYYY-MM-DD-title.md`，含
 
 ### 项目状态
 
-已完成 LlamaIndex 迁移（向量检索 + LLM 调用 + Agent 动态审核）。后续方向：审核报告交互追问（ChatEngine）、检索质量评估（eval）、外部数据源 Tool。
+已完成 LlamaIndex 迁移 + Agent 动态审核 + DeepSeek 结构化输出修复（`thinking: disabled`）。
+reranker 改为按需加载/卸载，缓解 GPU 显存压力。
 
 > 架构全貌、降级链、并发模型与完整技术债清单见 `docs/retrospectives/2026-06-18-architecture-and-debt.md`（含配图），是比本文件更详细的架构参考。

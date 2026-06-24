@@ -1,0 +1,30 @@
+graph TD
+    subgraph Index["索引阶段（一次性）"]
+        KB["KB文档文本"]
+        KB --> S["分块(Markdown/Sentence)"]
+        S --> EM["注入clause_number<br/>+section_path"]
+        EM --> FAISS["FAISS HNSW<br/>bge-m3 1024维"]
+    end
+
+    subgraph Audit["审核阶段"]
+        AD["待审核文档"]
+        AD --> CS["结构感知分块"]
+        CS --> VS["FAISS搜索 top_k=3"]
+        VS --> RR["reranker重排序"]
+        RR --> P["(文档段,标准条款)配對<br/>clause_number+section_path"]
+        P --> JL["LLM判断 ×匹配对数"]
+
+        JL --> VD{"结果类型"}
+        VD -->|"deviation"| CI["compliance问题"]
+        VD -->|"insufficient"| II["证据不足"]
+        VD -->|"compliant/NA"| IG["忽略"]
+        CI --> AR["AuditResult<br/>审核报告"]
+        II --> AR
+    end
+
+    style Index fill:#F0F4FF,stroke:#6C8EBF
+    style Audit fill:#F5F8FF,stroke:#6C8EBF
+    style FAISS fill:#DAE8FC,stroke:#6C8EBF
+    style JL fill:#DAE8FC,stroke:#6C8EBF
+    style VD fill:#FFE8CC,stroke:#D79B00
+    style AR fill:#DAE8FC,stroke:#6C8EBF,stroke-width:2px
