@@ -25,6 +25,10 @@ os.environ.setdefault("MKL_NUM_THREADS", "2")
 # 下载完成后切回 1（或不设，走默认）。
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
+# ── 文件上传大小限制 ──────────────────────────────────────────────────────────
+# 默认 100MB，通过 MAX_UPLOAD_SIZE_MB 环境变量可调整
+MAX_UPLOAD_SIZE = int(os.environ.get("MAX_UPLOAD_SIZE_MB", "100")) * 1024 * 1024
+
 from llama_index.core import Settings
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.callbacks import CallbackManager, LlamaDebugHandler
@@ -57,6 +61,10 @@ _embed_model_lock = threading.Lock()
 # forward 非线程安全。此锁确保同时只有一个线程执行模型前向传播，
 # 避免 N 个并发线程各自分配完整激活张量撑爆显存。
 _gpu_inference_lock = threading.RLock()
+
+# 代理环境变量操作锁：_create_safe_ollama 和 deepseek provider 需要临时
+# 移除 ALL_PROXY 环境变量。此锁确保移除→恢复期间不会有其他线程读到中间状态。
+_proxy_env_lock = threading.Lock()
 
 
 def get_gpu_inference_lock() -> threading.RLock:
@@ -108,148 +116,190 @@ def get_embed_model():
     return _embed_model
 
 
-# ── Reranker ────────────────────────────────────────────────────────────────────
-
-_reranker = None
-_reranker_lock = threading.Lock()
+# ── Reranker（按需加载→推理→卸载，避免与 embed 模型同时占用显存）──────────────
 
 
-def get_reranker():
-    """线程安全地延迟加载 reranker 模型（用于检索结果重排序，提升精度）。
-
-    Reranker 是一种 cross-encoder，对 query-doc 对做精确打分重排，
-    弥补 bi-encoder（bge-m3）ANN 检索的精度损失。
-
-    如果加载失败（模型未下载 / OOM / 依赖缺失），静默降级不阻断裂。
-    """
-    global _reranker
-    if _reranker is not None:
-        return _reranker
-    with _reranker_lock:
-        if _reranker is not None:
-            return _reranker
-
+def get_reranker_config() -> dict:
+    """返回 reranker 配置（不加载模型）。"""
     model_name = os.environ.get("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
     top_n = int(os.environ.get("RERANKER_TOP_N", "5"))
-    # 默认自动检测 GPU（None → SentenceTransformerRerank 自动选 cuda 或 cpu）
-    # 如果设置了 EMBED_DEVICE 但没单独设 RERANKER_DEVICE，跟随 EMBED_DEVICE
     device = os.environ.get("RERANKER_DEVICE") or os.environ.get("EMBED_DEVICE", None)
+    # ModelScope 本地缓存优先
+    path = os.path.expanduser(f"~/.cache/modelscope/hub/{model_name}")
+    if os.path.isdir(path):
+        model_name = path
+    return {"model": model_name, "top_n": top_n, "device": device or "cuda"}
+
+
+def run_reranker(nodes: list, query_str: str, config: dict | None = None) -> list:
+    """按需加载 reranker → 推理 → 立即卸载释放显存。
+
+    在 GPU 锁内调用（调用方负责持锁），确保不会与 embed 模型并发推理。
+    加载 ~1.3s、推理 ~0.2s、卸载 ~0s，总开销可接受。
+
+    Args:
+        nodes: NodeWithScore 列表（LlamaIndex 格式）。
+        query_str: 查询字符串。
+        config: get_reranker_config() 返回的配置，None 则自动获取。
+
+    Returns:
+        重排序后的 NodeWithScore 列表（取 top_n），失败时返回原始列表。
+    """
+    if not nodes:
+        return nodes
+    if config is None:
+        config = get_reranker_config()
 
     try:
-        # ModelScope 本地缓存优先（同 bge-m3 策略）
-        _modelscope_path = os.path.expanduser(f"~/.cache/modelscope/hub/{model_name}")
-        if os.path.isdir(_modelscope_path):
-            model_name = _modelscope_path
+        import gc
+        import torch
+        from sentence_transformers import CrossEncoder
 
-        from llama_index.core.postprocessor import SentenceTransformerRerank
-        _reranker = SentenceTransformerRerank(
-            model=model_name,
-            top_n=top_n,
-            device=device,
-            trust_remote_code=True,
-        )
+        device = config["device"]
+        try:
+            ce = CrossEncoder(
+                config["model"],
+                device=device,
+                trust_remote_code=True,
+            )
+        except Exception as gpu_err:
+            # GPU 显存不足 → 降级到 CPU（较慢但可用）
+            _logger.warning("reranker GPU load failed (%s), falling back to CPU", gpu_err)
+            device = "cpu"
+            ce = CrossEncoder(
+                config["model"],
+                device="cpu",
+                trust_remote_code=True,
+            )
+        try:
+            # 对 (query, node.text) 对打分
+            pairs = [(query_str, n.node.text or "") for n in nodes]
+            scores = ce.predict(pairs)
+
+            # 用 cross-encoder 分数覆盖原始 score，按降序排序
+            for node, score in zip(nodes, scores):
+                node.score = float(score)
+            nodes_sorted = sorted(nodes, key=lambda n: n.score or 0, reverse=True)
+            return nodes_sorted[: config["top_n"]]
+        finally:
+            del ce
+            gc.collect()
+            torch.cuda.empty_cache()
     except Exception as e:
-        _logger.warning("reranker init failed (%s), degraded to raw ranking: %s", model_name, e)
-        _reranker = None  # type: ignore[assignment]
-
-    return _reranker
+        _logger.warning("reranker on-demand load/predict failed, using raw ranking: %s", e)
+        return nodes
 
 
 # ── LLM ────────────────────────────────────────────────────────────────────────
 
 _llm = None
+_llm_lock = threading.Lock()
 
 
 def get_llm():
-    """延迟加载 LLM（支持 Ollama / OpenAI / MiniMax）。"""
+    """延迟加载 LLM（支持 Ollama / OpenAI / MiniMax），线程安全。"""
     global _llm
     if _llm is not None:
         return _llm
+    with _llm_lock:
+        # 双检锁：避免多个线程同时进入后各自创建一份 LLM 实例
+        if _llm is not None:
+            return _llm
 
-    provider = os.environ.get("LLM_PROVIDER", "ollama").lower().strip()
-    timeout = int(os.environ.get("LLM_TIMEOUT", "180"))
+        provider = os.environ.get("LLM_PROVIDER", "ollama").lower().strip()
+        timeout = int(os.environ.get("LLM_TIMEOUT", "180"))
 
-    if provider == "ollama":
-        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-        model = os.environ.get("OLLAMA_MODEL", "qwen3.5:0.8b")
-        _llm = _create_safe_ollama(model=model, base_url=base_url, timeout=timeout)
-    elif provider in ("minimax", "minimax-cn"):
-        from llama_index.llms.openai import OpenAI as OpenAILLM
-        base_url = os.environ.get("MINIMAX_CN_BASE_URL", "https://api.minimaxi.com/v1").rstrip("/")
-        api_key = os.environ.get("MINIMAX_CN_API_KEY", "")
-        model = os.environ.get("MINIMAX_CN_MODEL", "MiniMax-M2.7")
-        # MiniMax 模型名不在 OpenAI 白名单中，注册到校验列表避免报错
-        from llama_index.llms.openai import utils as _openai_utils
-        _openai_utils.ALL_AVAILABLE_MODELS[model] = 128000
-        _openai_utils.CHAT_MODELS[model] = 128000
-        _llm = OpenAILLM(
-            model=model, api_base=base_url, api_key=api_key,
-            request_timeout=timeout, is_chat_model=True,
-        )
-    elif provider == "openai":
-        from llama_index.llms.openai import OpenAI as OpenAILLM
-        base_url = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-        _llm = OpenAILLM(
-            model=model, api_base=base_url or None, api_key=api_key,
-            request_timeout=timeout, is_chat_model=True,
-        )
-    elif provider == "deepseek":
-        from llama_index.llms.openai import OpenAI as OpenAILLM
-        import httpx
-        base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
-        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-        model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-        # DeepSeek 模型名不在 OpenAI 白名单中，注册到校验列表避免报错
-        from llama_index.llms.openai import utils as _openai_utils
-        _openai_utils.ALL_AVAILABLE_MODELS[model] = 128000
-        _openai_utils.CHAT_MODELS[model] = 128000
-        # 创建 httpx client 时 trust_env=False，绕过 SOCKS 代理干扰
-        # 与 _SafeOllama 的 trust_env=False 原理一致
-        http_client = httpx.Client(trust_env=False, timeout=httpx.Timeout(timeout))
-        # 临时移除代理环境变量防止 httpx Client() 初始化时读取
-        _orig = os.environ.pop("ALL_PROXY", None)
-        os.environ.pop("all_proxy", None)
-        try:
+        if provider == "ollama":
+            base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+            model = os.environ.get("OLLAMA_MODEL", "qwen3.5:0.8b")
+            _llm = _create_safe_ollama(model=model, base_url=base_url, timeout=timeout, temperature=0.0)
+        elif provider in ("minimax", "minimax-cn"):
+            from llama_index.llms.openai import OpenAI as OpenAILLM
+            base_url = os.environ.get("MINIMAX_CN_BASE_URL", "https://api.minimaxi.com/v1").rstrip("/")
+            api_key = os.environ.get("MINIMAX_CN_API_KEY", "")
+            model = os.environ.get("MINIMAX_CN_MODEL", "MiniMax-M2.7")
+            # MiniMax 模型名不在 OpenAI 白名单中，注册到校验列表避免报错
+            from llama_index.llms.openai import utils as _openai_utils
+            _openai_utils.ALL_AVAILABLE_MODELS[model] = 128000
+            _openai_utils.CHAT_MODELS[model] = 128000
             _llm = OpenAILLM(
                 model=model, api_base=base_url, api_key=api_key,
                 request_timeout=timeout, is_chat_model=True,
-                http_client=http_client,
+                temperature=0.0,
             )
-        finally:
-            if _orig is not None:
-                os.environ["ALL_PROXY"] = _orig
-    else:
-        raise ValueError(f"Unknown LLM_PROVIDER: {provider}")
+        elif provider == "openai":
+            from llama_index.llms.openai import OpenAI as OpenAILLM
+            base_url = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")
+            api_key = os.environ.get("OPENAI_API_KEY", "")
+            model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+            _llm = OpenAILLM(
+                model=model, api_base=base_url or None, api_key=api_key,
+                request_timeout=timeout, is_chat_model=True,
+                temperature=0.0,
+            )
+        elif provider == "deepseek":
+            from llama_index.llms.openai import OpenAI as OpenAILLM
+            import httpx
+            base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+            api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+            model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+            # DeepSeek 模型名不在 OpenAI 白名单中，注册到校验列表避免报错
+            from llama_index.llms.openai import utils as _openai_utils
+            _openai_utils.ALL_AVAILABLE_MODELS[model] = 128000
+            _openai_utils.CHAT_MODELS[model] = 128000
+            # 创建 httpx client 时 trust_env=False，绕过 SOCKS 代理干扰
+            # 与 _SafeOllama 的 trust_env=False 原理一致
+            http_client = httpx.Client(trust_env=False, timeout=httpx.Timeout(timeout))
+            # 临时移除代理环境变量防止 httpx Client() 初始化时读取
+            # _proxy_env_lock 串行化此操作，确保移除→恢复期间无其他线程读到中间状态
+            with _proxy_env_lock:
+                _orig = os.environ.pop("ALL_PROXY", None)
+                os.environ.pop("all_proxy", None)
+                try:
+                    _llm = OpenAILLM(
+                        model=model, api_base=base_url, api_key=api_key,
+                        request_timeout=timeout, is_chat_model=True,
+                        http_client=http_client,
+                        temperature=0.0,
+                        # 禁用 DeepSeek 思考模式（thinking mode），
+                        # 否则 as_structured_llm 的 tool_choice 参数报 400
+                        additional_kwargs={'extra_body': {'thinking': {'type': 'disabled'}}},
+                    )
+                finally:
+                    if _orig is not None:
+                        os.environ["ALL_PROXY"] = _orig
+        else:
+            raise ValueError(f"Unknown LLM_PROVIDER: {provider}")
 
-    Settings.llm = _llm
+        Settings.llm = _llm
+
     return _llm
 
 
-def _create_safe_ollama(*, model: str, base_url: str, timeout: int):
+def _create_safe_ollama(*, model: str, base_url: str, timeout: int, temperature: float = 0.0):
     """创建绕过 SOCKS 代理问题的 Ollama LLM 实例。"""
-    _orig = os.environ.pop("ALL_PROXY", None)
-    os.environ.pop("all_proxy", None)
-    try:
-        import ollama as _ollama
-        from llama_index.llms.ollama import Ollama as _BaseOllama
+    with _proxy_env_lock:
+        _orig = os.environ.pop("ALL_PROXY", None)
+        os.environ.pop("all_proxy", None)
+        try:
+            import ollama as _ollama
+            from llama_index.llms.ollama import Ollama as _BaseOllama
 
-        class _SafeOllama(_BaseOllama):
-            """Ollama 子类，创建 httpx.Client 时禁用代理。"""
+            class _SafeOllama(_BaseOllama):
+                """Ollama 子类，创建 httpx.Client 时禁用代理。"""
 
-            @property
-            def client(self):
-                if self._client is None:
-                    self._client = _ollama.Client(
-                        host=self.base_url,
-                        timeout=self.request_timeout,
-                        headers=self.headers or {},
-                        trust_env=False,
-                    )
-                return self._client
+                @property
+                def client(self):
+                    if self._client is None:
+                        self._client = _ollama.Client(
+                            host=self.base_url,
+                            timeout=self.request_timeout,
+                            headers=self.headers or {},
+                            trust_env=False,
+                        )
+                    return self._client
 
-        return _SafeOllama(model=model, base_url=base_url, request_timeout=timeout)
-    finally:
-        if _orig is not None:
-            os.environ["ALL_PROXY"] = _orig
+            return _SafeOllama(model=model, base_url=base_url, request_timeout=timeout, temperature=temperature)
+        finally:
+            if _orig is not None:
+                os.environ["ALL_PROXY"] = _orig
