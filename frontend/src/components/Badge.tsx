@@ -29,6 +29,8 @@ const colorMap: Record<string, string> = {
   compliance: 'bg-red-50 text-red-700',
   completeness: 'bg-amber-50 text-amber-700',
   consistency: 'bg-blue-50 text-blue-700',
+  insufficient_evidence: 'bg-slate-100 text-slate-500',
+  out_of_scope: 'bg-slate-100 text-slate-400',
 }
 
 const labelMap: Record<string, string> = {
@@ -54,6 +56,8 @@ const labelMap: Record<string, string> = {
   compliance: '合规性',
   completeness: '完整性',
   consistency: '一致性',
+  insufficient_evidence: '证据不足',
+  out_of_scope: '超出范围',
 }
 
 export function Badge({

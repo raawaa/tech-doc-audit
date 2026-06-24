@@ -3,6 +3,7 @@ import type {
   KnowledgeBase, KBDocument,
   AuditDocument, AuditTask, AuditResult,
   QAResponse, ChatRequest, ChatResponse,
+  DocumentStructure,
 } from './types'
 
 // ── 知识库 ──
@@ -58,6 +59,8 @@ export const auditDocApi = {
     api.post<AuditDocument>(`/audit-documents/${id}/parse`).then(r => r.data),
   process: (id: string) =>
     api.post<AuditDocument>(`/audit-documents/${id}/process`).then(r => r.data),
+  getStructure: (id: string) =>
+    api.get<DocumentStructure>(`/audit-documents/${id}/structure`).then(r => r.data),
 }
 
 // ── 审核任务 ──

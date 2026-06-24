@@ -1,13 +1,84 @@
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowLeft, Download, Loader2 } from 'lucide-react'
+import { ArrowLeft, Download, FileDown, Loader2, Quote } from 'lucide-react'
 import { auditTaskApi } from '../api/endpoints'
+import type { AuditResult as AuditResultData, AuditIssue } from '../api/types'
 import { Card, CardHeader, CardBody } from '../components/Card'
 import { Badge, SeverityDot } from '../components/Badge'
 
 const typeLabels: Record<string, string> = {
-  compliance: '合规性', completeness: '完整性', consistency: '一致性',
+  compliance: '合规性',
+  completeness: '完整性',
+  consistency: '一致性',
+  insufficient_evidence: '证据不足',
+  out_of_scope: '超出范围',
 }
+
+const severityLabels: Record<string, string> = {
+  high: '高', medium: '中', low: '低',
+}
+
+// ── Markdown 导出 ──────────────────────────────────────────────────────────────
+
+function buildMarkdown(result: AuditResultData): string {
+  const { summary, issues, document_name, generated_at } = result
+  const date = new Date(generated_at).toLocaleString('zh-CN')
+
+  const lines: string[] = [
+    `# 审核报告`,
+    '',
+    `**文档名称**: ${document_name}`,
+    `**生成时间**: ${date}`,
+    `**条款总数**: ${summary.total_clauses}`,
+    '',
+    '## 摘要',
+    '',
+    '| 指标 | 数量 |',
+    '|------|------|',
+    `| 发现问题 | ${summary.issues_count} |`,
+    `| 合规性问题 | ${summary.compliance_issues} |`,
+    `| 完整性问题 | ${summary.completeness_issues} |`,
+    `| 一致性问题 | ${summary.consistency_issues} |`,
+    `| 高风险 | ${summary.high_severity} |`,
+    `| 中风险 | ${summary.medium_severity} |`,
+    `| 低风险 | ${summary.low_severity} |`,
+    '',
+  ]
+
+  if (issues.length === 0) {
+    lines.push('## 问题列表', '', '未发现合规问题。', '')
+  } else {
+    lines.push('## 问题列表', '')
+    issues.forEach((issue, i) => {
+      lines.push(`### ${i + 1}. [${severityLabels[issue.severity] || issue.severity}] ${issue.description}`)
+      lines.push('')
+      lines.push(`- **类型**: ${typeLabels[issue.type] || issue.type}`)
+      if (issue.clause_number) lines.push(`- **条款编号**: ${issue.clause_number}`)
+      if (issue.standard_name) lines.push(`- **标准依据**: ${issue.standard_name}${issue.standard_clause ? ` ${issue.standard_clause}` : ''}`)
+      if (issue.document_position) lines.push(`- **文档位置**: ${issue.document_position}`)
+      if (issue.suggestion) lines.push(`- **修改建议**: ${issue.suggestion}`)
+      if (issue.cited_excerpt) {
+        lines.push('')
+        lines.push('> ' + issue.cited_excerpt.split('\n').join('\n> '))
+      }
+      lines.push('')
+    })
+  }
+
+  return lines.join('\n')
+}
+
+function downloadFile(filename: string, content: string, mime: string) {
+  const blob = new Blob([content], { type: mime })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+// ── 组件 ──────────────────────────────────────────────────────────────────────
 
 export function AuditResult() {
   const { id: docId, taskId } = useParams<{ id: string; taskId: string }>()
@@ -24,14 +95,12 @@ export function AuditResult() {
   if (!result) return <div className="text-center py-20 text-slate-500">暂无结果</div>
 
   const { summary, issues } = result
-  const exportJson = () => {
-    const blob = new Blob([JSON.stringify(result, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url; a.download = `审核报告_${result.document_name}_${Date.now()}.json`
-    a.click()
-    URL.revokeObjectURL(url)
-  }
+
+  const exportJson = () =>
+    downloadFile(`审核报告_${result.document_name}_${Date.now()}.json`, JSON.stringify(result, null, 2), 'application/json')
+
+  const exportMd = () =>
+    downloadFile(`审核报告_${result.document_name}_${Date.now()}.md`, buildMarkdown(result), 'text/markdown')
 
   return (
     <div className="space-y-6">
@@ -39,9 +108,14 @@ export function AuditResult() {
         <button className="btn-ghost btn-sm -ml-2" onClick={() => navigate(`/audit/${docId}`)}>
           <ArrowLeft className="w-4 h-4" /> 返回
         </button>
-        <button className="btn-secondary btn-sm" onClick={exportJson}>
-          <Download className="w-3.5 h-3.5" /> 导出 JSON
-        </button>
+        <div className="flex gap-2">
+          <button className="btn-secondary btn-sm" onClick={exportMd}>
+            <FileDown className="w-3.5 h-3.5" /> 导出报告
+          </button>
+          <button className="btn-ghost btn-sm" onClick={exportJson}>
+            <Download className="w-3.5 h-3.5" /> JSON
+          </button>
+        </div>
       </div>
 
       <div>
@@ -87,8 +161,8 @@ export function AuditResult() {
         <CardHeader
           title={`问题列表（${issues.length}）`}
           action={
-            <div className="flex gap-2 text-xs">
-              {['compliance', 'completeness', 'consistency'].map((t) => (
+            <div className="flex flex-wrap gap-2 text-xs">
+              {['compliance', 'completeness', 'consistency', 'insufficient_evidence', 'out_of_scope'].map((t) => (
                 <span key={t} className="flex items-center gap-1">
                   <Badge value={t} /> <span className="text-slate-400">{typeLabels[t]}</span>
                 </span>
@@ -101,7 +175,7 @@ export function AuditResult() {
             <div className="text-center py-12 text-sm text-slate-400">未发现合规问题</div>
           ) : (
             <div className="divide-y divide-slate-100">
-              {issues.map((issue) => (
+              {issues.map((issue: AuditIssue) => (
                 <div key={issue.id} className="px-5 py-4 hover:bg-slate-50/50 transition-colors">
                   <div className="flex items-start gap-3">
                     <SeverityDot severity={issue.severity} />
@@ -112,9 +186,22 @@ export function AuditResult() {
                           <span className="text-xs font-mono text-slate-400">#{issue.clause_number}</span>
                         )}
                       </div>
-                      <p className="text-sm text-slate-900 mt-1 leading-relaxed">{issue.description}</p>
-                      {(issue.standard_name || issue.standard_clause) && (
-                        <div className="mt-2 text-xs text-slate-500 bg-slate-50 rounded-md p-2.5 border border-slate-100">
+                      {issue.document_position && (
+                        <p className="text-xs text-slate-500 mt-0.5 mb-1">📍 {issue.document_position}</p>
+                      )}
+                      <p className="text-sm text-slate-900 leading-relaxed">{issue.description}</p>
+
+                      {/* 原文引用 */}
+                      {issue.cited_excerpt && (
+                        <div className="mt-2 flex gap-1.5 text-xs text-slate-600 bg-slate-50 rounded-md p-2.5 border border-slate-100">
+                          <Quote className="w-3 h-3 text-slate-400 shrink-0 mt-0.5" />
+                          <p className="leading-relaxed">{issue.cited_excerpt}</p>
+                        </div>
+                      )}
+
+                      {/* 标准依据 + 建议 */}
+                      {(issue.standard_name || issue.suggestion) && (
+                        <div className="mt-2 text-xs text-slate-500 bg-blue-50/40 rounded-md p-2.5 border border-blue-100/60">
                           {issue.standard_name && <p><span className="font-medium text-slate-600">依据：</span>{issue.standard_name}{issue.standard_clause ? ` ${issue.standard_clause}` : ''}</p>}
                           {issue.suggestion && <p className="mt-1"><span className="font-medium text-slate-600">建议：</span>{issue.suggestion}</p>}
                         </div>

@@ -1,7 +1,7 @@
-import { useRef, useEffect } from 'react'
+import { useRef, useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, Play, Loader2, FileText, XCircle } from 'lucide-react'
+import { ArrowLeft, Play, Loader2, FileText, XCircle, ChevronDown, ChevronRight } from 'lucide-react'
 import { toast } from 'sonner'
 import { auditDocApi, auditTaskApi } from '../api/endpoints'
 import { Card, CardHeader, CardBody } from '../components/Card'
@@ -60,6 +60,14 @@ export function AuditDocDetail() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['audit-doc', id] }),
   })
 
+  // 文档结构（文档解析后才展示）
+  const [structureOpen, setStructureOpen] = useState(false)
+  const { data: structure } = useQuery({
+    queryKey: ['doc-structure', id],
+    queryFn: () => auditDocApi.getStructure(id!),
+    enabled: !!id && doc?.status !== 'uploaded',
+  })
+
   const runTask = useMutation({
     mutationFn: (taskId: string) => auditTaskApi.run(taskId, true),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['audit-tasks', id] }),
@@ -102,6 +110,48 @@ export function AuditDocDetail() {
           )}
         </CardBody>
       </Card>
+
+      {/* 文档结构 */}
+      {structure && structure.chapters.length > 0 && (
+        <Card>
+          <CardHeader
+            title={`文档结构（${structure.total_clauses} 条款）`}
+            action={
+              <button className="btn-ghost btn-sm" onClick={() => setStructureOpen(o => !o)}>
+                {structureOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+                {structureOpen ? '收起' : '展开'}
+              </button>
+            }
+          />
+          {structureOpen && (
+            <CardBody className="p-0">
+              <div className="max-h-80 overflow-y-auto">
+                {structure.chapters.map((ch, i) => (
+                  <div key={i} className="px-5 py-3 border-b border-slate-50 last:border-0">
+                    <div className="flex items-center gap-2">
+                      {ch.number && <span className="text-xs font-mono text-blue-600">{ch.number}</span>}
+                      <span className="text-sm font-medium text-slate-800">{ch.title}</span>
+                      {ch.clauses.length > 0 && (
+                        <span className="text-xs text-slate-400">{ch.clauses.length} 条款</span>
+                      )}
+                    </div>
+                    {ch.clauses.length > 0 && (
+                      <div className="mt-1.5 ml-4 space-y-1">
+                        {ch.clauses.map((c, j) => (
+                          <div key={j} className="text-xs text-slate-500 flex gap-1.5">
+                            <span className="font-mono text-slate-400 shrink-0">{c.number}</span>
+                            <span className="truncate">{c.text}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </CardBody>
+          )}
+        </Card>
+      )}
 
       <Card>
         <CardHeader title="审核任务" />

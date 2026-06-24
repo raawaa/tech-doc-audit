@@ -35,6 +35,24 @@ export interface AuditDocument {
   has_index: boolean
 }
 
+export interface DocumentClause {
+  number: string
+  text: string
+}
+
+export interface DocumentChapter {
+  number?: string
+  title: string
+  clauses: DocumentClause[]
+}
+
+export interface DocumentStructure {
+  doc_id: string
+  title: string | null
+  chapters: DocumentChapter[]
+  total_clauses: number
+}
+
 // ── 审核任务 ──
 export interface AuditTask {
   id: string
@@ -51,13 +69,15 @@ export interface AuditTask {
 
 export interface AuditIssue {
   id: number
-  type: 'compliance' | 'completeness' | 'consistency'
+  type: 'compliance' | 'completeness' | 'consistency' | 'insufficient_evidence' | 'out_of_scope'
   clause_number?: string
   description: string
   severity: 'high' | 'medium' | 'low'
   standard_name?: string
   standard_clause?: string
   suggestion?: string
+  cited_excerpt?: string
+  document_position?: string
 }
 
 export interface AuditResult {
