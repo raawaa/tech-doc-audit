@@ -76,14 +76,8 @@ export function AuditDashboard() {
     onSuccess: async (task) => {
       setShowAuditModal(false)
       setSelectedKBs([])
-      toast.success('审核任务已创建，正在后台处理')
-      try {
-        await auditTaskApi.run(task.id, true)
-      } catch (e) {
-        toast.error('启动审核失败：' + (e as Error).message)
-        return
-      }
-      // 自动跳转到详情页，让用户能看到实时进度
+      toast.success('审核任务已创建')
+      // 跳转到详情页，SSE 会接管启动审核并流式推送进度
       navigate(`/audit/${task.document_id}`)
       qc.invalidateQueries({ queryKey: ['audit-docs'] })
       qc.invalidateQueries({ queryKey: ['audit-tasks'] })
