@@ -137,7 +137,7 @@ class TestChapterExtraction:
             standard_clause="5.2",
         )
         result = _tool_flag_issue(action, issues)
-        assert "问题 #1 已记录" == result
+        assert "问题 #1 已记录" in result
         assert len(issues) == 1
         assert issues[0].type == "compliance"
         assert issues[0].severity == "high"

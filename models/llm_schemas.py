@@ -73,55 +73,122 @@ class AgentAction(BaseModel):
     """
 
     thought: str = Field(
-        description="推理过程：当前在审哪个章节、看到了什么、为什么做这个操作",
+        description=(
+            "推理过程：当前在审文档的哪个章节、发现了什么技术要点、"
+            "为什么选择此操作（而非其他操作）"
+        ),
     )
     action: AuditActionType = Field(
-        description="要执行的操作",
+        description=(
+            "要执行的操作。选择规则："
+            "read_chapter=需要阅读文档更多章节内容时；"
+            "search_kb=搜索概念性/描述性要求时（如质保期、验收标准），语义匹配，能匹配同义词；"
+            "search_kb_text=搜索精确术语/编号/参数时（如GB/T 12345、IP65），文本匹配，速度更快；"
+            "flag_issue=已找到标准依据且确认文档存在问题后记录；"
+            "finish=审核完成，所有问题已记录"
+        ),
     )
 
     # — read_chapter 参数 —
     chapter_index: Optional[int] = Field(
-        default=None, description="read_chapter: 章节序号（从 1 开始）",
+        default=None,
+        description=(
+            "read_chapter: 章节序号，从1开始，对应文档结构中各章节的编号。"
+            "示例：读第3章时传3"
+        ),
     )
 
-    # — search_kb 参数 —
+    # — search_kb / search_kb_text 共用参数 —
     search_query: Optional[str] = Field(
-        default=None, description="search_kb: 搜索关键词",
+        default=None,
+        description=(
+            "search_kb 或 search_kb_text: 搜索关键词，从文档当前章节中提取技术术语。"
+            "示例：'质保期'、'验收标准'、'GB/T 12345'。"
+            "不要输入完整句子，用2-5个词的关键词短语。"
+        ),
     )
     search_top_k: Optional[int] = Field(
-        default=5, description="search_kb: 返回条数",
+        default=5,
+        description=(
+            "search_kb: 返回结果条数，默认5。"
+            "若前次搜索结果相关度过低（<0.3），可增至8-10以扩大搜索范围。"
+        ),
     )
 
     # — flag_issue 参数 —
     issue_type: Optional[IssueType] = Field(
-        default=None, description="flag_issue: 问题类型",
+        default=None,
+        description=(
+            "flag_issue: 问题类型。"
+            "compliance=违反标准规定（如数值不达标、方法错误）；"
+            "completeness=缺少标准要求的必要内容（如缺失质保期条款）；"
+            "consistency=文档内部数据矛盾或与标准条文不一致；"
+            "insufficient_evidence=证据不足以确定判断"
+        ),
     )
     issue_severity: Optional[Severity] = Field(
-        default=None, description="flag_issue: 严重程度",
+        default=None,
+        description=(
+            "flag_issue: 严重程度。"
+            "high=可能导致项目失败或重大法律风险；"
+            "medium=影响质量或增加成本风险；"
+            "low=格式或表述瑕疵，不影响实质合规"
+        ),
     )
     issue_description: Optional[str] = Field(
-        default=None, description="flag_issue: 问题描述",
+        default=None,
+        description=(
+            "flag_issue: 问题描述，清晰说明文档何处存在何问题，违反哪条标准哪项要求。"
+            "示例：'第三章技术规格中IP防护等级仅标注IP54，"
+            "而GB 4208-2008第5.1条要求室外设备不低于IP65。'"
+        ),
     )
     standard_name: Optional[str] = Field(
-        default=None, description="flag_issue: 标准名称（来自 search_kb 结果）",
+        default=None,
+        description=(
+            "flag_issue: 标准文档名称，必须来自 search_kb 或 search_kb_text 返回结果。"
+            "示例：'CJJ101-2016'、'GB/T 31462-2015'。不可自行编造标准编号。"
+        ),
     )
     standard_clause: Optional[str] = Field(
-        default=None, description="flag_issue: 标准条款编号",
+        default=None,
+        description=(
+            "flag_issue: 标准条款编号，必须来自搜索结果中的'第X条'字段。"
+            "示例：'3.2.1'、'5.4.2'。"
+        ),
     )
     standard_requirement: Optional[str] = Field(
-        default=None, description="flag_issue: 标准原文要求",
+        default=None,
+        description="flag_issue: 标准条款的原文要求（从搜索结果中摘录）",
     )
     cited_excerpt: Optional[str] = Field(
-        default=None, description="flag_issue: 从文档原文引用的证据",
+        default=None,
+        description=(
+            "flag_issue: 从待审核文档原文逐字引用的证据（必须原样复制，不可概括或改写）。"
+            "示例：'设备防护等级不低于IP54'。"
+            "这是证明问题存在的核心证据，请务必提供。"
+        ),
     )
     document_position: Optional[str] = Field(
-        default=None, description="flag_issue: 引用在文档中的位置",
+        default=None,
+        description=(
+            "flag_issue: 引用原文在文档中的章节位置。使用文档实际的章节标题，不要用编号代替。"
+            "示例：'第三章 技术规格与参数要求'。"
+        ),
     )
     issue_suggestion: Optional[str] = Field(
-        default=None, description="flag_issue: 修改建议",
+        default=None,
+        description=(
+            "flag_issue: 具体的修改建议。"
+            "示例：'将防护等级从IP54修改为不低于IP65，以满足GB 4208-2008室外设备要求。'"
+        ),
     )
 
     # — finish 参数 —
     final_summary: Optional[str] = Field(
-        default=None, description="finish: 审核总结",
+        default=None,
+        description=(
+            "finish: 审核总结。应包含：发现的问题总数、各类型问题数量、"
+            "各严重程度分布、关键发现概述"
+        ),
     )

@@ -65,7 +65,7 @@ def list_tasks(document_id: Optional[str] = None) -> list[AuditTask]:
         tasks_dir = _task_dir(document_id)
         if tasks_dir.exists():
             for f in tasks_dir.iterdir():
-                if f.suffix == ".json":
+                if f.suffix == ".json" and "_trace" not in f.name:
                     with open(f, "r", encoding="utf-8") as fh:
                         data = json.load(fh)
                     results.append(AuditTask.from_dict(data))
@@ -74,7 +74,7 @@ def list_tasks(document_id: Optional[str] = None) -> list[AuditTask]:
             tasks_dir = d / "tasks"
             if tasks_dir.exists():
                 for f in tasks_dir.iterdir():
-                    if f.suffix == ".json":
+                    if f.suffix == ".json" and "_trace" not in f.name:
                         with open(f, "r", encoding="utf-8") as fh:
                             data = json.load(fh)
                         results.append(AuditTask.from_dict(data))
