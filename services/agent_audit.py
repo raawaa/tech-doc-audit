@@ -76,10 +76,15 @@ def determine_audit_topics(
         result: AuditTopicList = response.raw
     except Exception:
         # as_structured_llm 降级：手调 .chat() + 手动解析
+        from core.degradation import record as _deg_record
+        _deg_record("agent_audit", "structured_llm_failed",
+                     "as_structured_llm failed, falling back to chat+JSON parse")
         try:
             response = get_llm().chat(messages)
             result = _parse_json_fallback(response.message.content or "", AuditTopicList)
         except Exception:
+            _deg_record("agent_audit", "chat_fallback_failed",
+                         "Both structured_llm and chat fallback failed, returning empty")
             return []
 
     if not result or not result.topics:
@@ -98,13 +103,110 @@ def determine_audit_topics(
 
 
 def _parse_json_fallback(content: str, model_cls: type) -> Optional[AuditTopicList]:
-    """当 structured_llm 不可用时的降级解析。"""
+    """当 structured_llm 不可用时的降级解析。
+
+    支持两种 LLM 输出格式：
+    1. JSON: {"topics": [{"id": "...", "name": "...", ...}]}
+    2. Markdown: ### 主题N：名称\n\n* **Keywords**: ...\n* **Prompt**: ...
+    """
     import json, re
+
+    # 策略 1：尝试 JSON 解析
     match = re.search(r"\{.*\}", content, re.DOTALL)
-    if not match:
-        return None
-    try:
-        data = json.loads(match.group(0))
-        return model_cls.model_validate(data)
-    except Exception:
-        return None
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            return model_cls.model_validate(data)
+        except Exception:
+            pass
+
+    # 策略 2：从 Markdown 中提取审核主题
+    # 匹配多种标题格式：
+    #   "### 1. 费用与支付条款"
+    #   "### 主题一：品牌限制与公平竞争"
+    #   "### 主题1: 品牌限制"
+    #   "### 费用与支付条款"（无编号）
+    topic_headers = re.findall(r'###\s+(.*?)(?=\n)', content)
+    # 反向从 content 中按 ### 分割
+    parts = re.split(r'\n(?=###\s+)', content)
+
+    # 关键词模式（兼容：keywords / 关键词 / Keywords）
+    kw_pattern = re.compile(r'\*{0,2}(?:keywords?|关键词)\*{0,2}\s*[：:]\s*(.+)', re.IGNORECASE)
+    # prompt 模式（兼容：prompt / 审核提示 / 审核指令）
+    prompt_pattern = re.compile(r'\*{0,2}(?:prompt|审核提示|审核指令)\*{0,2}\s*[：:]\s*(.+)', re.IGNORECASE)
+    reason_pattern = re.compile(r'\*{0,2}(?:理由|reason)\*{0,2}\s*[：:]\s*(.+)', re.IGNORECASE)
+
+    topics = []
+    for part in parts:
+        # 提取标题（从 ### 行中提取名称，去掉编号）
+        header_match = re.match(r'###\s+(.+)', part)
+        if not header_match:
+            continue
+        header = header_match.group(1).strip()
+        # 去掉编号前缀：
+        # "1. 费用与支付条款" → "费用与支付条款"
+        # "主题1：品牌限制" → "品牌限制"
+        # "一、品牌限制" → "品牌限制"
+        name = re.sub(
+            r'^(?:主题)?[一二三四五六七八九十\d]+[\.、：:\s]+',
+            '', header,
+        ).strip()
+        if not name or len(name) < 2:
+            continue
+        # 跳过非主题的标题行（如"审核主题清单"、"详细审核指令"等元信息）
+        skip_headers = {"审核主题清单", "详细审核指令", "审核步骤", "注意事项", "重要说明"}
+        if name in skip_headers:
+            continue
+
+        # 提取 keywords
+        kw_match = kw_pattern.search(part)
+        if kw_match:
+            keywords = [k.strip() for k in re.split(r'[,，、]', kw_match.group(1)) if k.strip()]
+        else:
+            keywords = [name]
+
+        # 提取 prompt（含多行直到下一个 ** 标记）
+        prompt_text = f"审核{name}相关内容"
+        prompt_match = prompt_pattern.search(part)
+        if prompt_match:
+            p_start = prompt_match.start(1)  # prompt 内容起始位置
+            remaining = part[p_start:]
+            # 取到下一个 ** 或 ### 或 - ** 标记
+            next_meta = re.search(r'\n\s*[-*]+\s*\*{1,2}|\n###', remaining)
+            if next_meta:
+                prompt_text = remaining[:next_meta.start()].strip()
+            else:
+                prompt_text = remaining.strip()[:500]
+
+        # 提取理由
+        reason_text = ""
+        reason_match = reason_pattern.search(part)
+        if reason_match:
+            reason_text = reason_match.group(1).strip()[:200]
+
+        # 生成英文 id
+        import hashlib
+        topic_id = hashlib.md5(name.encode()).hexdigest()[:16]
+
+        topics.append({
+            "id": topic_id,
+            "name": name,
+            "prompt": prompt_text,
+            "keywords": keywords[:6],
+        })
+
+    if topics:
+        # 包装为 AuditTopicList
+        from models.llm_schemas import AuditTopicItem
+        items = []
+        for t in topics:
+            items.append(AuditTopicItem(
+                id=t["id"],
+                name=t["name"],
+                prompt=t["prompt"],
+                keywords=t["keywords"],
+                reason="从 Markdown 文本中提取",
+            ))
+        return AuditTopicList(topics=items)
+
+    return None

@@ -160,6 +160,7 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = ""):
         )
 
         nodes = _split_document(doc)
+        _enrich_chunk_metadata(nodes, doc_id, source_name or doc_id)
         index.insert_nodes(nodes)
 
         # 释放临时对象并回收内存
@@ -167,6 +168,40 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = ""):
         gc.collect()
 
         _persist(kb_id, index)
+
+
+def _enrich_chunk_metadata(
+    nodes: list,
+    doc_id: str,
+    source_name: str,
+):
+    """从文档分块文本中检测条款编号和章节标题，注入 node.metadata。
+
+    使 FAISS 搜索结果能追溯到标准的某个具体条款（如 "CJJ101-2016 第 3.2.1 条"）。
+    不在 text 中注入元数据，避免稀释 embedding 语义信号。
+    """
+    import re
+    clause_re = re.compile(r"(\d+(?:\.\d+)*)")
+
+    for node in nodes:
+        text = node.text or ""
+        if not text:
+            continue
+
+        # 检测条款编号（取最长的数字段，如 3.2.1 而非 3）
+        nums = clause_re.findall(text)
+        if nums:
+            clause = max(nums, key=lambda n: n.count("."))
+            node.metadata["clause_number"] = clause
+
+        # 检测章节标题
+        sec_match = re.search(r"^(#{1,6})\s+(.+)", text, re.MULTILINE)
+        if sec_match:
+            node.metadata["section_path"] = sec_match.group(2).strip()
+
+        # 保证 doc_id / source 完整
+        node.metadata.setdefault("doc_id", doc_id)
+        node.metadata.setdefault("source", source_name)
 
 
 def index_documents_batch(
@@ -201,6 +236,7 @@ def index_documents_batch(
                 metadata={"doc_id": doc_id, "source": source_name or doc_id},
             )
             nodes = _split_document(doc)
+            _enrich_chunk_metadata(nodes, doc_id, source_name or doc_id)
             index.insert_nodes(nodes)
 
             # 主动释放大对象，防止批量索引时内存堆积
@@ -224,7 +260,7 @@ def _has_markdown_headings(text: str) -> bool:
     """快速检测文本是否包含 Markdown 标题层级。"""
     import re
     # 检查是否包含至少 2 个带层级的 Markdown 标题（# 或 ## 或 ###）
-    return bool(re.search(r"^#{2,6}\s+\S", text, re.MULTILINE))
+    return bool(re.search(r"^#{1,6}\s+\S", text, re.MULTILINE))
 
 
 def remove_document(kb_id: str, doc_id: str):
@@ -376,15 +412,13 @@ def search(kb_ids: list[str], query: str, top_k: int = 5, use_reranker: bool = T
         all_nodes.sort(key=lambda n: n.score or 0, reverse=True)
         all_nodes = all_nodes[: top_k * 2]  # 多留候选给 reranker
 
-        # ── Reranker 重排序 ────────────────────────────────────────────────
+        # ── Reranker 重排序（按需加载→推理→卸载）────────────────────────
         if use_reranker:
             try:
-                from core.settings import get_reranker
-                reranker = get_reranker()
-                if reranker is not None:
-                    reranked = reranker.postprocess_nodes(all_nodes, query_str=query)
-                    if reranked:
-                        all_nodes = reranked
+                from core.settings import run_reranker
+                reranked = run_reranker(all_nodes, query)
+                if reranked:
+                    all_nodes = reranked
             except Exception as e:
                 _logger.warning("reranker failed in search, using raw ranking: %s", e)
 
@@ -398,6 +432,8 @@ def search(kb_ids: list[str], query: str, top_k: int = 5, use_reranker: bool = T
             "doc_id": meta.get("doc_id", ""),
             "content": node.text,
             "doc_source": meta.get("source", ""),
+            "section_path": meta.get("section_path", ""),
+            "clause_number": meta.get("clause_number", ""),
             "relevance": round(node.get_score() or 0, 4),
         })
 

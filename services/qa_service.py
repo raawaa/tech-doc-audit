@@ -140,13 +140,8 @@ def _build_chat_engine(kb_ids: list[str], top_k: int) -> ContextChatEngine:
     retriever = CrossKBRetriever(kb_ids=kb_ids, top_k=top_k)
     memory = ChatMemoryBuffer.from_defaults(token_limit=4000)
     node_postprocessors = []
-    try:
-        from core.settings import get_reranker
-        reranker = get_reranker()
-        if reranker:
-            node_postprocessors.append(reranker)
-    except Exception:
-        pass
+    # QA 场景不使用 reranker（按需加载延迟较高，QA 需要快速响应）
+    # 向量搜索结果已足够用于问答
     return ContextChatEngine.from_defaults(
         retriever=retriever,
         memory=memory,

@@ -60,16 +60,14 @@ class CrossKBRetriever(BaseRetriever):
 
         results = sorted(all_nodes.values(), key=lambda n: n.score or 0, reverse=True)
 
-        # ── Reranker 重排序 ────────────────────────────────────────────────
+        # ── Reranker 重排序（按需加载→推理→卸载）────────────────────────
         # 用 cross-encoder 对候选结果精确打分，弥补 bi-encoder ANN 精度损失
         if self.use_reranker and results:
             try:
-                from core.settings import get_reranker
-                reranker = get_reranker()
-                if reranker is not None:
-                    reranked = reranker.postprocess_nodes(results, query_str=query)
-                    if reranked:
-                        results = reranked
+                from core.settings import run_reranker
+                reranked = run_reranker(results, query)
+                if reranked:
+                    results = reranked
             except Exception as e:
                 _logger.warning("reranker postprocess failed, using raw ranking: %s", e)
 

@@ -1,4 +1,5 @@
 import concurrent.futures
+import os
 import threading
 from datetime import datetime
 from typing import Optional
@@ -13,6 +14,9 @@ import services.audit_doc_service as audit_doc_svc
 import services.structure_service as structure_svc
 
 _logger = get_logger(__name__)
+
+# 限制并发 LLM 调用数，防止压垮本地 Ollama 或触发 API 限流
+_LLM_SEMAPHORE = threading.Semaphore(4)
 
 
 def create_task(
@@ -79,27 +83,85 @@ def _audit_single_topic(
     topic_index: int,
 ) -> dict:
     """审核单个主题（供并行执行使用，异常不会透出）。"""
+    from core.degradation import drain as _deg_drain
+    acquired = _LLM_SEMAPHORE.acquire(timeout=300)
     try:
-        issues = topic_audit.audit_topic(
-            topic=topic,
-            doc_nav=None,
-            kb_ids=kb_ids,
-            topic_index=topic_index,
-            parsed_content=parsed_content,
-        )
-        return {
-            "name": topic.get("name", f"主题{topic_index}"),
-            "issues": issues,
-            "success": True,
-        }
-    except Exception as e:
-        _logger.warning("topic audit failed (%s): %s", topic.get("id", topic_index), e)
-        return {
-            "name": topic.get("name", f"主题{topic_index}"),
-            "issues": [],
-            "success": False,
-            "error": str(e),
-        }
+        if not acquired:
+            return {
+                "name": topic.get("name", f"主题{topic_index}"),
+                "issues": [],
+                "success": False,
+                "error": "LLM semaphore timeout",
+                "degradation_events": _deg_drain(),
+            }
+        try:
+            issues = topic_audit.audit_topic(
+                topic=topic,
+                doc_nav=None,
+                kb_ids=kb_ids,
+                topic_index=topic_index,
+                parsed_content=parsed_content,
+            )
+            return {
+                "name": topic.get("name", f"主题{topic_index}"),
+                "issues": issues,
+                "success": True,
+                "degradation_events": _deg_drain(),
+            }
+        except Exception as e:
+            _logger.warning("topic audit failed (%s): %s", topic.get("id", topic_index), e)
+            return {
+                "name": topic.get("name", f"主题{topic_index}"),
+                "issues": [],
+                "success": False,
+                "error": str(e),
+                "degradation_events": _deg_drain(),
+            }
+    finally:
+        if acquired:
+            _LLM_SEMAPHORE.release()
+
+
+def _deduplicate_issues(issues: list) -> list:
+    """合并描述同一根因的重复问题。
+
+    不同审核主题可能对同一段文档报出相同问题。
+    按 cited_excerpt 相似度分组，每组保留 severity 最高的问题。
+    """
+    if len(issues) <= 1:
+        return issues
+
+    # 按 cited_excerpt 前 80 字符分组
+    groups: dict[str, list] = {}
+    for issue in issues:
+        excerpt = (issue.cited_excerpt or issue.description or "")[:80]
+        if excerpt not in groups:
+            groups[excerpt] = []
+        groups[excerpt].append(issue)
+
+    # 语义去重：不同但相似的 excerpt 可能描述同一问题
+    # 策略：如果两个 issue 的 document_position 和 clause_number 相同
+    # 且 description 文本相似度 > 60%，视为重复
+    merged = list(groups.values())
+    deduped: list = []
+    seen_keys = set()
+
+    severity_rank = {"high": 3, "medium": 2, "low": 1}
+
+    for group in merged:
+        if len(group) == 1:
+            deduped.append(group[0])
+            continue
+
+        # 取 severity 最高的
+        best = max(group, key=lambda i: severity_rank.get(i.severity, 0))
+        # 合并 suggestion
+        suggestions = [i.suggestion for i in group if i.suggestion]
+        if len(suggestions) > 1 and best.suggestion:
+            best.suggestion = "；".join(suggestions)
+        deduped.append(best)
+
+    return deduped
 
 
 def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
@@ -117,6 +179,10 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
     task.progress = 0.0
     repo.save_task(task)
 
+    # 初始化降级日志收集
+    from core.degradation import record as _deg_record, drain as _deg_drain
+    degradation_log: list[dict] = []
+
     try:
         # 获取文档
         doc = doc_repo.get_doc(task.document_id)
@@ -126,12 +192,15 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
         # 确保文档已处理
         if not doc.parsed_content:
             doc = audit_doc_svc.parse_document(doc.id)
+        degradation_log.extend(_deg_drain())
 
         if not doc.structure:
             try:
                 doc = structure_svc.analyze_document_structure(doc.id)
             except Exception:
-                pass
+                _deg_record("structure_analysis", "structure_analysis_failed",
+                             "Document structure analysis failed, continuing without structure")
+                degradation_log.extend(_deg_drain())
 
         task.progress = 0.1
         repo.save_task(task)
@@ -143,7 +212,11 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
             topics = task.audit_topics
         else:
             topics = agent_audit.determine_audit_topics(parsed_content, task.kb_ids)
+            degradation_log.extend(_deg_drain())
             if not topics:
+                _deg_record("agent_audit", "agent_topics_empty",
+                             "LLM agent returned no topics, falling back to 8 fixed topics")
+                degradation_log.extend(_deg_drain())
                 topics = topic_audit.AUDIT_TOPICS
 
         task.progress = 0.15
@@ -168,6 +241,12 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
             }
             total = len(future_map)
             for future in concurrent.futures.as_completed(future_map):
+                # 检查任务是否被取消
+                task = repo.get_task(task_id)
+                if task and task.status == "cancelled":
+                    for f in future_map:
+                        f.cancel()
+                    break
                 topic = future_map[future]
                 result = future.result()
                 if result["success"]:
@@ -175,6 +254,7 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
                 else:
                     fail_count += 1
                 all_issues.extend(result["issues"])
+                degradation_log.extend(result.get("degradation_events", []))
                 raw_parts.append(
                     f"{result['name']}: 发现 {len(result['issues'])} 个问题"
                     if result["issues"]
@@ -191,8 +271,36 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
         task.progress = 0.9
         repo.save_task(task)
 
+        # 3a. 可选：需求锚定审核（与主题审核互补，不替代）
+        if os.environ.get("USE_REQUIREMENT_AUDIT", "").lower() in ("true", "1", "yes"):
+            try:
+                _logger.info("Running requirement-anchored audit for task %s", task_id)
+                from services.requirement_audit import run_requirement_audit
+
+                req_result = run_requirement_audit(
+                    task_id=task.id,
+                    doc_id=doc.id,
+                    document_name=doc.name,
+                    parsed_content=parsed_content,
+                    structure=doc.structure,
+                    kb_ids=task.kb_ids,
+                )
+                if req_result.issues:
+                    _logger.info(
+                        "Requirement audit found %d additional issues",
+                        len(req_result.issues),
+                    )
+                    # 合并需求审核的问题到现有结果
+                    all_issues.extend(req_result.issues)
+                    raw_parts.append(
+                        f"需求锚定审核: 发现 {len(req_result.issues)} 个问题"
+                    )
+            except Exception as e:
+                _logger.warning("Requirement audit failed: %s", e)
+                raw_parts.append(f"需求锚定审核: 失败（{e}）")
+
         # 3. 生成结果（即使部分 topic 失败，已完成的结果也不丢失）
-        issues = all_issues
+        issues = _deduplicate_issues(all_issues)
         raw_analysis = "\n".join(raw_parts)
         if fail_count > 0:
             raw_analysis += f"\n\n⚠️ {fail_count}/{len(topics)} 个主题审核失败"
@@ -227,6 +335,7 @@ def run_audit(task_id: str, use_quick_mode: bool = True) -> AuditTask:
         task.completed_at = datetime.utcnow()
         _logger.error("audit task %s failed: %s", task_id, e)
 
+    task.degradation_log = degradation_log
     repo.save_task(task)
     return task
 

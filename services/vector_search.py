@@ -9,6 +9,7 @@
 """
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -47,21 +48,41 @@ def _get_kb_search_paths(kb_ids: list[str]) -> list[str]:
 
 
 def _run_rga(keyword: str, paths: list[str]) -> str:
-    """单个关键词的 ripgrep-all 搜索。"""
+    """单个关键词的文本搜索。优先 rga（支持 PDF/DOCX），降级到 rg（纯文本）。"""
     if not keyword or not paths:
         return ""
-    try:
-        result = subprocess.run(
-            ["rga", "-i", "--no-ignore", "--hidden", "-m", "15", "-C", "2", keyword, *paths],
-            capture_output=True, text=True, timeout=30,
-        )
-        return result.stdout.strip()
-    except FileNotFoundError:
-        # rga not installed — expected in minimal deployments
-        return ""
-    except Exception as e:
-        _logger.warning("rga search failed for keyword %s: %s", keyword, e)
-        return ""
+    # 优先 rga（ripgrep-all，支持二进制文件格式）
+    rga_bin = shutil.which("rga")
+    if rga_bin:
+        try:
+            result = subprocess.run(
+                [rga_bin, "-i", "--no-ignore", "--hidden", "-m", "15", "-C", "2", keyword, *paths],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.stdout.strip():
+                return result.stdout.strip()
+        except Exception as e:
+            _logger.warning("rga search failed for keyword %s: %s", keyword, e)
+
+    # 降级到 rg（ripgrep，搜索纯文本文件如 .md / .txt）
+    rg_bin = shutil.which("rg")
+    if rg_bin:
+        try:
+            result = subprocess.run(
+                [rg_bin, "-i", "--no-ignore", "-m", "10", "-C", "3",
+                 "-g", "*.md", "-g", "*.txt", "-g", "*.markdown",
+                 keyword, *paths],
+                capture_output=True, text=True, timeout=15,
+            )
+            return result.stdout.strip()
+        except Exception as e:
+            _logger.warning("rg search failed for keyword %s: %s", keyword, e)
+
+    from core.degradation import record as _deg_record
+    _deg_record("vector_search", "text_search_unavailable",
+                 f"No text search tool (rga/rg) available for keyword: {keyword}")
+    _logger.warning("no text search tool available for keyword: %s", keyword)
+    return ""
 
 
 def _text_search_fallback(kb_ids: list[str], keywords: list[str]) -> str:
@@ -81,10 +102,19 @@ def _text_search_fallback(kb_ids: list[str], keywords: list[str]) -> str:
             break
 
     if not hits:
-        # 列出文件作为最后退路
+        # 最终退路：直接从 KB 文档中读取前几个文件的内容片段
+        from core.degradation import record as _deg_record
+        _deg_record("vector_search", "text_search_empty",
+                     "No text search hits, reading raw file snippets as last resort")
         for root, _, files in os.walk(paths[0]):
-            for f in files:
-                hits.append(f"文件: {f}")
+            for f in files[:5]:
+                fpath = os.path.join(root, f)
+                try:
+                    snippet = Path(fpath).read_text(encoding="utf-8", errors="ignore")[:500]
+                    if snippet.strip():
+                        hits.append(f"文件: {f}\n{snippet}")
+                except Exception:
+                    pass
             break
 
     content = "\n\n---\n\n".join(hits[:5])
@@ -170,12 +200,31 @@ def search(kb_ids: list[str], query: str, max_results: int = 5, rebuild_if_missi
 
 
 def _format_kb_results(results: list[dict], prefix: str = "知识库参考依据（向量检索）") -> str:
-    """统一格式化 KB 向量搜索结果（用于注入 LLM prompt）。"""
+    """统一格式化 KB 向量搜索结果（用于注入 LLM prompt）。
+
+    格式示例：
+    【知识库参考依据】
+    1. 【CJJ101-2016】第 3.2.1 条
+       原文内容...
+
+    2. 【GB/T XXXX】第 5.2 条
+       原文内容...
+    """
     if not results:
         return ""
     parts = [f"【{prefix}】"]
     for i, r in enumerate(results, 1):
-        label = f"【{r.get('doc_source', '')}】" if r.get("doc_source") else ""
+        doc_label = r.get("doc_source", "")
+        clause = r.get("clause_number", "")
+        section = r.get("section_path", "")
+        label_parts = []
+        if doc_label:
+            label_parts.append(f"【{doc_label}】")
+        if clause:
+            label_parts.append(f"第{clause}条")
+        if section and not clause:
+            label_parts.append(section)
+        label = " ".join(label_parts) if label_parts else ""
         parts.append(f"\n{i}. {label}\n{r.get('content', '')[:1000]}")
     return "\n".join(parts)
 
@@ -183,7 +232,7 @@ def _format_kb_results(results: list[dict], prefix: str = "知识库参考依据
 def search_by_keywords(kb_ids: list[str], keywords: list[str], topic_name: str = "") -> str:
     """向量搜索 → 低分降级到纯文本。"""
     query = topic_name or " ".join(k for k in keywords if k)[:200]
-    results = vec_search(kb_ids, query, top_k=3)
+    results = vec_search(kb_ids, query, top_k=6)
     if results and any(r.get("relevance", 0) > 0.35 for r in results):
         return _format_kb_results(results)
     return _text_search_fallback(kb_ids, keywords or [topic_name])

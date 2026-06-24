@@ -204,15 +204,20 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
         if not kb:
             return
 
-        # 收集需要索引的文档
+        # 收集需要索引的文档（使用 _extract_text 提取纯文本，支持 PDF/DOCX 等二进制格式）
+        from core.text_extraction import extract_text as _extract_text
         texts = []
         doc_map = {doc.id: doc for doc in docs}
         for doc in docs:
             if doc.file_path and os.path.exists(doc.file_path):
                 try:
-                    with open(doc.file_path, "r", encoding="utf-8") as f:
-                        text = f.read()
-                    texts.append((doc.id, text, doc.original_name))
+                    text = _extract_text(doc.file_path)
+                    if text and len(text) >= 20:
+                        texts.append((doc.id, text, doc.original_name))
+                    else:
+                        _logger.warning("文档 %s 文本提取为空，跳过索引", doc.id)
+                        doc_map[doc.id].index_status = "failed"
+                        doc_repo._save_doc_meta(doc_map[doc.id])
                 except Exception as e:
                     _logger.warning("读取文档 %s 失败: %s", doc.id, e)
                     doc_map[doc.id].index_status = "failed"

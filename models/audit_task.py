@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 from ulid import ULID
 
 
-AuditType = Literal["compliance", "completeness", "consistency"]
+AuditType = Literal["compliance", "completeness", "consistency", "insufficient_evidence", "out_of_scope"]
 
 
 class IssueLocation(BaseModel):
@@ -32,6 +32,8 @@ class AuditIssue(BaseModel):
     severity: Literal["high", "medium", "low"]
     standard_reference: Optional[StandardRef] = None
     suggestion: Optional[str] = None
+    cited_excerpt: str = ""
+    document_position: str = ""
 
 
 class ResultSummary(BaseModel):
@@ -75,6 +77,7 @@ class AuditTask(BaseModel):
     completed_at: Optional[datetime] = None
     result: Optional[AuditResult] = None
     error_message: Optional[str] = None
+    degradation_log: list[dict] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 

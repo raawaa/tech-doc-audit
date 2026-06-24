@@ -113,6 +113,9 @@ def parse_document(doc_id: str) -> AuditDocument:
             mineru_success = _parse_with_mineru(doc)
             if not mineru_success:
                 # MinerU 失败，降级
+                from core.degradation import record as _deg_record
+                _deg_record("text_extraction", "mineru_failed",
+                             f"MinerU parse failed for {doc.file_type}, falling back to pdfplumber/python-docx")
                 _parse_fallback(doc)
         else:
             _parse_fallback(doc)

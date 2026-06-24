@@ -131,16 +131,32 @@ def _parse_by_regex(content: str) -> Optional[DocumentStructure]:
     current_clause_text: list[str] = []
     chapter_start_line = 0  # 当前章节在 lines 中的起始行
 
+    # 扫描文档，判断最高标题级别
+    # 标准规范文件通常用 ##（H2）作为章节标题（如 "## 1 总则"），
+    # 而 MinerU 输出的文档用 #（H1）作为章节标题。
+    # 这里动态适应，确保两种格式都能正确识别章节边界。
     cleaned_lines = _flatten_html_tables(lines)
+    has_h1 = any(re.match(r'^#\s+\S', line) for line in cleaned_lines)
+    chapter_heading_level = 1 if has_h1 else 2
+    chapter_re = re.compile(r'^#{' + str(chapter_heading_level) + r'}\s+(.+)$')
+
+    # 中文文档标题模式（无 Markdown 标记时，常见于 DOCX 提取的纯文本）
+    # 章节级：第X部分 / 第X章 / 一、 / （一）
+    # 子标题级：1. 概述 / 1.1 项目概况
+    cn_part_re = re.compile(r'^第[一二三四五六七八九十百]+[部分章节编篇]\s*(.*)')
+    cn_num_re = re.compile(r'^[一二三四五六七八九十]+[、.．]\s*(.*)')
+    cn_paren_re = re.compile(r'^（[一二三四五六七八九十]+）\s*(.*)')
+    # 用于判断是否应该走中文标题路径（文档中是否有 Markdown 标题）
+    has_markdown_headings = has_h1 or any(re.match(r'^#{2,3}\s+\S', line) for line in cleaned_lines)
 
     for idx, line in enumerate(cleaned_lines):
         stripped = line.strip()
         if not stripped:
             continue
 
-        # H1 → 新章节
-        h1_match = re.match(r'^#\s+(.+)$', stripped)
-        if h1_match:
+        # 章节边界（H1 或 H2，取决于文档的标题层级）
+        chapter_match = chapter_re.match(stripped)
+        if chapter_match:
             _finalize_clause(current_chapter, current_clause_num, current_clause_text)
             # 填充上一章节的 text
             if current_chapter is not None:
@@ -150,8 +166,8 @@ def _parse_by_regex(content: str) -> Optional[DocumentStructure]:
             current_clause_text = []
             chapter_start_line = idx
 
-            chapter_title = _clean_heading(h1_match.group(1))
-            chapter_num = _extract_number(h1_match.group(1))
+            chapter_title = _clean_heading(chapter_match.group(1))
+            chapter_num = _extract_number(chapter_match.group(1))
             current_chapter = Chapter(number=chapter_num, title=chapter_title)
             chapters.append(current_chapter)
             continue
@@ -160,9 +176,62 @@ def _parse_by_regex(content: str) -> Optional[DocumentStructure]:
             current_chapter = Chapter(title="前言")
             chapters.append(current_chapter)
 
-        # H3 → 条款
+        # ── 中文标题识别（无 Markdown 标题的纯文本文档）──────────────────
+        if not has_markdown_headings:
+            # 章节级：第X部分 / 第X章 / 第X编
+            cn_part_match = cn_part_re.match(stripped)
+            if cn_part_match:
+                _finalize_clause(current_chapter, current_clause_num, current_clause_text)
+                if current_chapter is not None and chapters[-1] is current_chapter:
+                    current_chapter.text = "\n".join(lines[chapter_start_line:idx]).strip()
+                current_clause_num = None
+                current_clause_text = []
+                chapter_start_line = idx
+                full_title = stripped
+                current_chapter = Chapter(number=None, title=full_title)
+                chapters.append(current_chapter)
+                continue
+
+            # 章节级：一、 二、 三、
+            cn_num_match = cn_num_re.match(stripped)
+            if cn_num_match and len(stripped) < 100:
+                _finalize_clause(current_chapter, current_clause_num, current_clause_text)
+                if current_chapter is not None and chapters[-1] is current_chapter:
+                    current_chapter.text = "\n".join(lines[chapter_start_line:idx]).strip()
+                current_clause_num = None
+                current_clause_text = []
+                chapter_start_line = idx
+                current_chapter = Chapter(number=None, title=stripped)
+                chapters.append(current_chapter)
+                continue
+
+            # 子标题级：（一） （二）
+            cn_paren_match = cn_paren_re.match(stripped)
+            if cn_paren_match and len(stripped) < 100:
+                _finalize_clause(current_chapter, current_clause_num, current_clause_text)
+                clause_counter = len(current_chapter.clauses) + 1
+                current_chapter.clauses.append(Clause(
+                    number=str(clause_counter),
+                    text=cn_paren_match.group(1)[:200],
+                ))
+                continue
+
+            # 子标题级：短行且非正文 → 当作子标题（中文文档中单独成行的短语通常是标题）
+            if len(stripped) <= 30 and not stripped.endswith(('。', '；', '：', '.', '!', '?')) \
+               and not _clause_match_possible(stripped) and not re.search(r'[，,]', stripped):
+                # 启发式：短行 + 不含逗号/句号 → 很可能是子标题，作为 clause 记录
+                if current_chapter:
+                    _finalize_clause(current_chapter, current_clause_num, current_clause_text)
+                    clause_counter = len(current_chapter.clauses) + 1
+                    current_chapter.clauses.append(Clause(
+                        number=str(clause_counter),
+                        text=stripped[:200],
+                    ))
+                    continue
         h3_match = re.match(r'^###\s+(.+)$', stripped)
-        h2_match = re.match(r'^##\s+(.+)$', stripped) if not h3_match else None
+        # H2 → 只有当 H2 不是章节级别时才是子标题
+        h2_is_sub = chapter_heading_level != 2
+        h2_match = re.match(r'^##\s+(.+)$', stripped) if not h3_match and h2_is_sub else None
 
         if h3_match:
             _finalize_clause(current_chapter, current_clause_num, current_clause_text)
@@ -250,6 +319,11 @@ def _flatten_html_tables(lines: list[str]) -> list[str]:
         if not in_table:
             result.append(line)
     return result
+
+
+def _clause_match_possible(stripped: str) -> bool:
+    """快速判断一行是否可能是编号条款（避免被子标题启发式误吞）。"""
+    return bool(re.match(r'^\d+(?:\.\d+)*[）\)\.、\s]', stripped))
 
 
 def _clean_heading(raw: str) -> str:

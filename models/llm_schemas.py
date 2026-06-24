@@ -35,12 +35,14 @@ class StandardRef(BaseModel):
 
 class TopicIssue(BaseModel):
     """单条审核发现的问题（与 models.audit_task.AuditIssue 对应）。"""
-    type: str = Field(description="compliance | completeness | consistency")
+    type: str = Field(description="compliance | completeness | consistency | insufficient_evidence | out_of_scope")
     clause_number: Optional[str] = Field(default=None, description="条款编号")
     description: str = Field(description="问题描述")
     severity: str = Field(description="high | medium | low")
-    standard_reference: Optional[StandardRef] = None
+    standard_reference: StandardRef = Field(default_factory=StandardRef)
     suggestion: Optional[str] = None
+    cited_excerpt: str = Field(default="", description="从原文中引用的具体文本片段作为证据")
+    document_position: str = Field(default="", description="引用文本在文档中的位置描述")
 
 
 class TopicIssueList(BaseModel):

@@ -57,6 +57,9 @@ def extract_text(file_path: str) -> str:
                 text = _extract_with_mineru(file_path)
             if text:
                 return text
+            from core.degradation import record as _deg_record
+            _deg_record("text_extraction", "mineru_empty_output",
+                         f"MinerU returned empty text for {file_path}, falling back to pdfplumber")
         if ext == ".pdf":
             return _extract_pdf_streaming(file_path)
         if ext in (".docx", ".doc"):
