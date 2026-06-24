@@ -203,24 +203,29 @@ async def stream_audit_progress(task_id: str):
             except Exception as e:
                 event_queue.put({"type": "error", "message": str(e)})
             finally:
+                from services.agentic_audit import clear_task_events
+                clear_task_events(task_id)
                 event_queue.put(None)
 
         thread = threading.Thread(target=run_with_stream, daemon=True)
         thread.start()
 
     elif task.status == "processing":
+        # 任务已在执行，从共享事件日志读取新事件
         import time
+        from services.agentic_audit import get_task_events_since, clear_task_events
 
-        def poll_for_completion():
-            last_progress = -1
-            for _ in range(300):  # 最多等 5 分钟
+        def read_from_log():
+            event_index = 0
+            last_check = time.time()
+            for _ in range(300):
+                new_events, event_index = get_task_events_since(task_id, event_index)
+                for evt in new_events:
+                    event_queue.put(evt)
+
                 t = audit_task_svc.get_task(task_id)
                 if not t:
                     event_queue.put({"type": "error", "message": "任务丢失"})
-                    event_queue.put(None)
-                    return
-                if t.status == "cancelled":
-                    event_queue.put({"type": "cancelled", "message": "审核任务已被取消"})
                     event_queue.put(None)
                     return
                 if t.status == "completed":
@@ -231,25 +236,27 @@ async def stream_audit_progress(task_id: str):
                         "issues_count": result.summary.issues_count if result else 0,
                     })
                     event_queue.put(None)
+                    clear_task_events(task_id)
                     return
-                if t.status == "failed":
+                if t.status == "failed" or t.status == "cancelled":
                     event_queue.put({
-                        "type": "error",
-                        "message": t.error_message or "审核失败",
+                        "type": "cancelled" if t.status == "cancelled" else "error",
+                        "message": t.error_message or "审核失败" if t.status == "failed" else "审核任务已被取消",
                     })
                     event_queue.put(None)
+                    clear_task_events(task_id)
                     return
-                if t.progress != last_progress:
-                    event_queue.put({
-                        "type": "progress",
-                        "message": t.progress_label or f"处理中 {int(t.progress * 100)}%",
-                    })
-                    last_progress = t.progress
-                time.sleep(1)
+
+                # 每 5 秒无新事件发一次心跳
+                if not new_events and time.time() - last_check > 5:
+                    event_queue.put({"type": "progress", "message": t.progress_label or "审核进行中"})
+                    last_check = time.time()
+
+                time.sleep(0.5)
             event_queue.put({"type": "error", "message": "审核超时"})
             event_queue.put(None)
 
-        thread = threading.Thread(target=poll_for_completion, daemon=True)
+        thread = threading.Thread(target=read_from_log, daemon=True)
         thread.start()
 
     else:

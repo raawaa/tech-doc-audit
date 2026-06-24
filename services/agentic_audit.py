@@ -36,6 +36,32 @@ MAX_TURNS = 30
 CHAPTER_MAX_CHARS = 4000
 MAX_CONSECUTIVE_FAILURES = 3
 
+# per-task 共享事件日志：audit 线程写入，SSE 连接读取
+# key=task_id, value=list[dict]
+_task_event_logs: dict[str, list[dict]] = {}
+import threading as _threading
+_task_log_lock = _threading.Lock()
+
+
+def get_task_events_since(task_id: str, index: int = 0) -> tuple[list[dict], int]:
+    """获取 task_id 的事件日志中 index 之后的新事件。
+    
+    Returns:
+        (new_events, next_index) — new_events 是 index 之后的新事件列表，
+        next_index 是下次调用时应传入的 index。
+    """
+    with _task_log_lock:
+        log = _task_event_logs.get(task_id, [])
+        if index >= len(log):
+            return [], index
+        return log[index:], len(log)
+
+
+def clear_task_events(task_id: str):
+    """清理任务事件日志。"""
+    with _task_log_lock:
+        _task_event_logs.pop(task_id, None)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # System Prompt
@@ -591,6 +617,12 @@ def _run_native_tool_calling(
     import httpx
 
     def _emit(event: dict):
+        # 存入共享日志
+        with _task_log_lock:
+            if task_id not in _task_event_logs:
+                _task_event_logs[task_id] = []
+            _task_event_logs[task_id].append(event)
+        # 同时推送给当前 SSE 连接的回调
         if event_callback:
             try:
                 event_callback(event)
@@ -769,6 +801,12 @@ def _run_structured_llm_loop(
     适用非 DeepSeek provider（MiniMax、OpenAI 等）或 DeepSeek 原生路径失败时。
     """
     def _emit(event: dict):
+        # 存入共享日志
+        with _task_log_lock:
+            if task_id not in _task_event_logs:
+                _task_event_logs[task_id] = []
+            _task_event_logs[task_id].append(event)
+        # 同时推送给当前 SSE 连接的回调
         if event_callback:
             try:
                 event_callback(event)
