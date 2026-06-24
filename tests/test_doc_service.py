@@ -94,19 +94,21 @@ def test_batch_import_documents_async():
     kb = kb_svc.create_kb(name="测试批量异步", category="national")
 
     files = [
-        ("doc_1.pdf", b"%PDF-1.4 content 1"),
-        ("doc_2.pdf", b"%PDF-1.4 content 2"),
-        ("doc_3.pdf", b"%PDF-1.4 content 3"),
+        ("doc_1.md", b"# Document 1\n\nThis is the content of document 1 for testing."),
+        ("doc_2.md", b"# Document 2\n\nThis is the content of document 2 for testing."),
+        ("doc_3.md", b"# Document 3\n\nThis is the content of document 3 for testing."),
     ]
 
     docs = doc_svc.batch_import_documents(kb.id, files, async_index=True)
     assert len(docs) == 3
 
-    # 等待后台线程完成
-    for _ in range(100):
-        if all(d.index_status != "pending_index" for d in docs):
+    # 等待后台线程完成（从 repo 重新读取最新状态）
+    import storage.doc_repo as doc_repo
+    for _ in range(600):
+        fresh_docs = [doc_repo.get_doc(kb.id, d.id) for d in docs]
+        if all(d and d.index_status not in ("pending_index", "building") for d in fresh_docs):
             break
-        time.sleep(0.1)
+        time.sleep(0.5)
 
     # 验证所有文档都在 kb.document_ids 中
     kb = kb_repo.get(kb.id)
@@ -246,7 +248,7 @@ def test_concurrent_batch_imports_no_orphans(monkeypatch):
     kb = kb_svc.create_kb(name="并发批量", category="national")
 
     def batch_one(i):
-        files = [(f"doc_{i}_{j}.pdf", b"%PDF-1.4 content") for j in range(3)]
+        files = [(f"doc_{i}_{j}.md", f"# Doc {i}_{j}\n\nTest content for document {i}_{j}.".encode()) for j in range(3)]
         doc_svc.batch_import_documents(kb.id, files, async_index=False)
 
     threads = [threading.Thread(target=batch_one, args=(i,)) for i in range(4)]

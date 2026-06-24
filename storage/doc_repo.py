@@ -6,6 +6,7 @@ from typing import Optional
 import shutil
 
 from models.document import KBDocument
+from storage import validate_id
 
 DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 
@@ -15,6 +16,7 @@ def _ensure_dir(path: Path) -> None:
 
 
 def _kb_docs_dir(kb_id: str) -> Path:
+    validate_id(kb_id, "kb_id")
     return DATA_DIR / "kbs" / kb_id / "docs"
 
 
@@ -23,6 +25,7 @@ def _doc_meta_dir(kb_id: str) -> Path:
 
 
 def _doc_meta_file(kb_id: str, doc_id: str) -> Path:
+    validate_id(doc_id, "doc_id")
     return _doc_meta_dir(kb_id) / f"{doc_id}.json"
 
 

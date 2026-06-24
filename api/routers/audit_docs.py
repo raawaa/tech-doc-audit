@@ -6,6 +6,7 @@ from pydantic import BaseModel
 import services.audit_doc_service as audit_doc_svc
 import services.structure_service as structure_svc
 import services.temp_index_service as temp_index_svc
+from core.settings import MAX_UPLOAD_SIZE
 
 router = APIRouter(prefix="/api/v1/audit-documents", tags=["audit-documents"])
 
@@ -74,6 +75,8 @@ def list_audit_documents(status: Optional[str] = Query(None)):
 async def upload_audit_document(file: UploadFile = File(...)):
     """上传待审核文档。"""
     content = await file.read()
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=413, detail=f"文件过大（{len(content) // 1024 // 1024}MB），最大允许 {MAX_UPLOAD_SIZE // 1024 // 1024}MB")
     try:
         doc = audit_doc_svc.upload_document(file.filename, content)
         return AuditDocumentResponse.from_doc(doc)

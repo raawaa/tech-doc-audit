@@ -17,6 +17,17 @@ from unittest.mock import MagicMock
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _clear_degradation_log():
+    """每个测试前清空线程级降级日志，防止交叉污染。"""
+    try:
+        from core.degradation import drain
+        drain()
+    except Exception:
+        pass
+
+
 # ── 测试数据目录（模块级，确保早于 storage 模块 import）──────────────────────────
 _TEST_DATA_DIR = Path(tempfile.mkdtemp(prefix="jishu_shenhe_test_"))
 os.environ["AUDIT_DATA_DIR"] = str(_TEST_DATA_DIR)

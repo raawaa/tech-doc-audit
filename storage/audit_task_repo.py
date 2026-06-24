@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from models.audit_task import AuditTask
+from storage import validate_id
 
 DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 
@@ -14,10 +15,12 @@ def _ensure_dir(path: Path) -> None:
 
 
 def _task_dir(doc_id: str) -> Path:
+    validate_id(doc_id, "document_id")
     return DATA_DIR / "audits" / doc_id / "tasks"
 
 
 def _task_file(doc_id: str, task_id: str) -> Path:
+    validate_id(task_id, "task_id")
     return _task_dir(doc_id) / f"{task_id}.json"
 
 

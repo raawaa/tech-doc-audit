@@ -7,6 +7,7 @@ from typing import Optional
 import shutil
 
 from models.knowledge_base import KnowledgeBase
+from storage import validate_id
 
 DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 KBS_DIR = DATA_DIR / "kbs"
@@ -19,6 +20,7 @@ def _ensure_dir(path: Path) -> None:
 
 
 def _kb_dir(kb_id: str) -> Path:
+    validate_id(kb_id, "kb_id")
     return KBS_DIR / kb_id
 
 

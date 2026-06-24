@@ -22,7 +22,7 @@ from models.llm_schemas import TopicIssueList, TopicIssue
 def test_locate_paragraphs_finds_keyword():
     """含关键词的内容 → 返回非空，且包含关键词及其上下文。"""
     content = "文档前言。" + "增值税税率" + "后续条款说明。"
-    result = locate_paragraphs(content, ["增值税"])
+    result, pos = locate_paragraphs(content, ["增值税"])
     assert result != ""
     assert "增值税" in result
 
@@ -30,7 +30,7 @@ def test_locate_paragraphs_finds_keyword():
 def test_locate_paragraphs_dedup():
     """两个关键词命中同一区域（同一 1000 字符桶）→ 去重为单段。"""
     content = "增值税税率相关条款说明。"
-    result = locate_paragraphs(content, ["增值税", "税率"])
+    result, pos = locate_paragraphs(content, ["增值税", "税率"])
     # 短文本：两次命中的 (start//1000, end//1000) 桶相同 → 只保留 1 段
     assert result != ""
     assert result.count("---") == 0  # 单段无分隔符
@@ -44,21 +44,21 @@ def test_locate_paragraphs_caps_at_5():
         parts.append("填充" * 1500 + f"关键词{i}")
     content = "".join(parts)
     keywords = [f"关键词{i}" for i in range(10)]
-    result = locate_paragraphs(content, keywords)
+    result, pos = locate_paragraphs(content, keywords)
     segments = result.split("\n\n---\n\n")
     assert len(segments) == 5  # 硬上限
 
 
 def test_locate_paragraphs_empty_inputs():
     """空内容或空关键词列表 → 返回空串。"""
-    assert locate_paragraphs("", ["增值税"]) == ""
-    assert locate_paragraphs("内容", []) == ""
-    assert locate_paragraphs("", []) == ""
+    assert locate_paragraphs("", ["增值税"]) == ("", [])
+    assert locate_paragraphs("内容", []) == ("", [])
+    assert locate_paragraphs("", []) == ("", [])
 
 
 def test_locate_paragraphs_no_match():
     """内容不含任何关键词 → 返回空串。"""
-    assert locate_paragraphs("完全无关的招标内容", ["增值税", "保证金"]) == ""
+    assert locate_paragraphs("完全无关的招标内容", ["增值税", "保证金"]) == ("", [])
 
 
 # ── _parse_json_fallback（纯逻辑）───────────────────────────────────────────────
