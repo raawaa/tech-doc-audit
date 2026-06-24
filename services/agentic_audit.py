@@ -627,6 +627,18 @@ def _run_native_tool_calling(
     max_iterations = 100
 
     for iteration in range(max_iterations):
+        # 检查任务是否被取消
+        try:
+            from storage.audit_task_repo import get_task
+            current_task = get_task(task_id)
+            if current_task and current_task.status == "cancelled":
+                _emit({"type": "cancelled", "message": "审核任务已被取消"})
+                _logger.info("agentic audit task %s cancelled at iteration %d", task_id, iteration)
+                raw_analysis = f"审核已取消（第 {iteration} 轮），已记录 {len(issues)} 个问题。"
+                break
+        except Exception:
+            pass  # 取消检查失败不阻塞审核
+
         try:
             response = client.chat.completions.create(
                 model=model,
@@ -778,6 +790,18 @@ def _run_structured_llm_loop(
     consecutive_failures = 0
 
     for turn in range(MAX_TURNS):
+        # 检查任务是否被取消
+        try:
+            from storage.audit_task_repo import get_task
+            current_task = get_task(task_id)
+            if current_task and current_task.status == "cancelled":
+                _emit({"type": "cancelled", "message": "审核任务已被取消"})
+                _logger.info("structured_llm audit task %s cancelled at turn %d", task_id, turn)
+                raw_analysis = f"审核已取消（第 {turn} 轮），已记录 {len(issues)} 个问题。"
+                break
+        except Exception:
+            pass
+
         try:
             response = structured_llm.chat(messages)
             action: AgentAction = response.raw

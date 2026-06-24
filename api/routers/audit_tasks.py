@@ -219,6 +219,10 @@ async def stream_audit_progress(task_id: str):
                     event_queue.put({"type": "error", "message": "任务丢失"})
                     event_queue.put(None)
                     return
+                if t.status == "cancelled":
+                    event_queue.put({"type": "cancelled", "message": "审核任务已被取消"})
+                    event_queue.put(None)
+                    return
                 if t.status == "completed":
                     result = t.result
                     event_queue.put({

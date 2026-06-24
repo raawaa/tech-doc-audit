@@ -268,6 +268,14 @@ function EventRow({
         <div className="px-4 py-2 text-xs text-slate-500">{event.message}</div>
       )
 
+    case 'cancelled':
+      return (
+        <div className="px-4 py-2 flex items-center gap-2 text-xs text-amber-600">
+          <XCircle className="w-3.5 h-3.5" />
+          {event.message}
+        </div>
+      )
+
     case 'error':
       return (
         <div className="px-4 py-2 flex items-center gap-2 text-xs text-red-600">

@@ -116,6 +116,7 @@ export type AuditEvent =
   | { type: 'issue_found'; issue: AuditEventIssue }
   | { type: 'progress'; message: string }
   | { type: 'complete'; summary: string; issues_count: number }
+  | { type: 'cancelled'; message: string }
   | { type: 'error'; message: string }
 export interface QASource {
   kb_id: string
