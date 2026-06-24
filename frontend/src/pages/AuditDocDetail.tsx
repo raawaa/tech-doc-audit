@@ -57,6 +57,14 @@ export function AuditDocDetail() {
     }
   }, [tasks, id, navigate])
 
+  // 自动检测 processing 状态的任务，开启流式展示
+  useEffect(() => {
+    const processingTask = tasks.find(t => t.status === 'processing')
+    if (processingTask && !streamingTaskId) {
+      setStreamingTaskId(processingTask.id)
+    }
+  }, [tasks, streamingTaskId])
+
   const processDoc = useMutation({
     mutationFn: () => auditDocApi.process(id!),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['audit-doc', id] }),

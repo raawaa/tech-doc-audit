@@ -626,16 +626,7 @@ def _run_native_tool_calling(
     raw_analysis = ""
     max_iterations = 100
 
-    # 上下文窗口管理：保留 system prompt + 最近的消息
-    # 避免 thinking 模式 + 工具返回导致上下文膨胀 OOM
-    MAX_CONTEXT_MESSAGES = 15  # 保留最近 15 条消息（不含 system prompt）
-
     for iteration in range(max_iterations):
-        # 上下文裁剪：保留 system + 最近 N 条
-        if len(messages) > MAX_CONTEXT_MESSAGES + 1:
-            # 保留 system prompt + 最近的消息
-            messages = [messages[0]] + messages[-(MAX_CONTEXT_MESSAGES):]
-            _logger.debug("context trimmed to %d messages", len(messages))
         try:
             response = client.chat.completions.create(
                 model=model,
