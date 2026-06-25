@@ -22,7 +22,7 @@
 | 属性 | 值 |
 |------|-----|
 | 位置 | `services/doc_service.py:109-114`（单文档异步）和 `:214-224`（批量索引） |
-| 文件 | `/home/yuwenjie/Code/jishu_shenhe/services/doc_service.py` |
+| 文件 | `services/doc_service.py` |
 | 状态 | 已验证，无法反驳 |
 
 **描述**：`kb_repo.get()` 读取 KB 时不持有任何锁，而 `kb_repo.update()` 仅序列化最终写入（通过 `_write_lock`），不保护 `get()` → `modify` → `update()` 这个完整周期。在行 110/215/221（`get()`）和行 114/224（`update()`）之间，另一个并发的 `import_document` 调用可能已向 `kb.document_ids` 追加了 `doc_id`，当前线程随后写回一个陈旧 `kb` 对象，导致该 `doc_id` 永久丢失——文档已保存到磁盘但未被 KB 引用（孤立文档）。
@@ -40,7 +40,7 @@
 | 属性 | 值 |
 |------|-----|
 | 位置 | `services/doc_service.py` 中 `async_index=True` 所有代码路径 |
-| 文件 | `/home/yuwenjie/Code/jishu_shenhe/services/doc_service.py` |
+| 文件 | `services/doc_service.py` |
 | 状态 | 已验证，无法反驳 |
 
 **描述**：没有测试（单元、集成或 API）覆盖 `async_index=True` 路径。API 服务器（`api/routers/documents.py:21,50`）只使用 `async_index=True`，这意味着这是生产代码路径——零测试覆盖。re-read 修复（行 109-114 和 214-221）专门为防止 `document_ids` 并发追加中的竞态条件而设计，但此修复完全没有测试覆盖。底层索引逻辑（`_index_vec` / `core.index_manager.index_document`）通过同步路径有测试覆盖，但 KB 状态管理（`building` -> `ready`、`index_current_doc`、`index_progress`）和 re-read 模式完全未测试。
@@ -54,7 +54,7 @@
 | 属性 | 值 |
 |------|-----|
 | 位置 | `core/index_manager.py` 六个函数 |
-| 文件 | `/home/yuwenjie/Code/jishu_shenhe/core/index_manager.py` |
+| 文件 | `core/index_manager.py` |
 | 状态 | 已验证，无法反驳 |
 
 **描述**：`index_document`、`index_documents_batch`、`remove_document`、`rebuild_kb_index`、`search` 等六个函数没有直接的测试覆盖。测试文件使用虚假 PDF 内容，提取结果为空文本，因此即使同步索引路径也从未到达 `index_document`（空文本提前返回）。集成测试 `test_full_workflow` 依赖真实 PDF 存在，且即使运行也只断言 `kb_doc.id is not None` 而不验证索引结果。新引入的 `threading.RLock` 并发控制使此覆盖缺口成为真正风险——并发的正确性错误只能通过测试发现。
@@ -73,7 +73,7 @@
 | 属性 | 值 |
 |------|-----|
 | 位置 | `tests/test_kb_service.py:20`、`tests/test_doc_service.py:21-22`、`tests/test_audit_doc_service.py:20` |
-| 文件 | `/home/yuwenjie/Code/jishu_shenhe/tests/test_kb_service.py`、`tests/test_doc_service.py`、`tests/test_audit_doc_service.py` |
+| 文件 | `tests/test_kb_service.py`、`tests/test_doc_service.py`、`tests/test_audit_doc_service.py` |
 | 状态 | 已验证，修复在工作树中（已暂存） |
 
 **描述**：提交 30144cf 移除了模块级常量 `KB_META_DIR`（`kb_repo.py`）、`KB_DOCS_DIR`（`doc_repo.py`）和 `AUDIT_DOCS_DIR`（`audit_doc_repo.py`）。三个测试文件中的 `autouse` 清理 fixture 未同步更新，导致每个测试在 teardown 时抛出 `AttributeError`。这导致模块内测试间清理失败（遗留数据污染后续测试），且只有带精确计数断言的测试（如 `test_list_kbs`）会因此失败。
@@ -89,7 +89,7 @@
 | 属性 | 值 |
 |------|-----|
 | 位置 | `tests/test_doc_service.py:10` 和 `tests/test_kb_service.py:10` |
-| 文件 | `/home/yuwenjie/Code/jishu_shenhe/tests/test_kb_service.py`、`tests/test_doc_service.py` |
+| 文件 | `tests/test_kb_service.py`、`tests/test_doc_service.py` |
 | 状态 | 已验证 |
 
 **描述**：两个测试文件在模块级设置 `os.environ["AUDIT_DATA_DIR"]`，但由于 Python 的 `sys.modules` 缓存，`storage.kb_repo.DATA_DIR` 对象在首次 import 后即固定。后加载的模块设置的环境变量不再影响已导入模块的 `DATA_DIR`。不过顺序执行时无实际影响——autouse fixture 提供了每测试隔离，且测试间无数据依赖。实际后果仅限于临时目录泄漏和调试混淆。
@@ -103,7 +103,7 @@
 | 属性 | 值 |
 |------|-----|
 | 位置 | `core/index_manager.py` 和 `storage/kb_repo.py` 的三个锁 |
-| 文件 | `/home/yuwenjie/Code/jishu_shenhe/core/index_manager.py`、`storage/kb_repo.py` |
+| 文件 | `core/index_manager.py`、`storage/kb_repo.py` |
 | 状态 | 已验证 |
 
 **描述**：唯一嵌套锁路径是 `_on_progress` 回调场景：per-KB RLock 先获取，`_write_lock` 后获取（一致顺序，同一线程）。不存在 `_write_lock` 被持有后进入 `index_manager` 获取 per-KB RLock 的代码路径（反向顺序）。`kb_repo.update()` 中的 `_write_lock` 临界区极小，仅执行 JSON 文件写入，无递归锁获取或 `index_manager` 调用。三个锁（`_write_lock`、per-KB RLock、`_index_locks_lock`）之间不存在 ABBA 死锁场景。
@@ -117,7 +117,7 @@
 | 属性 | 值 |
 |------|-----|
 | 位置 | `core/index_manager.py` 全部公共函数 |
-| 文件 | `/home/yuwenjie/Code/jishu_shenhe/core/index_manager.py` |
+| 文件 | `core/index_manager.py` |
 | 状态 | 已验证 |
 
 **描述**：所有索引变更操作（`index_document`、`index_documents_batch`、`remove_document`、`rebuild_kb_index`、`search`）已正确包裹在 per-KB RLock 内。`_split_document()` 降级链和 `remove_document` 全量重建降级路径均在锁内，且通过 RLock 重入正确处理。`search()` 的异常处理正确包裹锁内代码。`get_kb_index_built()` 在锁外检查的竞态是良性的——最坏情况丢失一次搜索而非数据损坏。`CrossKBRetriever`（`retriever.py:45`）调用 `get_kb_index()` 时未持有 per-KB 锁，但此路径仅用于 Q&A 只读检索，无并发写入同一索引的竞争。
@@ -131,7 +131,7 @@
 | 属性 | 值 |
 |------|-----|
 | 位置 | `tests/test_kb_service.py:19-21`、`tests/test_doc_service.py:20-22`、`tests/test_audit_doc_service.py:19-20` |
-| 文件 | `/home/yuwenjie/Code/jishu_shenhe/tests/` 三个测试文件 |
+| 文件 | `tests/` 三个测试文件 |
 | 状态 | 已验证，修复在工作树中 |
 
 **描述**：存储层重构（提交 30144cf）重命名了常量，但测试清理 fixture 未同步更新。工作树 diff 使用正确的常量（`KBS_DIR`、`DATA_DIR`）替换了已移除的常量，这是真正的回归修复，非风格性修改。
