@@ -429,24 +429,34 @@ def qa_ask(
     question: str = typer.Argument(..., help="问题"),
     kb_ids: str = typer.Option(..., "--kb-ids", help="知识库 ID（逗号分隔）"),
     top_k: int = typer.Option(5, "--top-k", help="检索 chunk 数量"),
+    agentic: bool = typer.Option(False, "--agentic", help="使用 Agentic 问答模式"),
 ):
     """向知识库提问，获取答案及参考来源。"""
-    from services.qa_service import ask as ask_svc
-
     kb_id_list = [k.strip() for k in kb_ids.split(",")]
 
     typer.echo(f"\n{'='*60}")
     typer.echo(f"问题: {question}")
     typer.echo(f"{'='*60}\n")
 
-    result = ask_svc(kb_id_list, question, top_k)
+    if agentic:
+        from services.agentic_qa import run_agentic_qa
+        import uuid
+        typer.echo("[Agentic 模式] 正在搜索知识库...\n")
+        result = run_agentic_qa(
+            question, kb_id_list,
+            qa_id=uuid.uuid4().hex[:12],
+        )
+    else:
+        from services.qa_service import ask as ask_svc
+        result = ask_svc(kb_id_list, question, top_k)
 
     typer.echo(result["answer"])
     typer.echo(f"\n{'='*60}")
     typer.echo(f"参考来源 ({len(result['sources'])} 条):")
     for s in result["sources"]:
-        doc = s["doc_source"] or s["doc_id"]
-        typer.echo(f"  - [{doc}] (相关度: {s['relevance']:.2f})")
+        doc = s.get("doc_source") or s.get("doc_id", "未知来源")
+        relevance = s.get("relevance", 0)
+        typer.echo(f"  - [{doc}] (相关度: {relevance:.2f})")
 
 
 if __name__ == "__main__":

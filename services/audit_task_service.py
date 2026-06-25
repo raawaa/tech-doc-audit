@@ -287,7 +287,7 @@ def run_audit(task_id: str, use_quick_mode: bool = True, event_callback: Callabl
         raw_parts = []
 
         # 2a. Agentic 审核（优先）
-        if os.environ.get("USE_AGENTIC_AUDIT", "").lower() in ("true", "1", "yes"):
+        if os.environ.get("USE_AGENTIC_AUDIT", "true").lower() in ("true", "1", "yes"):
             _logger.info("Running agentic audit for task %s", task_id)
             task.progress_label = "Agentic 审核中"
             repo.save_task(task)

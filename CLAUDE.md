@@ -29,6 +29,13 @@ uv run pytest tests/test_xxx.py -v   # 运行单个测试文件
 uv run uvicorn api.main:app --reload --port 8000
 USE_AGENTIC_AUDIT=true nohup uv run uvicorn api.main:app --port 8000 > /tmp/backend.log 2>&1 &  # 生产模式，启用 Agentic 审核
 
+# ⚠️ 修改 Python 后端代码后必须重启 uvicorn！
+# 与前端 Vite（HMR 自动生效）不同，Python 没有热更新。
+# uvicorn 启动时将代码加载到内存，磁盘文件修改不影响运行中的进程。
+# 加了 --reload 参数才会自动重启，否则必须手动：
+#   pkill -f "uvicorn api.main" && sleep 2
+#   然后重新启动后端
+
 # CLI 工具（与 API 功能一一对应）
 uv run python -m cli kb create --name "xxx" --category national
 uv run python -m cli kb list
