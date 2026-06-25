@@ -179,8 +179,8 @@ def chat_stream(req: ChatRequest):
             pending_tool_calls: dict[str, str] = {}  # tool_name → toolCallId
             step_counter = 0
 
-            # 发送流开始
-            yield _sse("start", {"type": "start"})
+            # 发送流开始（messageMetadata 确保 AI SDK 立即触发 write()，让前端即时显示加载指示器）
+            yield _sse("start", {"type": "start", "messageMetadata": {}})
 
             while True:
                 try:
@@ -267,6 +267,7 @@ def chat_stream(req: ChatRequest):
 
         else:
             # 原始 RAG 管道流式
+            yield _sse("start", {"type": "start", "messageMetadata": {}})
             text_started_rag = False
             for event in qa_chat_stream(req.session_id, question, kb_ids, req.top_k):
                 t = event["type"]
