@@ -15,7 +15,7 @@ from services.qa_service import chat_stream as qa_chat_stream
 
 router = APIRouter(prefix="/api/v1/qa", tags=["qa"])
 
-_AGENTIC_QA = os.environ.get("USE_AGENTIC_QA", "").lower() in ("true", "1", "yes")
+_AGENTIC_QA = os.environ.get("USE_AGENTIC_QA", "true").lower() in ("true", "1", "yes")
 
 
 class QARequest(BaseModel):
