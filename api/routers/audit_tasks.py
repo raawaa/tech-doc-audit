@@ -281,11 +281,11 @@ async def stream_audit_progress(task_id: str):
             if event is None:
                 break
 
-            # 截断过长的 tool_result 内容
+            # 截断过长的 tool_result 内容（仅前端显示，不影响 LLM）
             if isinstance(event, dict) and event.get("type") == "tool_result":
                 content = event.get("content", "")
-                if len(content) > 2000:
-                    event = {**event, "content": content[:2000] + "\n... [截断]", "truncated": True}
+                if len(content) > 10000:
+                    event = {**event, "content": content[:10000] + "\n... [截断]", "truncated": True}
 
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 

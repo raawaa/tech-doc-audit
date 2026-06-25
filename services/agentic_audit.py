@@ -40,7 +40,7 @@ _TRACE_DIR = Path(
 ) / "audits"
 
 MAX_TURNS = 30
-CHAPTER_MAX_CHARS = 4000
+CHAPTER_MAX_CHARS = 8000
 MAX_CONSECUTIVE_FAILURES = 3
 
 # per-task 共享事件日志：audit 线程写入，SSE 连接读取
@@ -296,7 +296,7 @@ def _tool_search_kb(kb_ids: list[str], query: str, top_k: int = 5) -> str:
         doc = r.get("doc_source", "") or r.get("doc_id", "")
         clause = r.get("clause_number", "")
         section = r.get("section_path", "")
-        content = (r.get("content", "") or "")[:500]
+        content = (r.get("content", "") or "")
 
         label_parts = []
         if doc:
@@ -338,8 +338,8 @@ def _tool_search_kb_text(kb_ids: list[str], query: str) -> str:
         return f"（未找到与「{query}」匹配的文本）"
 
     # 截断
-    if len(result) > 2000:
-        result = result[:2000] + "\n... [截断]"
+    if len(result) > 5000:
+        result = result[:5000] + "\n... [截断]"
     return f"【知识库文本搜索结果（精确匹配: {query}）】\n{result}"
 
 

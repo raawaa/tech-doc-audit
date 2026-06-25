@@ -164,7 +164,7 @@ def _tool_search_kb(kb_ids: list[str], query: str, top_k: int = 5) -> str:
         doc = r.get("doc_source", "") or r.get("doc_id", "")
         clause = r.get("clause_number", "")
         section = r.get("section_path", "")
-        content = (r.get("content", "") or "")[:500]
+        content = (r.get("content", "") or "")
 
         label_parts = []
         if doc:
@@ -204,8 +204,8 @@ def _tool_search_kb_text(kb_ids: list[str], query: str) -> str:
     if not result:
         return f"（未找到与「{query}」匹配的文本，建议换关键词或改用 search_kb 语义搜索）"
 
-    if len(result) > 2000:
-        result = result[:2000] + "\n... [截断]"
+    if len(result) > 5000:
+        result = result[:5000] + "\n... [截断]"
     return f"【知识库文本搜索结果（精确匹配: {query}）】\n{result}"
 
 
