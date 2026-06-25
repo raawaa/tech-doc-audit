@@ -58,14 +58,24 @@ export function AuditDocDetail() {
   }, [tasks, id, navigate])
 
   // 自动检测 pending/processing 状态的任务，开启流式展示
+  // pending 任务自动触发执行，避免闪现「执行」按钮
+  const autoRanTasks = useRef<Set<string>>(new Set())
   useEffect(() => {
+    const pendingTask = tasks.find(t => t.status === 'pending')
+    if (pendingTask && !autoRanTasks.current.has(pendingTask.id)) {
+      autoRanTasks.current.add(pendingTask.id)
+      auditTaskApi.run(pendingTask.id, true).then(() => {
+        qc.invalidateQueries({ queryKey: ['audit-tasks', id] })
+      })
+      return
+    }
     const activeTask = tasks.find(
       t => t.status === 'processing' || t.status === 'pending'
     )
     if (activeTask && !streamingTaskId) {
       setStreamingTaskId(activeTask.id)
     }
-  }, [tasks, streamingTaskId])
+  }, [tasks, streamingTaskId, id, qc])
 
   const processDoc = useMutation({
     mutationFn: () => auditDocApi.process(id!),
@@ -205,9 +215,9 @@ export function AuditDocDetail() {
                     {task.status === 'processing' && (
                       <div className="flex items-center gap-2">
                         <div className="w-24">
-                          <ProgressBar value={task.progress} />
+                          <ProgressBar value={task.progress} indeterminate={task.progress >= 0.1 && task.progress < 0.9} />
                         </div>
-                        <span className="text-xs text-slate-500 min-w-[4rem]">
+                        <span className="text-xs text-slate-500 min-w-[5rem]">
                           {task.progress_label ?? `处理中 ${Math.round(task.progress * 100)}%`}
                         </span>
                         <button

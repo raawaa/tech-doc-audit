@@ -337,10 +337,11 @@ def run_agentic_qa(
 
     for iteration in range(MAX_ITERATIONS):
         try:
-            response = client.chat.completions.create(
+            stream = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 tools=_TOOLS_SPEC,
+                stream=True,
                 extra_body={"thinking": {"type": "enabled"}},
             )
         except Exception as e:
@@ -349,43 +350,105 @@ def run_agentic_qa(
             answer = f"抱歉，问答服务暂时不可用。（{e}）"
             break
 
-        msg = response.choices[0].message
+        # 流式接收响应：逐 token 发送推理过程和回答文本，累积 tool call 参数
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_call_accumulators: dict[int, dict] = {}  # index → {id, name, arguments}
+        reasoning_started = False
+        reasoning_ended = False
+        text_started = False
 
-        # 发送 reasoning 事件
-        if msg.reasoning_content:
-            _emit({"type": "reasoning", "content": msg.reasoning_content[:2000]})
+        try:
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+
+                # DeepSeek thinking 模式：逐 token 发送推理过程
+                rc = getattr(delta, 'reasoning_content', None)
+                if rc:
+                    if not reasoning_started:
+                        reasoning_started = True
+                        _emit({"type": "reasoning_start"})
+                    reasoning_parts.append(rc)
+                    _emit({"type": "reasoning_delta", "content": rc})
+
+                # 逐 token 发送回答文本
+                if delta.content:
+                    if reasoning_started and not reasoning_ended:
+                        _emit({"type": "reasoning_end"})
+                        reasoning_ended = True
+                    if not text_started:
+                        text_started = True
+                        _emit({"type": "text_start"})
+                    content_parts.append(delta.content)
+                    _emit({"type": "text_delta", "content": delta.content})
+
+                # 累积 tool call 参数（流式下 tool call 参数分多个 chunk 到达）
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_call_accumulators:
+                            tool_call_accumulators[idx] = {
+                                "id": "",
+                                "name": "",
+                                "arguments": "",
+                            }
+                        acc = tool_call_accumulators[idx]
+                        if tc_delta.id:
+                            acc["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                acc["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                acc["arguments"] += tc_delta.function.arguments
+        except Exception as e:
+            _emit({"type": "error", "message": f"流式响应中断: {e}"})
+            _logger.warning("agentic_qa: stream interrupted: %s", e)
+            answer = f"抱歉，问答服务暂时不可用。（流式响应中断: {e}）"
+            break
+
+        # 关闭未完成的阶段
+        if reasoning_started and not reasoning_ended:
+            _emit({"type": "reasoning_end"})
+        if text_started:
+            _emit({"type": "text_end"})
+
+        content = "".join(content_parts)
+        reasoning_content = "".join(reasoning_parts)
+
+        # 构建 tool calls 列表（按 index 排序确保顺序正确）
+        tool_calls_list: list[dict] = []
+        for idx in sorted(tool_call_accumulators.keys()):
+            acc = tool_call_accumulators[idx]
+            if acc["id"] and acc["name"]:
+                tool_calls_list.append({
+                    "id": acc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": acc["name"],
+                        "arguments": acc["arguments"],
+                    },
+                })
 
         # 追加 assistant 消息
-        assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
-        if msg.reasoning_content:
-            assistant_msg["reasoning_content"] = msg.reasoning_content
-        if msg.tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": tc.type,
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in msg.tool_calls
-            ]
+        assistant_msg: dict = {"role": "assistant", "content": content}
+        if reasoning_content:
+            assistant_msg["reasoning_content"] = reasoning_content
+        if tool_calls_list:
+            assistant_msg["tool_calls"] = tool_calls_list
         messages.append(assistant_msg)
 
         # 没有工具调用 → 模型给出了最终回答
-        if not msg.tool_calls:
-            answer = msg.content or ""
+        if not tool_calls_list:
+            answer = content
             finished = True
-            _emit({"type": "answer", "content": answer})
             _logger.info("agentic_qa finished after %d iterations", iteration + 1)
             break
 
-        # 执行工具
-        for tc in msg.tool_calls:
-            func_name = tc.function.name
+        # 执行工具（参数已在流式接收时累积完整）
+        for tc in tool_calls_list:
+            func_name = tc["function"]["name"]
             try:
-                func_args = json.loads(tc.function.arguments)
+                func_args = json.loads(tc["function"]["arguments"])
             except json.JSONDecodeError:
                 func_args = {}
 
@@ -401,7 +464,7 @@ def run_agentic_qa(
 
             messages.append({
                 "role": "tool",
-                "tool_call_id": tc.id,
+                "tool_call_id": tc["id"],
                 "content": tool_result,
             })
     else:

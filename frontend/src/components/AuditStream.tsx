@@ -66,12 +66,20 @@ export function AuditStream({ taskId, docId }: Props) {
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set())
   const containerRef = useRef<HTMLDivElement>(null)
 
+  const retryCount = useRef(0)
+  const hasErrored = useRef(false)
+  const MAX_RETRIES = 5
+
   useEffect(() => {
     const baseUrl = import.meta.env.VITE_API_BASE_URL || ''
     const url = `${baseUrl}/api/v1/audit-tasks/${taskId}/stream`
     const es = new EventSource(url)
 
-    es.onopen = () => setConnected(true)
+    es.onopen = () => {
+      setConnected(true)
+      hasErrored.current = false
+      retryCount.current = 0
+    }
 
     es.onmessage = (e) => {
       try {
@@ -87,7 +95,12 @@ export function AuditStream({ taskId, docId }: Props) {
 
     es.onerror = () => {
       setConnected(false)
-      es.close()
+      hasErrored.current = true
+      retryCount.current += 1
+      if (retryCount.current >= MAX_RETRIES) {
+        es.close()
+      }
+      // 不调用 close()，让浏览器自动重连（EventSource 内置重连机制）
     }
 
     return () => es.close()
@@ -177,7 +190,7 @@ export function AuditStream({ taskId, docId }: Props) {
           </button>
         </div>
       )}
-      {(lastEvent?.type === 'error' || (!connected && !isComplete && events.length === 0)) && (
+      {(lastEvent?.type === 'error' || (hasErrored.current && !connected && !isComplete && events.length === 0)) && (
         <div className="px-4 py-3 bg-red-50 border-t border-red-200 flex items-center gap-2 text-sm text-red-700">
           <XCircle className="w-4 h-4" />
           {lastEvent?.type === 'error' ? (lastEvent as { message: string }).message : '连接失败'}

@@ -78,7 +78,8 @@ export function AuditDashboard() {
       setShowAuditModal(false)
       setSelectedKBs([])
       toast.success('审核任务已创建')
-      // 跳转到详情页，SSE 会接管启动审核并流式推送进度
+      // 立即启动审核，导航到详情页时任务已是 processing，不会闪现「执行」按钮
+      auditTaskApi.run(task.id, true)
       navigate(`/audit/${task.document_id}`)
       qc.invalidateQueries({ queryKey: ['audit-docs'] })
       qc.invalidateQueries({ queryKey: ['audit-tasks'] })
@@ -204,7 +205,7 @@ export function AuditDashboard() {
                           const p = taskProgressMap.get(doc.id)
                           return p ? (
                             <div className="flex flex-col gap-0.5 min-w-[80px]">
-                              <ProgressBar value={p.progress} className="h-1.5" />
+                              <ProgressBar value={p.progress} className="h-1.5" indeterminate={p.progress >= 0.1 && p.progress < 0.9} />
                               <span className="text-[10px] text-slate-400 leading-tight">
                                 {p.label ?? `处理中 ${Math.round(p.progress * 100)}%`}
                               </span>

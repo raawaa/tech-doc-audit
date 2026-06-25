@@ -197,6 +197,13 @@ async def stream_audit_progress(task_id: str):
     event_queue: queue.Queue = queue.Queue()
 
     if task.status == "pending":
+        # 等待一小段时间，让 /run 触发的线程有机会将状态转为 processing，
+        # 避免重复 spawn 线程导致竞态报错。
+        import time as _time
+        _time.sleep(0.3)
+        task = audit_task_svc.get_task(task_id)
+
+    if task and task.status == "pending":
         def run_with_stream():
             try:
                 audit_task_svc.run_audit(task_id, event_callback=event_queue.put)
@@ -210,7 +217,7 @@ async def stream_audit_progress(task_id: str):
         thread = threading.Thread(target=run_with_stream, daemon=True)
         thread.start()
 
-    elif task.status == "processing":
+    elif task and task.status == "processing":
         # 任务已在执行，从共享事件日志读取新事件
         import time
         from services.agentic_audit import get_task_events_since, clear_task_events

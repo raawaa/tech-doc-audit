@@ -132,10 +132,14 @@ def run_audit(task_id: str, use_quick_mode: bool = True, event_callback: Callabl
 
         # 确保文档已处理
         if not doc.parsed_content:
+            if event_callback:
+                event_callback({"type": "progress", "message": "正在解析文档…"})
             doc = audit_doc_svc.parse_document(doc.id)
         degradation_log.extend(_deg_drain())
 
         if not doc.structure:
+            if event_callback:
+                event_callback({"type": "progress", "message": "正在分析文档结构…"})
             try:
                 doc = structure_svc.analyze_document_structure(doc.id)
             except Exception:

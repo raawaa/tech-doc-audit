@@ -178,6 +178,7 @@ def chat_stream(req: ChatRequest):
             # 记录每个 tool_call 的 toolCallId，为后续 tool_result 关联
             pending_tool_calls: dict[str, str] = {}  # tool_name → toolCallId
             step_counter = 0
+            current_rid = ""  # 当前推理块的 ID，跨 reasoning_start/delta/end 复用
 
             # 发送流开始（messageMetadata 确保 AI SDK 立即触发 write()，让前端即时显示加载指示器）
             yield _sse("start", {"type": "start", "messageMetadata": {}})
@@ -194,15 +195,39 @@ def chat_stream(req: ChatRequest):
                 t = event.get("type", "")
 
                 if t == "start":
-                    # agent 开始工作，可以忽略或发一个 start-step
                     yield _sse("start-step", {"type": "start-step"})
 
-                elif t == "reasoning":
+                elif t == "reasoning_start":
                     step_counter += 1
-                    rid = f"reasoning-{step_counter}"
-                    yield _sse("reasoning-start", {"type": "reasoning-start", "id": rid})
-                    yield _sse("reasoning-delta", {"type": "reasoning-delta", "id": rid, "delta": event.get("content", "")})
-                    yield _sse("reasoning-end", {"type": "reasoning-end", "id": rid})
+                    current_rid = f"reasoning-{step_counter}"
+                    yield _sse("reasoning-start", {"type": "reasoning-start", "id": current_rid})
+
+                elif t == "reasoning_delta":
+                    if current_rid:
+                        yield _sse("reasoning-delta", {
+                            "type": "reasoning-delta",
+                            "id": current_rid,
+                            "delta": event.get("content", ""),
+                        })
+
+                elif t == "reasoning_end":
+                    if current_rid:
+                        yield _sse("reasoning-end", {"type": "reasoning-end", "id": current_rid})
+                    current_rid = ""
+
+                elif t == "text_start":
+                    text_started = True
+                    yield _sse("text-start", {"type": "text-start", "id": TEXT_PART_ID})
+
+                elif t == "text_delta":
+                    yield _sse("text-delta", {
+                        "type": "text-delta",
+                        "id": TEXT_PART_ID,
+                        "delta": event.get("content", ""),
+                    })
+
+                elif t == "text_end":
+                    yield _sse("text-end", {"type": "text-end", "id": TEXT_PART_ID})
 
                 elif t == "tool_call":
                     func_name = event.get("tool", "unknown")
@@ -230,16 +255,6 @@ def chat_stream(req: ChatRequest):
                         "output": event.get("content", ""),
                     })
 
-                elif t == "answer":
-                    if not text_started:
-                        yield _sse("text-start", {"type": "text-start", "id": TEXT_PART_ID})
-                        text_started = True
-                    yield _sse("text-delta", {
-                        "type": "text-delta",
-                        "id": TEXT_PART_ID,
-                        "delta": event.get("content", ""),
-                    })
-
                 elif t == "error":
                     yield _sse("error", {
                         "type": "error",
@@ -249,9 +264,10 @@ def chat_stream(req: ChatRequest):
             # 发送最终结果
             result = result_container.get("result", {})
             answer_text = result.get("answer", "")
-            if answer_text:
-                if not text_started:
-                    yield _sse("text-start", {"type": "text-start", "id": TEXT_PART_ID})
+            if answer_text and not text_started:
+                # 错误/降级情况：没有流式文本输出，发一次完整的 text 事件
+                yield _sse("text-start", {"type": "text-start", "id": TEXT_PART_ID})
+                yield _sse("text-delta", {"type": "text-delta", "id": TEXT_PART_ID, "delta": answer_text})
                 yield _sse("text-end", {"type": "text-end", "id": TEXT_PART_ID})
             yield _sse("finish-step", {"type": "finish-step"})
             if result.get("sources"):
