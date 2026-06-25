@@ -23,6 +23,7 @@ export function AuditDashboard() {
   const [showAuditModal, setShowAuditModal] = useState(false)
   const [auditTarget, setAuditTarget] = useState<AuditDocument | null>(null)
   const [selectedKBs, setSelectedKBs] = useState<string[]>([])
+  const [isDragging, setIsDragging] = useState(false)
 
   const { data: docs = [], isLoading } = useQuery({
     queryKey: ['audit-docs'],
@@ -93,6 +94,26 @@ export function AuditDashboard() {
     e.target.value = ''
   }
 
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(true)
+  }
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(false)
+  }
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(false)
+    const file = e.dataTransfer.files?.[0]
+    if (file) upload.mutate(file)
+  }
+
   const handleAction = (doc: AuditDocument) => {
     const act = statusActions[doc.status]
     if (!act) return
@@ -118,10 +139,21 @@ export function AuditDashboard() {
 
       <Card>
         <CardBody>
-          <label className="flex flex-col items-center justify-center gap-3 py-8 cursor-pointer rounded-lg border-2 border-dashed border-slate-200 hover:border-blue-400 hover:bg-blue-50/30 transition-colors">
-            <Upload className="w-8 h-8 text-slate-400" />
+          <label
+            className={`flex flex-col items-center justify-center gap-3 py-8 cursor-pointer rounded-lg border-2 border-dashed transition-colors ${
+              isDragging
+                ? 'border-blue-500 bg-blue-50'
+                : 'border-slate-200 hover:border-blue-400 hover:bg-blue-50/30'
+            }`}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+          >
+            <Upload className={`w-8 h-8 ${isDragging ? 'text-blue-500' : 'text-slate-400'}`} />
             <div className="text-center">
-              <p className="text-sm font-medium text-slate-700">点击上传文档</p>
+              <p className="text-sm font-medium text-slate-700">
+                {isDragging ? '释放文件以上传' : '点击或拖拽文件上传'}
+              </p>
               <p className="text-xs text-slate-400 mt-0.5">支持 PDF、DOC、DOCX 格式</p>
             </div>
             <input type="file" accept=".pdf,.doc,.docx" onChange={handleUpload} className="hidden" />
