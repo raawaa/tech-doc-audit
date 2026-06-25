@@ -28,7 +28,8 @@ export function QA() {
   const [sourcesMap, setSourcesMap] = useState<Map<string, QASource[]>>(new Map())
   const [suggestionsMap, setSuggestionsMap] = useState<Map<string, string[]>>(new Map())
   const [expandedSources, setExpandedSources] = useState<Set<string>>(new Set())
-  const [progressLabel, setProgressLabel] = useState('')
+  const [agentSteps, setAgentSteps] = useState<Array<{id: string; label: string}>>([])
+  const [activeAgentStepId, setActiveAgentStepId] = useState('')
   const [input, setInput] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
 
@@ -54,13 +55,17 @@ export function QA() {
     }),
     experimental_throttle: 50,
     onData: (dataPart) => {
-      // 实时消费服务端 data-progress 事件，更新进度标签
+      // 实时消费服务端 data-progress 事件，累积 agent 步骤
       const data = dataPart.data as { label?: string; sources?: QASource[] } | undefined
       if (dataPart.type === 'data-progress' && data?.label) {
-        setProgressLabel(data.label)
+        const stepId = dataPart.id || `step-${Date.now()}`
+        setAgentSteps(prev => [...prev, { id: stepId, label: data.label! }])
+        setActiveAgentStepId(stepId)
       }
     },
     onFinish: ({ message }) => {
+      setAgentSteps([])
+      setActiveAgentStepId('')
       // 从 message.parts 中提取自定义数据（data-* 事件，类型为 `data-${string}`）
       const dataParts = message.parts?.filter(p => p.type.startsWith('data-')) as Array<{ data: { sources?: QASource[]; session_id?: string; suggestions?: string[] } }> | undefined
       // data-sources: 查找 data 中有 sources 字段的
@@ -88,7 +93,8 @@ export function QA() {
   const handleSend = useCallback(() => {
     const q = input.trim()
     if (!q || selectedKBs.length === 0 || isStreaming) return
-    setProgressLabel('正在准备...')
+    setAgentSteps([])
+    setActiveAgentStepId('')
     setInput('')
     chat.sendMessage({ text: q })
   }, [input, selectedKBs, isStreaming, chat.sendMessage])
@@ -96,7 +102,8 @@ export function QA() {
   // 用于追问建议直接发送
   const handleSendWithText = useCallback((text: string) => {
     if (selectedKBs.length === 0 || isStreaming) return
-    setProgressLabel('正在准备...')
+    setAgentSteps([])
+    setActiveAgentStepId('')
     setInput('')
     chat.sendMessage({ text })
   }, [selectedKBs, isStreaming, chat.sendMessage])
@@ -113,7 +120,8 @@ export function QA() {
     setSessionId(undefined)
     setSourcesMap(new Map())
     setSuggestionsMap(new Map())
-    setProgressLabel('')
+    setAgentSteps([])
+    setActiveAgentStepId('')
     setInput('')
   }
 
@@ -247,15 +255,39 @@ export function QA() {
                 </div>
               )}
 
-              {/* 流式输出中的进度指示 */}
+              {/* Agent 步骤列表（搜索/推理过程） */}
+              {isStreaming && agentSteps.length > 0 && (
+                <div className="flex justify-start">
+                  <div className="max-w-[85%] rounded-lg px-4 py-3 text-xs bg-slate-50 border border-slate-100">
+                    <p className="text-slate-400 mb-2 font-medium">思考过程</p>
+                    <div className="space-y-1 max-h-48 overflow-y-auto">
+                      {agentSteps.map((step) => (
+                        <div
+                          key={step.id}
+                          className={`flex items-start gap-1.5 ${
+                            step.id === activeAgentStepId ? 'text-slate-700' : 'text-slate-400'
+                          }`}
+                        >
+                          {step.id === activeAgentStepId && (
+                            <Loader2 className="w-3 h-3 animate-spin mt-0.5 shrink-0 text-blue-400" />
+                          )}
+                          <span className="leading-relaxed break-all">{step.label}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* 流式输出中的 assistant 消息 */}
               {isStreaming && chat.messages[chat.messages.length - 1]?.role === 'assistant' && (
                 <div className="flex justify-start">
                   <div className="max-w-[70%] rounded-lg px-4 py-3 text-sm bg-slate-100 text-slate-900">
                     <div className="markdown-body"><Markdown content={getMessageText(chat.messages[chat.messages.length - 1])} /></div>
-                    {!getMessageText(chat.messages[chat.messages.length - 1]) && (
+                    {!getMessageText(chat.messages[chat.messages.length - 1]) && agentSteps.length === 0 && (
                       <div className="flex items-center gap-2">
                         <Loader2 className="w-4 h-4 animate-spin text-slate-400" />
-                        <span className="text-xs text-slate-400">{progressLabel}</span>
+                        <span className="text-xs text-slate-400">正在生成回答…</span>
                       </div>
                     )}
                   </div>
