@@ -1,22 +1,15 @@
-import concurrent.futures
-import os
 import threading
 from datetime import datetime
 from typing import Callable, Optional
 
 from core.logger import get_logger
-from models.audit_task import AuditTask, AuditIssue, AuditResult, ResultSummary, AuditType
+from models.audit_task import AuditTask, AuditResult, ResultSummary, AuditType
 import storage.audit_task_repo as repo
 import storage.audit_doc_repo as doc_repo
-import services.topic_audit as topic_audit
-import services.agent_audit as agent_audit
 import services.audit_doc_service as audit_doc_svc
 import services.structure_service as structure_svc
 
 _logger = get_logger(__name__)
-
-# 限制并发 LLM 调用数，防止压垮本地 Ollama 或触发 API 限流
-_LLM_SEMAPHORE = threading.Semaphore(4)
 
 
 def create_task(
@@ -76,116 +69,10 @@ def get_result(task_id: str) -> Optional[AuditResult]:
     return task.result
 
 
-def _run_topic_audit_pipeline(
-    topics: list[dict],
-    parsed_content: str,
-    task: AuditTask,
-    repo,
-    degradation_log: list[dict],
-) -> tuple[list[AuditIssue], list[str], AuditTask]:
-    """执行主题审核管线（并行），返回 (issues, raw_parts, updated_task)。"""
-    all_issues = []
-    raw_parts = []
-    success_count = 0
-    fail_count = 0
-
-    from core.degradation import drain as _deg_drain
-
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(8, len(topics)) if topics else 1
-    ) as executor:
-        future_map = {
-            executor.submit(
-                _audit_single_topic, topic, parsed_content, task.kb_ids, i
-            ): topic
-            for i, topic in enumerate(topics)
-        }
-        total = len(future_map)
-        for future in concurrent.futures.as_completed(future_map):
-            task = repo.get_task(task.id)
-            if task and task.status == "cancelled":
-                for f in future_map:
-                    f.cancel()
-                break
-            topic = future_map[future]
-            result = future.result()
-            if result["success"]:
-                success_count += 1
-            else:
-                fail_count += 1
-            all_issues.extend(result["issues"])
-            degradation_log.extend(result.get("degradation_events", []))
-            raw_parts.append(
-                f"{result['name']}: 发现 {len(result['issues'])} 个问题"
-                if result["issues"]
-                else f"{result['name']}: 无问题"
-            )
-            completed = success_count + fail_count
-            task.progress = 0.15 + (completed / total) * 0.75
-            task.progress_label = result["name"] if result["success"] else f"失败：{result['name']}"
-            repo.save_task(task)
-
-    topic_progress = sum(1 for r in raw_parts)
-    task.progress_label = f"已完成 {topic_progress}/{total} 个主题"
-    task.progress = 0.9
-    repo.save_task(task)
-
-    if fail_count > 0:
-        raw_parts.append(f"⚠️ {fail_count}/{len(topics)} 个主题审核失败")
-
-    return all_issues, raw_parts, task
-
-
-def _audit_single_topic(
-    topic: dict,
-    parsed_content: str,
-    kb_ids: list[str],
-    topic_index: int,
-) -> dict:
-    """审核单个主题（供并行执行使用，异常不会透出）。"""
-    from core.degradation import drain as _deg_drain
-    acquired = _LLM_SEMAPHORE.acquire(timeout=300)
-    try:
-        if not acquired:
-            return {
-                "name": topic.get("name", f"主题{topic_index}"),
-                "issues": [],
-                "success": False,
-                "error": "LLM semaphore timeout",
-                "degradation_events": _deg_drain(),
-            }
-        try:
-            issues = topic_audit.audit_topic(
-                topic=topic,
-                doc_nav=None,
-                kb_ids=kb_ids,
-                topic_index=topic_index,
-                parsed_content=parsed_content,
-            )
-            return {
-                "name": topic.get("name", f"主题{topic_index}"),
-                "issues": issues,
-                "success": True,
-                "degradation_events": _deg_drain(),
-            }
-        except Exception as e:
-            _logger.warning("topic audit failed (%s): %s", topic.get("id", topic_index), e)
-            return {
-                "name": topic.get("name", f"主题{topic_index}"),
-                "issues": [],
-                "success": False,
-                "error": str(e),
-                "degradation_events": _deg_drain(),
-            }
-    finally:
-        if acquired:
-            _LLM_SEMAPHORE.release()
-
-
 def _deduplicate_issues(issues: list) -> list:
     """合并描述同一根因的重复问题。
 
-    不同审核主题可能对同一段文档报出相同问题。
+    Agent 可能在不同轮次对同一段文档报出相同问题。
     按 cited_excerpt 相似度分组，每组保留 severity 最高的问题。
     """
     if len(issues) <= 1:
@@ -199,16 +86,10 @@ def _deduplicate_issues(issues: list) -> list:
             groups[excerpt] = []
         groups[excerpt].append(issue)
 
-    # 语义去重：不同但相似的 excerpt 可能描述同一问题
-    # 策略：如果两个 issue 的 document_position 和 clause_number 相同
-    # 且 description 文本相似度 > 60%，视为重复
-    merged = list(groups.values())
-    deduped: list = []
-    seen_keys = set()
-
     severity_rank = {"high": 3, "medium": 2, "low": 1}
+    deduped: list = []
 
-    for group in merged:
+    for group in groups.values():
         if len(group) == 1:
             deduped.append(group[0])
             continue
@@ -225,7 +106,7 @@ def _deduplicate_issues(issues: list) -> list:
 
 
 def run_audit(task_id: str, use_quick_mode: bool = True, event_callback: Callable[[dict], None] | None = None) -> AuditTask:
-    """执行审核任务。"""
+    """执行审核任务（Agentic ReAct loop）。"""
     task = repo.get_task(task_id)
     if not task:
         raise ValueError(f"任务不存在: {task_id}")
@@ -267,106 +148,29 @@ def run_audit(task_id: str, use_quick_mode: bool = True, event_callback: Callabl
 
         parsed_content = doc.parsed_content or ""
 
-        # 1. LLM Agent 分析文档 → 确定审核主题
-        if hasattr(task, 'audit_topics') and task.audit_topics:
-            topics = task.audit_topics
-        else:
-            topics = agent_audit.determine_audit_topics(parsed_content, task.kb_ids)
-            degradation_log.extend(_deg_drain())
-            if not topics:
-                _deg_record("agent_audit", "agent_topics_empty",
-                             "LLM agent returned no topics, falling back to 8 fixed topics")
-                degradation_log.extend(_deg_drain())
-                topics = topic_audit.AUDIT_TOPICS
-
-        task.progress = 0.15
+        # Agentic ReAct 审核
+        _logger.info("Running agentic audit for task %s", task_id)
+        task.progress_label = "Agentic 审核中"
         repo.save_task(task)
 
-        # 2. 执行审核
-        all_issues = []
-        raw_parts = []
+        from services.agentic_audit import run_agentic_audit
+        agentic_result = run_agentic_audit(
+            parsed_content=parsed_content,
+            structure=doc.structure,
+            kb_ids=task.kb_ids,
+            doc_name=doc.name,
+            task_id=task.id,
+            doc_id=doc.id,
+            event_callback=event_callback,
+        )
+        all_issues = agentic_result.issues
+        raw_parts = [agentic_result.raw_analysis or "Agentic 审核完成"]
+        _logger.info("Agentic audit completed: %d issues found", len(all_issues))
 
-        # 2a. Agentic 审核（优先）
-        if os.environ.get("USE_AGENTIC_AUDIT", "true").lower() in ("true", "1", "yes"):
-            _logger.info("Running agentic audit for task %s", task_id)
-            task.progress_label = "Agentic 审核中"
-            repo.save_task(task)
-            try:
-                from services.agentic_audit import run_agentic_audit
-                agentic_result = run_agentic_audit(
-                    parsed_content=parsed_content,
-                    structure=doc.structure,
-                    kb_ids=task.kb_ids,
-                    doc_name=doc.name,
-                    task_id=task.id,
-                    doc_id=doc.id,
-                    event_callback=event_callback,
-                )
-                all_issues = agentic_result.issues
-                raw_parts.append(
-                    agentic_result.raw_analysis or "Agentic 审核完成"
-                )
-                _logger.info(
-                    "Agentic audit completed: %d issues found",
-                    len(all_issues),
-                )
-            except Exception as e:
-                _logger.warning("Agentic audit failed, falling back to topic audit: %s", e)
-                degradation_log.append({
-                    "source": "agentic_audit",
-                    "event": "agentic_failed",
-                    "detail": str(e),
-                })
-                raw_parts.append(f"Agentic 审核: 失败（{e}），降级到主题审核")
-                # 降级到 topic_audit
-                if not topics:
-                    topics = topic_audit.AUDIT_TOPICS
-                all_issues, raw_parts, _ = _run_topic_audit_pipeline(
-                    topics, parsed_content, task, repo, degradation_log,
-                )
-            task.progress = 0.9
-            repo.save_task(task)
-        else:
-            # 2b. 主题审核管线（默认）
-            if not topics:
-                _deg_record("agent_audit", "agent_topics_empty",
-                             "LLM agent returned no topics, falling back to 8 fixed topics")
-                degradation_log.extend(_deg_drain())
-                topics = topic_audit.AUDIT_TOPICS
-            all_issues, raw_parts, task = _run_topic_audit_pipeline(
-                topics, parsed_content, task, repo, degradation_log,
-            )
-            task.progress = 0.9
-            repo.save_task(task)
+        task.progress = 0.9
+        repo.save_task(task)
 
-            # 2c. 可选：需求锚定审核
-            if os.environ.get("USE_REQUIREMENT_AUDIT", "").lower() in ("true", "1", "yes"):
-                try:
-                    _logger.info("Running requirement-anchored audit for task %s", task_id)
-                    from services.requirement_audit import run_requirement_audit
-
-                    req_result = run_requirement_audit(
-                        task_id=task.id,
-                        doc_id=doc.id,
-                        document_name=doc.name,
-                        parsed_content=parsed_content,
-                        structure=doc.structure,
-                        kb_ids=task.kb_ids,
-                    )
-                    if req_result.issues:
-                        _logger.info(
-                            "Requirement audit found %d additional issues",
-                            len(req_result.issues),
-                        )
-                        all_issues.extend(req_result.issues)
-                        raw_parts.append(
-                            f"需求锚定审核: 发现 {len(req_result.issues)} 个问题"
-                        )
-                except Exception as e:
-                    _logger.warning("Requirement audit failed: %s", e)
-                    raw_parts.append(f"需求锚定审核: 失败（{e}）")
-
-        # 3. 生成结果（即使部分 topic 失败，已完成的结果也不丢失）
+        # 生成结果
         issues = _deduplicate_issues(all_issues)
         raw_analysis = "\n".join(raw_parts)
 

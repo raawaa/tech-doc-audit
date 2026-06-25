@@ -23,9 +23,8 @@ nohup uvicorn api.main:app --port 8000 > /tmp/backend.log 2>&1 &
 |------|------|------|
 | DeepSeek thinking 禁用 | `core/settings.py` get_llm() | `additional_kwargs={'extra_body': {'thinking': {'type': 'disabled'}}}` |
 | reranker 按需加载/卸载 | `core/settings.py` run_reranker() | 不再常驻显存，每次加载→推理→del+gc+empty_cache |
-| Agent Markdown 解析 | `services/agent_audit.py` _parse_json_fallback() | 支持中文 `**关键词**`/`**审核提示**` + `### N. 名称` 格式 |
+| Agentic Markdown 解析 | `services/agentic_audit.py` _parse_action_fallback() | 支持 ```json 代码块 + 中文 Markdown 混合格式 |
 | 审核去重 | `services/audit_task_service.py` _deduplicate_issues() | 按 cited_excerpt 去重 |
-| 段落行号定位 | `services/topic_audit.py` locate_paragraphs() | 返回 (文本, 行号信息) 元组 |
 
 ## 常用命令
 

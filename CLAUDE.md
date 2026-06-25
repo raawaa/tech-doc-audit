@@ -27,7 +27,7 @@ uv run pytest tests/test_xxx.py -v   # 运行单个测试文件
 
 # 启动 API 服务
 uv run uvicorn api.main:app --reload --port 8000
-USE_AGENTIC_AUDIT=true nohup uv run uvicorn api.main:app --port 8000 > /tmp/backend.log 2>&1 &  # 生产模式，启用 Agentic 审核
+nohup uv run uvicorn api.main:app --port 8000 > /tmp/backend.log 2>&1 &  # 生产模式
 
 # ⚠️ 修改 Python 后端代码后必须重启 uvicorn！
 # 与前端 Vite（HMR 自动生效）不同，Python 没有热更新。
@@ -84,11 +84,8 @@ docs/retrospectives/  → 开发复盘系列文档（`YYYY-MM-DD-title.md`，含
 1. **上传** `audit_doc_service.upload_document()` → 存入 `data/audit_docs/`
 2. **解析** `audit_doc_service.parse_document()` → MinerU 优先，pdfplumber/python-docx 降级
 3. **结构提取** `structure_service.analyze_document_structure()` → 零 LLM，正则降级链（regex → docx styles → 单章节兜底）
-4. **Agent 选主题** `agent_audit.determine_audit_topics()` → LLM 分析文档自主决定审核维度（降级到 8 个固定主题）
-5. **两条审核路径**（由 `USE_AGENTIC_AUDIT` 环境变量控制）：
-   - **Agentic 路径**（优先）：`agentic_audit.run_agentic_audit()` → ReAct agent loop，LLM 自主调用 `search_kb` / `search_kb_text` / `read_chapter` / `flag_issue` 多轮迭代审核
-   - **Topic 路径**（默认/降级）：`topic_audit.audit_topic()` → 关键词定位段落 → FAISS 向量检索 → 每主题 1 次 LLM 调用
-6. **生成报告** → AuditResult（含 issues、summary、standard_reference）
+4. **Agentic ReAct 审核** `agentic_audit.run_agentic_audit()` → LLM 自主调用 `search_kb` / `search_kb_text` / `read_chapter` / `flag_issue` 多轮迭代审核
+5. **生成报告** → AuditResult（含 issues、summary、standard_reference）
 
 ### 关键设计
 
@@ -96,10 +93,8 @@ docs/retrospectives/  → 开发复盘系列文档（`YYYY-MM-DD-title.md`，含
 - **LLM 调用**: `core/settings.get_llm()` 统一封装（LlamaIndex LLM），支持 Ollama / MiniMax / OpenAI / DeepSeek 四种 provider，通过 `LLM_PROVIDER` 环境变量切换。参见 `.env.example` 了解配置项。
 - **两个域**: 知识库文档（`models/document.py` — KBDocument）和待审核文档（`models/audit_document.py` — AuditDocument）相互独立
 - **存储**: 所有数据存为 JSON 文件在 `data/` 目录下，向量索引存为 FAISS 单文件。无外部数据库。
-- **异步审核（两级并发）**: 任务级 `audit_task_service.run_audit_async()` 用 `threading.Thread(daemon=True)` 后台执行；主题级用 `ThreadPoolExecutor(max_workers=min(8, len(topics)))` 并行审核，每完成一个主题即更新进度。Daemon 线程在服务重启时被强杀，FastAPI 启动时有重置卡住任务的恢复逻辑。
-- **审核方式（两条路径）**:
-  - **Agentic ReAct loop**（`services/agentic_audit.py`，`USE_AGENTIC_AUDIT=true`）：LLM 拿到文档 + 4 个工具（`search_kb` 语义搜索、`search_kb_text` 精确文本搜索、`read_chapter` 章节阅读、`flag_issue` 记录问题），在 ReAct 循环中自主推理、选择工具、根据反馈调整策略。DeepSeek 原生 function calling + thinking 模式为主路径，LlamaIndex structured_llm 为降级。每次审核结束时自动保存完整对话 trace 到 `data/audits/{doc_id}/tasks/traces/{task_id}_trace.json`
-  - **Topic 审核**（`services/topic_audit.py`，默认）：8 个预定义主题（税率合规、品牌限制、支付条款等），每主题用关键词定位段落 + FAISS 检索 + 1 次 LLM 判断
+- **异步审核**: 任务级 `audit_task_service.run_audit_async()` 用 `threading.Thread(daemon=True)` 后台执行。Daemon 线程在服务重启时被强杀，FastAPI 启动时有重置卡住任务的恢复逻辑。
+- **审核方式（Agentic ReAct loop）**: LLM 拿到文档 + 4 个工具（`search_kb` 语义搜索、`search_kb_text` 精确文本搜索、`read_chapter` 章节阅读、`flag_issue` 记录问题），在 ReAct 循环中自主推理、选择工具、根据反馈调整策略。DeepSeek 原生 function calling + thinking 模式为主路径，LlamaIndex structured_llm 为降级。每次审核结束时自动保存完整对话 trace 到 `data/audits/{doc_id}/tasks/traces/{task_id}_trace.json`
 
 ### 核心降级链（Graceful Degradation）
 
@@ -109,9 +104,7 @@ docs/retrospectives/  → 开发复盘系列文档（`YYYY-MM-DD-title.md`，含
 |------|---------|---------|
 | 文档解析 | MinerU | pdfplumber → python-docx |
 | 向量检索 | FAISS ANN | ripgrep-all 纯文本搜索 |
-| 审核主题 | LLM Agent 动态选择 | 8 个预定义固定主题 |
-| 审核执行 | Agentic ReAct loop（`USE_AGENTIC_AUDIT=true`） | Topic 流水线（8 主题 × 1 LLM 调用） |
-| Agent LLM 调用 | DeepSeek native function calling + thinking | LlamaIndex structured_llm + JSON fallback |
+| 审核执行 | Agentic ReAct loop（native function calling + thinking） | LlamaIndex structured_llm + JSON fallback |
 | 结构提取 | docx heading styles | markdown regex → plain text regex → 单章节兜底 |
 
 ### 测试模式
@@ -137,12 +130,11 @@ docs/retrospectives/  → 开发复盘系列文档（`YYYY-MM-DD-title.md`，含
 ### 几个尚未校准的魔数（已知债）
 
 - 向量搜索接受阈值 `relevance > 0.35`（`vector_search.search_by_keywords()`），低于此值降级到文本搜索——未经 benchmark 系统校准。
-- Agent 选主题只送文档前 **8000 字符**给 LLM（`agent_audit.determine_audit_topics()`），长文档后半段可能被遗漏。
-- 关键词段落定位取关键词前后各 **1500 字符**（`topic_audit.KEYWORD_CONTEXT_CHARS`），未按文档类型自适应。
+- Agentic 审核最多 **30 轮** ReAct 迭代（`agentic_audit.MAX_TURNS`），每章最多 **4000 字符**喂给 LLM。
 
 ### 项目状态
 
-已完成 LlamaIndex 迁移 + Agentic ReAct 审核（DeepSeek native function calling + thinking 模式）+ 双路径降级（Agentic → Topic）。
+已完成 Agentic ReAct 审核迁移（DeepSeek native function calling + thinking 模式），topic 主题审核模式已移除。
 reranker 改为按需加载/卸载，缓解 GPU 显存压力。工具描述已按 Anthropic 最佳实践重写（4 工具 × 5-6 句描述，含否定约束和兄弟工具互引用）。
 
 > 架构全貌、降级链、并发模型与完整技术债清单见 `docs/retrospectives/2026-06-18-architecture-and-debt.md`（含配图），是比本文件更详细的架构参考。

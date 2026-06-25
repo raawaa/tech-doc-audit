@@ -144,13 +144,11 @@ class TestChapterExtraction:
 
 
 class TestPipelineRouting:
-    """测试审核管线选择逻辑。"""
+    """测试审核管线 — agentic 为唯一路径。"""
 
     @patch("services.agentic_audit.run_agentic_audit")
-    def test_agentic_audit_activated(self, mock_agentic):
-        """USE_AGENTIC_AUDIT=true 时应走 agentic 管线。"""
-        os.environ["USE_AGENTIC_AUDIT"] = "true"
-
+    def test_agentic_audit_runs(self, mock_agentic, monkeypatch):
+        """审核任务应调用 agentic 管线。"""
         from services.audit_task_service import repo as task_repo
         from services.audit_task_service import doc_repo
         from models.audit_task import AuditTask, AuditResult, ResultSummary
@@ -164,9 +162,9 @@ class TestPipelineRouting:
         mock_doc.structure = DocumentStructure(
             chapters=[], total_clauses=0,
         )
-        doc_repo.get_doc = MagicMock(return_value=mock_doc)
+        monkeypatch.setattr(doc_repo, "get_doc", lambda doc_id: mock_doc)
 
-        # Setup mock task with pre-set topics (skip agent_audit LLM call)
+        # Setup mock task
         task = AuditTask(
             id="task_001",
             document_id="doc_001",
@@ -174,9 +172,9 @@ class TestPipelineRouting:
             kb_ids=[],
             status="pending",
         )
-        object.__setattr__(task, 'audit_topics', [{"id": "test", "name": "测试主题", "prompt": "test", "keywords": ["test"]}])
-        task_repo.get_task = MagicMock(return_value=task)
-        task_repo.save_task = MagicMock()
+        monkeypatch.setattr(task_repo, "get_task", lambda task_id: task)
+        save_calls = []
+        monkeypatch.setattr(task_repo, "save_task", lambda t: save_calls.append(t) or t)
 
         # Mock agentic result
         mock_result = AuditResult(
@@ -195,13 +193,9 @@ class TestPipelineRouting:
         mock_agentic.assert_called_once()
         assert result.status == "completed"
 
-        del os.environ["USE_AGENTIC_AUDIT"]
-
     @patch("services.agentic_audit.run_agentic_audit")
-    def test_agentic_fallback_to_topic(self, mock_agentic):
-        """agentic 失败时应降级到 topic_audit。"""
-        os.environ["USE_AGENTIC_AUDIT"] = "true"
-
+    def test_agentic_failure_marks_task_failed(self, mock_agentic, monkeypatch):
+        """agentic 失败 → status=failed，不再降级到 topic。"""
         from services.audit_task_service import repo as task_repo
         from services.audit_task_service import doc_repo
         from models.audit_task import AuditTask
@@ -214,7 +208,7 @@ class TestPipelineRouting:
         mock_doc.structure = DocumentStructure(
             chapters=[], total_clauses=0,
         )
-        doc_repo.get_doc = MagicMock(return_value=mock_doc)
+        monkeypatch.setattr(doc_repo, "get_doc", lambda doc_id: mock_doc)
 
         task = AuditTask(
             id="task_002",
@@ -223,25 +217,18 @@ class TestPipelineRouting:
             kb_ids=[],
             status="pending",
         )
-        object.__setattr__(task, 'audit_topics', [{"id": "test", "name": "测试主题", "prompt": "test", "keywords": ["test"]}])
-        task_repo.get_task = MagicMock(return_value=task)
-        task_repo.save_task = MagicMock()
+        monkeypatch.setattr(task_repo, "get_task", lambda task_id: task)
+        monkeypatch.setattr(task_repo, "save_task", lambda t: t)
 
         # Agentic raises
         mock_agentic.side_effect = RuntimeError("LLM unavailable")
 
-        # Mock topic audit
-        with patch("services.audit_task_service._run_topic_audit_pipeline") as mock_topic:
-            mock_topic.return_value = ([], ["主题审核: 无问题"], task)
+        from services.audit_task_service import run_audit
+        result = run_audit("task_002")
 
-            from services.audit_task_service import run_audit
-            result = run_audit("task_002")
-
-            mock_agentic.assert_called_once()
-            mock_topic.assert_called_once()
-            assert result.status == "completed"
-
-        del os.environ["USE_AGENTIC_AUDIT"]
+        mock_agentic.assert_called_once()
+        assert result.status == "failed"
+        assert "LLM unavailable" in result.error_message
 
 
 class TestFallbackParser:
