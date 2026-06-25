@@ -1,5 +1,8 @@
+import asyncio
 import json
 import os
+import queue
+import threading
 from typing import Optional
 
 from pydantic import BaseModel
@@ -153,41 +156,51 @@ def chat_stream(req: ChatRequest):
         if _AGENTIC_QA:
             from services.agentic_qa import run_agentic_qa
             import uuid
+
+            event_queue: queue.Queue = queue.Queue()
             qa_id = uuid.uuid4().hex[:12]
+            result_container: dict = {}
 
-            # Agentic 流式事件队列
-            events: list[dict] = []
+            def _run_agentic():
+                result = run_agentic_qa(
+                    question, kb_ids,
+                    chat_history=chat_history if chat_history else None,
+                    event_callback=event_queue.put,
+                    qa_id=qa_id,
+                )
+                result_container["result"] = result
+                event_queue.put(None)  # sentinel
 
-            def collect(event: dict):
-                events.append(event)
+            thread = threading.Thread(target=_run_agentic, daemon=True)
+            thread.start()
 
-            result = run_agentic_qa(
-                question, kb_ids,
-                chat_history=chat_history if chat_history else None,
-                event_callback=collect,
-                qa_id=qa_id,
-            )
-
-            # 将事件转为 SSE
             text_started = False
-            answer_text = result.get("answer", "")
-            for event in events:
-                t = event["type"]
+
+            while True:
+                try:
+                    event = event_queue.get(timeout=120)
+                except queue.Empty:
+                    break
+
+                if event is None:
+                    break
+
+                t = event.get("type", "")
 
                 if t == "reasoning":
                     yield _sse("data-progress", {
                         "type": "data-progress",
-                        "data": {"label": f"💭 {event['content'][:200]}"},
+                        "data": {"label": f"💭 {event['content'][:300]}"},
                     })
 
                 elif t == "tool_call":
+                    args_str = json.dumps(event.get("args", {}), ensure_ascii=False)
                     yield _sse("data-progress", {
                         "type": "data-progress",
-                        "data": {"label": f"🔍 {event['tool']}: {json.dumps(event.get('args', {}), ensure_ascii=False)}"},
+                        "data": {"label": f"🔍 {event['tool']}: {args_str}"},
                     })
 
                 elif t == "tool_result":
-                    # 不发送完整结果，只发进度
                     yield _sse("data-progress", {
                         "type": "data-progress",
                         "data": {"label": f"📋 {event['tool']} 完成"},
@@ -199,14 +212,7 @@ def chat_stream(req: ChatRequest):
                         "data": {"label": event.get("message", "Agentic 问答开始")},
                     })
 
-                elif t == "error":
-                    yield _sse("error", {
-                        "type": "error",
-                        "errorText": event.get("message", "未知错误"),
-                    })
-
                 elif t == "answer":
-                    # 流式输出答案文本
                     if not text_started:
                         yield _sse("text-start", {"type": "text-start", "id": TEXT_PART_ID})
                         text_started = True
@@ -216,11 +222,19 @@ def chat_stream(req: ChatRequest):
                         "delta": event.get("content", ""),
                     })
 
+                elif t == "error":
+                    yield _sse("error", {
+                        "type": "error",
+                        "errorText": event.get("message", "未知错误"),
+                    })
+
+            # 发送最终结果
+            result = result_container.get("result", {})
+            answer_text = result.get("answer", "")
             if answer_text:
                 if not text_started:
                     yield _sse("text-start", {"type": "text-start", "id": TEXT_PART_ID})
                 yield _sse("text-end", {"type": "text-end", "id": TEXT_PART_ID})
-
             if result.get("sources"):
                 yield _sse("data-sources", {
                     "type": "data-sources",
@@ -230,7 +244,6 @@ def chat_stream(req: ChatRequest):
                         for s in result["sources"]
                     ]},
                 })
-
             yield _sse("finish", {"type": "finish", "finishReason": "stop"})
 
         else:
