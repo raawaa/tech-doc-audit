@@ -175,7 +175,12 @@ def chat_stream(req: ChatRequest):
             thread.start()
 
             text_started = False
+            # 记录每个 tool_call 的 toolCallId，为后续 tool_result 关联
+            pending_tool_calls: dict[str, str] = {}  # tool_name → toolCallId
             step_counter = 0
+
+            # 发送流开始
+            yield _sse("start", {"type": "start", "messageId": qa_id})
 
             while True:
                 try:
@@ -188,37 +193,41 @@ def chat_stream(req: ChatRequest):
 
                 t = event.get("type", "")
 
-                if t == "reasoning":
+                if t == "start":
+                    # agent 开始工作，可以忽略或发一个 start-step
+                    yield _sse("start-step", {"type": "start-step"})
+
+                elif t == "reasoning":
                     step_counter += 1
-                    yield _sse("data-progress", {
-                        "type": "data-progress",
-                        "id": f"step-{step_counter}",
-                        "data": {"label": f"💭 {event['content'][:300]}"},
-                    })
+                    rid = f"reasoning-{step_counter}"
+                    yield _sse("reasoning-start", {"type": "reasoning-start", "id": rid})
+                    yield _sse("reasoning-delta", {"type": "reasoning-delta", "id": rid, "delta": event.get("content", "")})
+                    yield _sse("reasoning-end", {"type": "reasoning-end", "id": rid})
 
                 elif t == "tool_call":
+                    func_name = event.get("tool", "unknown")
                     step_counter += 1
-                    args_str = json.dumps(event.get("args", {}), ensure_ascii=False)
-                    yield _sse("data-progress", {
-                        "type": "data-progress",
-                        "id": f"step-{step_counter}",
-                        "data": {"label": f"🔍 {event['tool']}: {args_str}"},
+                    call_id = f"call-{step_counter}"
+                    pending_tool_calls[func_name] = call_id
+                    yield _sse("tool-input-start", {
+                        "type": "tool-input-start",
+                        "toolCallId": call_id,
+                        "toolName": func_name,
+                    })
+                    yield _sse("tool-input-available", {
+                        "type": "tool-input-available",
+                        "toolCallId": call_id,
+                        "toolName": func_name,
+                        "input": event.get("args", {}),
                     })
 
                 elif t == "tool_result":
-                    step_counter += 1
-                    yield _sse("data-progress", {
-                        "type": "data-progress",
-                        "id": f"step-{step_counter}",
-                        "data": {"label": f"📋 {event['tool']} 完成"},
-                    })
-
-                elif t == "start":
-                    step_counter += 1
-                    yield _sse("data-progress", {
-                        "type": "data-progress",
-                        "id": f"step-{step_counter}",
-                        "data": {"label": event.get("message", "Agentic 问答开始")},
+                    func_name = event.get("tool", "unknown")
+                    call_id = pending_tool_calls.pop(func_name, f"call-{step_counter}")
+                    yield _sse("tool-output-available", {
+                        "type": "tool-output-available",
+                        "toolCallId": call_id,
+                        "output": event.get("content", ""),
                     })
 
                 elif t == "answer":
@@ -244,6 +253,7 @@ def chat_stream(req: ChatRequest):
                 if not text_started:
                     yield _sse("text-start", {"type": "text-start", "id": TEXT_PART_ID})
                 yield _sse("text-end", {"type": "text-end", "id": TEXT_PART_ID})
+            yield _sse("finish-step", {"type": "finish-step"})
             if result.get("sources"):
                 yield _sse("data-sources", {
                     "type": "data-sources",
