@@ -180,7 +180,7 @@ def chat_stream(req: ChatRequest):
             step_counter = 0
 
             # 发送流开始
-            yield _sse("start", {"type": "start", "messageId": qa_id})
+            yield _sse("start", {"type": "start"})
 
             while True:
                 try:

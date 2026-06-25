@@ -136,8 +136,6 @@ export function QA() {
           ) : (
             <>
               {chat.messages.map((msg, i) => {
-                // 流式传输时，最后一条助手消息由下方的专用区块渲染，避免重复
-                if (isStreaming && i === chat.messages.length - 1 && msg.role === 'assistant') return null
                 return (
                   <div key={msg.id || i} className="space-y-1.5">
                     <div className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
@@ -173,6 +171,13 @@ export function QA() {
                           })
                         ) : (
                           <div className="markdown-body"><Markdown content={getMessageText(msg)} /></div>
+                        )}
+                        {/* 流式传输中，文本尚未生成时显示加载指示器 */}
+                        {isStreaming && i === chat.messages.length - 1 && msg.role === 'assistant' && !getMessageText(msg) && (
+                          <div className="flex items-center gap-2 mt-2">
+                            <Loader2 className="w-4 h-4 animate-spin text-slate-400" />
+                            <span className="text-xs text-slate-400">正在生成回答…</span>
+                          </div>
                         )}
                         {msg.role === 'assistant' && sourcesMap.has(msg.id) && (
                         <div className="mt-2 pt-2 border-t border-slate-200/60">
@@ -261,20 +266,6 @@ export function QA() {
                 </div>
               )}
 
-              {/* 流式输出中的 assistant 消息 */}
-              {isStreaming && chat.messages[chat.messages.length - 1]?.role === 'assistant' && (
-                <div className="flex justify-start">
-                  <div className="max-w-[70%] rounded-lg px-4 py-3 text-sm bg-slate-100 text-slate-900">
-                    <div className="markdown-body"><Markdown content={getMessageText(chat.messages[chat.messages.length - 1])} /></div>
-                    {!getMessageText(chat.messages[chat.messages.length - 1]) && (
-                      <div className="flex items-center gap-2">
-                        <Loader2 className="w-4 h-4 animate-spin text-slate-400" />
-                        <span className="text-xs text-slate-400">正在生成回答…</span>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
             </>
           )}
           <div ref={bottomRef} />
