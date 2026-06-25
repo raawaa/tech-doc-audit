@@ -1,3 +1,4 @@
+import hashlib
 import os
 import threading
 from typing import Optional
@@ -72,7 +73,17 @@ def import_document(
     if not file_type:
         raise ValueError(f"不支持的文件格式: {original_name}")
 
+    # 内容去重：检查同 KB 下是否已有相同文件（SHA-256 字节级）
+    file_hash = hashlib.sha256(content).hexdigest()
+    existing_docs = doc_repo.list_docs(kb_id)
+    for d in existing_docs:
+        if d.content_hash == file_hash:
+            _logger.info("文档 %s 与已有文档 %s 内容相同（%s），跳过导入",
+                         original_name, d.original_name, file_hash[:12])
+            return d
+
     doc = doc_repo.save_doc(kb_id, original_name, content, file_type)
+    doc.content_hash = file_hash
 
     doc.index_status = "ready"
     doc_repo._save_doc_meta(doc)
@@ -118,6 +129,10 @@ def import_document(
 def _index_single_doc_async(kb_id: str, doc: KBDocument):
     """后台索引单篇文档（由 import_document async_index=True 调用）。"""
     import storage.kb_repo as kb_repo
+
+    # 标记为 indexing（崩溃后可识别）
+    doc.index_status = "indexing"
+    doc_repo._save_doc_meta(doc)
 
     # 获取最新 kb 并标记 building（原子 get→modify→update）
     with _get_lock(kb_id):
@@ -167,13 +182,25 @@ def batch_import_documents(
     if not kb:
         raise ValueError(f"知识库不存在: {kb_id}")
 
+    # 加载已有文档哈希集合，用于批量去重
+    existing_docs = doc_repo.list_docs(kb_id)
+    existing_hashes = {d.content_hash for d in existing_docs if d.content_hash}
+
     for original_name, content in files:
         file_type = _detect_file_type(original_name)
         if not file_type:
             _logger.warning("跳过不支持的文件: %s", original_name)
             continue
 
+        # 内容去重
+        file_hash = hashlib.sha256(content).hexdigest()
+        if file_hash in existing_hashes:
+            _logger.info("跳过重复文档: %s (hash=%s)", original_name, file_hash[:12])
+            continue
+        existing_hashes.add(file_hash)
+
         doc = doc_repo.save_doc(kb_id, original_name, content, file_type)
+        doc.content_hash = file_hash
         doc.index_status = "pending_index"
         doc_repo._save_doc_meta(doc)
         docs.append(doc)
@@ -209,6 +236,15 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
         texts = []
         doc_map = {doc.id: doc for doc in docs}
         for doc in docs:
+            # 断点续传：跳过已索引完成的文档
+            if doc.index_status == "ready":
+                _logger.info("文档 %s 已索引，跳过", doc.id)
+                continue
+
+            # 标记为 indexing（崩溃后可识别并重置）
+            doc.index_status = "indexing"
+            doc_repo._save_doc_meta(doc)
+
             if doc.file_path and os.path.exists(doc.file_path):
                 try:
                     text = _extract_text(doc.file_path)

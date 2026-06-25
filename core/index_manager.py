@@ -5,11 +5,15 @@
 """
 
 import gc
+import json as _json
 import os
 import threading
 import shutil
 from pathlib import Path
 from typing import Optional
+
+import numpy as np
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from core.logger import get_logger
 
@@ -18,9 +22,10 @@ _logger = get_logger(__name__)
 import faiss
 from llama_index.core import VectorStoreIndex, StorageContext, Document, Settings
 from llama_index.core.node_parser import SentenceSplitter, MarkdownNodeParser
+from llama_index.core.schema import TextNode
 from llama_index.vector_stores.faiss import FaissVectorStore
 
-from core.settings import get_embed_model
+from core.settings import get_embed_model, get_gpu_inference_lock
 from core.text_extraction import extract_text as _extract_text
 
 DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
@@ -139,18 +144,81 @@ def clear_cache():
     _index_cache.clear()
 
 
+# ── 向量持久化辅助函数 ──────────────────────────────────────────────────────────
+
+def _save_doc_vectors(kb_id: str, doc_id: str, nodes: list, embeddings: list):
+    """保存文档的 embedding 向量和节点元数据到磁盘。
+
+    每个文档保存两个文件：
+    - {doc_id}.npy: float32 向量矩阵 (n_chunks, 1024)
+    - {doc_id}_nodes.json: 节点元数据列表 [{node_id, text, metadata}, ...]
+
+    先写 _nodes.json 再写 .npy：.npy 存在 ⇔ 向量缓存完整，重建时以此判断。
+    写入顺序保证崩溃后不会出现「.npy 存在但 _nodes.json 缺失」的半完成状态。
+
+    这些文件使索引重建时无需重新 embedding（纯 CPU 操作）。
+    """
+    vectors_dir = _vectors_dir(kb_id)
+    _ensure_dir(vectors_dir)
+
+    # 先写节点元数据（非原子写入可能崩溃残留，但 .npy 不存在时不会触发重建）
+    nodes_data = []
+    for node in nodes:
+        nodes_data.append({
+            "node_id": node.node_id,
+            "text": node.text or "",
+            "metadata": node.metadata or {},
+        })
+    nodes_file = vectors_dir / f"{doc_id}_nodes.json"
+    nodes_tmp = vectors_dir / f"{doc_id}_nodes.json.tmp"
+    nodes_tmp.write_text(_json.dumps(nodes_data, ensure_ascii=False))
+    nodes_tmp.rename(nodes_file)
+
+    # 后写向量（np.save 内部写临时文件 + rename，原子操作）
+    vec_array = np.array(embeddings, dtype=np.float32)
+    np.save(str(vectors_dir / f"{doc_id}.npy"), vec_array)
+
+
+def _cleanup_doc_vectors(kb_id: str, doc_id: str):
+    """删除文档的向量缓存文件。"""
+    vectors_dir = _vectors_dir(kb_id)
+    for suffix in [".npy", "_nodes.json"]:
+        f = vectors_dir / f"{doc_id}{suffix}"
+        if f.exists():
+            f.unlink()
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=30),
+    reraise=True,
+)
+def _embed_batch_with_retry(embed_model, texts: list[str]) -> list:
+    """批量 embedding，瞬态错误自动重试（最多 3 次，指数退避）。
+
+    可重试的错误：GPU 瞬态错误、CUDA 异常。
+    不可重试的错误（如模型未加载、ValueError）会直接抛出。
+    """
+    return embed_model.get_text_embedding_batch(texts)
+
+
 # ── 文档索引 ────────────────────────────────────────────────────────────────────
 
 def index_document(kb_id: str, doc_id: str, text: str, source_name: str = ""):
-    """对文档文本分块 → embedding → 写入 KB 索引。
+    """对文档文本分块 → embedding → 写入 KB 索引 + 持久化向量。
 
     优先使用 MarkdownNodeParser 按标题层级切块（适合带 # 标题的文本），
     降级到 SentenceSplitter 按 token 数切块。
+    embedding 结果同时保存为 .npy 文件，供后续快速重建。
     """
     if not text or len(text) < 20:
         return
 
     with _get_index_lock(kb_id):
+        embed_model = get_embed_model()
+        if embed_model is None:
+            raise RuntimeError("Embedding model not loaded, cannot index document")
+
         index = get_kb_index(kb_id)
 
         doc = Document(
@@ -161,10 +229,25 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = ""):
 
         nodes = _split_document(doc)
         _enrich_chunk_metadata(nodes, doc_id, source_name or doc_id)
+
+        if not nodes:
+            del doc
+            return
+
+        # 预 embedding：拿到向量引用后再插入索引，避免重复推理
+        node_texts = [node.text or "" for node in nodes]
+        with get_gpu_inference_lock():
+            embeddings = _embed_batch_with_retry(embed_model, node_texts)
+        for node, emb in zip(nodes, embeddings):
+            node.embedding = emb
+
+        # 持久化向量（索引重建时无需 GPU）
+        _save_doc_vectors(kb_id, doc_id, nodes, embeddings)
+
+        # 插入索引（节点已有 embedding，不会重复推理）
         index.insert_nodes(nodes)
 
-        # 释放临时对象并回收内存
-        del doc, nodes
+        del doc, nodes, embeddings
         gc.collect()
 
         _persist(kb_id, index)
@@ -209,7 +292,10 @@ def index_documents_batch(
     docs: list[tuple[str, str, str]],
     progress_callback=None,
 ):
-    """批量索引文档，全部处理完再持久化一次。
+    """批量索引文档：分块 → 批量 embedding → 保存向量 → 写入 FAISS。
+
+    每篇文档内部的所有 chunk 批量 embedding（利用 embed_batch_size 加速），
+    embedding 结果持久化为 .npy 文件供后续快速重建。
 
     Args:
         kb_id: 知识库 ID。
@@ -220,6 +306,10 @@ def index_documents_batch(
         return
 
     with _get_index_lock(kb_id):
+        embed_model = get_embed_model()
+        if embed_model is None:
+            raise RuntimeError("Embedding model not loaded, cannot index documents")
+
         index = get_kb_index(kb_id)
         total = len(docs)
 
@@ -237,10 +327,31 @@ def index_documents_batch(
             )
             nodes = _split_document(doc)
             _enrich_chunk_metadata(nodes, doc_id, source_name or doc_id)
+
+            if not nodes:
+                del doc
+                continue
+
+            # 批量 embedding 本稿件所有 chunk（GPU 锁内，失败自动重试）
+            node_texts = [node.text or "" for node in nodes]
+            try:
+                with get_gpu_inference_lock():
+                    embeddings = _embed_batch_with_retry(embed_model, node_texts)
+            except Exception as e:
+                _logger.error("embedding failed for doc %s after retries: %s", doc_id, e)
+                del doc, nodes
+                raise
+
+            for node, emb in zip(nodes, embeddings):
+                node.embedding = emb
+
+            # 持久化向量（索引重建时无需 GPU）
+            _save_doc_vectors(kb_id, doc_id, nodes, embeddings)
+
+            # 插入索引（节点已有 embedding）
             index.insert_nodes(nodes)
 
-            # 主动释放大对象，防止批量索引时内存堆积
-            del doc, nodes
+            del doc, nodes, embeddings
             if i % 5 == 0:
                 gc.collect()
 
@@ -266,29 +377,25 @@ def _has_markdown_headings(text: str) -> bool:
 def remove_document(kb_id: str, doc_id: str):
     """从 KB 索引中删除指定文档的所有节点。
 
-    HNSW + IDMap 支持向量级删除（快速路径），
-    降级到全量重建（兼容旧版 FlatIP 索引或异常场景）。
+    优先尝试向量级删除（delete_ref_doc），降级到从已保存的 .npy 向量
+    重建索引（无需 GPU 重新 embedding）。
     """
     with _get_index_lock(kb_id):
         # 快速路径：通过 delete_ref_doc 直接从索引删除
         try:
             index = get_kb_index(kb_id)
-            # 检查底层索引是否支持删除（IDMap）
             if hasattr(index.vector_store, '_faiss_index') and hasattr(index.vector_store._faiss_index, 'remove_ids'):
                 index.delete_ref_doc(doc_id, delete_from_docstore=True)
                 _persist(kb_id, index)
+                _cleanup_doc_vectors(kb_id, doc_id)
                 _logger.info("removed doc %s from kb %s via delete_ref_doc", doc_id, kb_id)
                 return
         except Exception as e:
-            _logger.warning("vector-level deletion failed for %s/%s (%s), fallback to rebuild", kb_id, doc_id, e)
+            _logger.warning("vector-level deletion failed for %s/%s (%s), fallback to rebuild from cached vectors", kb_id, doc_id, e)
 
-        # 降级路径：全量重建（IndexFlatIP 不支持删除）
-        _logger.info("fallback rebuild for kb %s after removing doc %s", kb_id, doc_id)
+        # 降级路径：从已保存的 .npy 向量重建索引（无需 GPU）
+        _logger.info("rebuilding kb %s index from cached vectors after removing doc %s", kb_id, doc_id)
         _index_cache.pop(kb_id, None)
-
-        vectors_dir = _vectors_dir(kb_id)
-        if vectors_dir.exists():
-            shutil.rmtree(str(vectors_dir))
 
         import storage.kb_repo as kb_repo
         kb = kb_repo.get(kb_id)
@@ -296,29 +403,110 @@ def remove_document(kb_id: str, doc_id: str):
             return
 
         remaining_ids = [did for did in kb.document_ids if did != doc_id]
+        vectors_dir = _vectors_dir(kb_id)
+
         if not remaining_ids:
-            return  # 已无其他文档，无需重建
+            # 无剩余文档，清理所有索引文件
+            if vectors_dir.exists():
+                shutil.rmtree(str(vectors_dir))
+            return
 
-        index = _create_index()
-        _index_cache[kb_id] = index
+        # 从向量缓存重建（_rebuild_from_vectors 成功后 _persist 会覆盖旧 FAISS 文件；
+        # 失败则旧文件仍在，不会丢失索引）
+        _rebuild_from_vectors(kb_id, remaining_ids)
+        _cleanup_doc_vectors(kb_id, doc_id)
 
-        from storage.doc_repo import get_doc
 
-        for did in remaining_ids:
-            doc = get_doc(kb_id, did)
-            if doc and doc.file_path and Path(doc.file_path).exists():
-                try:
-                    text = _extract_text(doc.file_path)
-                    if text:
-                        index_document(kb_id, did, text)
-                except Exception as e:
-                    print(f"  [skip] {did}: {e}")
+def _rebuild_from_vectors(kb_id: str, doc_ids: list[str], progress_callback=None):
+    """从已保存的 .npy 向量文件重建 FAISS 索引（纯 CPU，无需 GPU）。
 
-        _persist(kb_id, index)
+    从 {doc_id}.npy 加载向量，从 {doc_id}_nodes.json 加载节点文本/元数据，
+    重建 TextNode 并插入新索引。
+
+    Args:
+        progress_callback: 可选回调 (current, total, doc_name) → None。
+    """
+    vectors_dir = _vectors_dir(kb_id)
+
+    new_index = _create_index()
+    _index_cache[kb_id] = new_index
+
+    total = len(doc_ids)
+    loaded = 0
+    for i, doc_id in enumerate(doc_ids, 1):
+        vec_file = vectors_dir / f"{doc_id}.npy"
+        nodes_file = vectors_dir / f"{doc_id}_nodes.json"
+
+        if not vec_file.exists():
+            _logger.warning("vector cache missing for doc %s, will need re-embedding", doc_id)
+            if progress_callback:
+                progress_callback(i, total, doc_id)
+            continue
+
+        vectors = np.load(str(vec_file))
+
+        # 加载节点元数据（文本 + metadata）
+        if not nodes_file.exists():
+            _logger.error(
+                "vector cache incomplete for doc %s: .npy exists but _nodes.json missing. "
+                "This doc will be skipped in rebuild. Run `index rebuild --kb-id %s` to re-embed.",
+                doc_id, kb_id,
+            )
+            if progress_callback:
+                progress_callback(i, total, doc_id)
+            continue
+
+        try:
+            nodes_data = _json.loads(nodes_file.read_text())
+        except Exception as e:
+            _logger.error(
+                "failed to load nodes metadata for doc %s (%s). "
+                "This doc will be skipped in rebuild.",
+                doc_id, e,
+            )
+            if progress_callback:
+                progress_callback(i, total, doc_id)
+            continue
+
+        if len(nodes_data) != len(vectors):
+            _logger.error(
+                "node count mismatch for doc %s: %d nodes in _nodes.json vs %d vectors in .npy. "
+                "This doc will be skipped in rebuild.",
+                doc_id, len(nodes_data), len(vectors),
+            )
+            if progress_callback:
+                progress_callback(i, total, doc_id)
+            continue
+
+        nodes = []
+        for j, vec in enumerate(vectors):
+            nd = nodes_data[j]
+            node = TextNode(
+                text=nd.get("text", ""),
+                id_=nd.get("node_id", f"{doc_id}_{j}"),
+                metadata=nd.get("metadata", {}),
+                embedding=vec.tolist() if hasattr(vec, 'tolist') else list(vec),
+            )
+            nodes.append(node)
+
+        new_index.insert_nodes(nodes)
+        loaded += 1
+
+        if progress_callback:
+            progress_callback(i, total, doc_id)
+
+        if loaded % 20 == 0:
+            gc.collect()
+
+    _persist(kb_id, new_index)
+    _logger.info("rebuilt index for kb %s from %d/%d docs (cached vectors)", kb_id, loaded, len(doc_ids))
 
 
 def rebuild_kb_index(kb_id: str, progress_callback=None):
-    """重建 KB 索引（清除旧索引，重新索引所有文档）。
+    """重建 KB 索引。
+
+    优先从已保存的 .npy 向量重建（纯 CPU，秒级），
+    向量缺失时降级到重新提取文本 + embedding（需要 GPU）。
 
     Args:
         kb_id: 知识库 ID。
@@ -328,35 +516,60 @@ def rebuild_kb_index(kb_id: str, progress_callback=None):
     with _get_index_lock(kb_id):
         _index_cache.pop(kb_id, None)
 
-        vectors_dir = _vectors_dir(kb_id)
-        if vectors_dir.exists():
-            shutil.rmtree(str(vectors_dir))
-
         import storage.kb_repo as kb_repo
         kb = kb_repo.get(kb_id)
         if not kb:
             return
 
-        index = _create_index()
-        _index_cache[kb_id] = index
+        vectors_dir = _vectors_dir(kb_id)
+        doc_ids = kb.document_ids
 
-        from storage.doc_repo import get_doc
-        total = len(kb.document_ids)
+        # 区分有/无向量缓存的文档
+        with_vectors = []
+        without_vectors = []
+        for doc_id in doc_ids:
+            if (vectors_dir / f"{doc_id}.npy").exists():
+                with_vectors.append(doc_id)
+            else:
+                without_vectors.append(doc_id)
 
-        for i, doc_id in enumerate(kb.document_ids, 1):
-            doc = get_doc(kb_id, doc_id)
-            doc_name = doc.original_name if doc and doc.original_name else doc_id
-            if progress_callback:
-                progress_callback(i, total, doc_name)
-            if doc and doc.file_path and Path(doc.file_path).exists():
-                try:
-                    text = _extract_text(doc.file_path)
-                    if text:
-                        index_document(kb_id, doc_id, text)
-                except Exception as e:
-                    _logger.warning("  [skip] %s: %s", doc_id, e)
+        # 阶段 1：从向量缓存快速重建（无需 GPU）
+        if with_vectors:
+            _logger.info("rebuilding kb %s from %d cached vectors (fast path)", kb_id, len(with_vectors))
+            # 删除旧的 llama-index 持久化文件（_rebuild_from_vectors 成功后会 _persist 写回新的）
+            old_store = vectors_dir / "default__vector_store.json"
+            if old_store.exists():
+                old_store.unlink()
+            for pattern in ["docstore.json", "index_store.json", "graph_store.json"]:
+                p = vectors_dir / pattern
+                if p.exists():
+                    p.unlink()
 
-        _persist(kb_id, index)
+            _rebuild_from_vectors(kb_id, with_vectors, progress_callback=progress_callback)
+
+        # 阶段 2：重新提取文本 + embedding（向量缓存缺失的文档）
+        if without_vectors:
+            _logger.info("rebuilding kb %s: %d docs need re-embedding (slow path)", kb_id, len(without_vectors))
+            from storage.doc_repo import get_doc
+            total = len(without_vectors)
+            for i, doc_id in enumerate(without_vectors, 1):
+                doc = get_doc(kb_id, doc_id)
+                doc_name = doc.original_name if doc and doc.original_name else doc_id
+                if progress_callback:
+                    progress_callback(i, total, doc_name)
+                if doc and doc.file_path and Path(doc.file_path).exists():
+                    try:
+                        text = _extract_text(doc.file_path)
+                        if text:
+                            index_document(kb_id, doc_id, text)
+                            # index_document 内部已调用 _persist + _save_doc_vectors
+                    except Exception as e:
+                        _logger.warning("  [skip] %s: %s", doc_id, e)
+
+        if not with_vectors and not without_vectors:
+            # 无文档，清理
+            if vectors_dir.exists():
+                shutil.rmtree(str(vectors_dir))
 
 
 def get_kb_index_built(kb_id: str) -> bool:

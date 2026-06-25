@@ -25,24 +25,38 @@ app = FastAPI(
 import storage.kb_repo as kb_repo
 import storage.doc_repo as doc_repo
 
-_stuck_kbs = [kb for kb in kb_repo.list_all() if kb.index_status == "building"]
-for kb in _stuck_kbs:
-    kb.index_status = "none"
-    kb.index_progress = None
-    kb.index_current_doc = ""
-    kb_repo.update(kb)
-    print(f"[startup] 恢复卡住的 KB: {kb.name} ({kb.id}) → index_status=none")
 
-for kb_dir in (kb_repo.KBS_DIR.iterdir() if kb_repo.KBS_DIR.exists() else []):
-    if not kb_dir.is_dir():
-        continue
-    stuck_docs = [d for d in doc_repo.list_docs(kb_dir.name) if d.index_status == "pending_index"]
-    for doc in stuck_docs:
-        doc.index_status = "none"
-        doc_repo._save_doc_meta(doc)
-        print(f"[startup] 恢复卡住的文档: {doc.original_name} ({doc.id}) → index_status=none")
+def recover_stuck_indexes():
+    """恢复因崩溃卡住的 KB 和文档索引状态（可独立调用，便于测试）。"""
+    stuck_kbs = [kb for kb in kb_repo.list_all() if kb.index_status == "building"]
+    for kb in stuck_kbs:
+        kb.index_status = "none"
+        kb.index_progress = None
+        kb.index_current_doc = ""
+        kb_repo.update(kb)
+        print(f"[startup] 恢复卡住的 KB: {kb.name} ({kb.id}) → index_status=none")
 
-del _stuck_kbs
+    for kb_dir in (kb_repo.KBS_DIR.iterdir() if kb_repo.KBS_DIR.exists() else []):
+        if not kb_dir.is_dir():
+            continue
+        all_docs = doc_repo.list_docs(kb_dir.name)
+
+        # pending_index: 还没来得及开始索引就崩溃了
+        stuck_docs = [d for d in all_docs if d.index_status == "pending_index"]
+        for doc in stuck_docs:
+            doc.index_status = "none"
+            doc_repo._save_doc_meta(doc)
+            print(f"[startup] 恢复卡住的文档: {doc.original_name} ({doc.id}) → index_status=none")
+
+        # indexing: 索引进行到一半崩溃了，重置为 pending_index 等待重新索引
+        indexing_docs = [d for d in all_docs if d.index_status == "indexing"]
+        for doc in indexing_docs:
+            doc.index_status = "pending_index"
+            doc_repo._save_doc_meta(doc)
+            print(f"[startup] 恢复卡住的文档: {doc.original_name} ({doc.id}) → index_status=pending_index")
+
+
+recover_stuck_indexes()
 
 # 审核任务：将因上次服务器重启中断的 processing 任务标记为 failed
 import storage.audit_task_repo as audit_task_repo

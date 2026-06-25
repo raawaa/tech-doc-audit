@@ -4,6 +4,7 @@
   uv run python scripts/bulk_import.py --kb-id <kb_id> --dir /path/to/pdfs
 """
 
+import hashlib
 import sys
 from pathlib import Path
 
@@ -49,6 +50,7 @@ def bulk_import(kb_id: str, pdf_dir: str):
         try:
             content = fpath.read_bytes()
             doc = doc_repo.save_doc(kb_id, fpath.name, content, "pdf")
+            doc.content_hash = hashlib.sha256(content).hexdigest()
             # 标记为未建索引状态
             doc.index_status = "none"
             doc_repo._save_doc_meta(doc)

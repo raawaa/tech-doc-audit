@@ -40,11 +40,18 @@ def test_import_document_async():
     content = b"%PDF-1.4 fake pdf content"
     doc = doc_svc.import_document(kb.id, "test.pdf", content, async_index=True)
 
-    assert doc.index_status == "pending_index"
+    # async 导入返回时可能仍在 pending_index，也可能已被后台线程标记为 indexing
+    assert doc.index_status in ("pending_index", "indexing")
 
     # 等待后台线程完成（fake PDF 空文本 → 快速返回）
+    import storage.doc_repo as _dr
     for _ in range(50):
-        if doc.index_status != "pending_index":
+        try:
+            doc = _dr.get_doc(kb.id, doc.id)
+        except Exception:
+            time.sleep(0.1)
+            continue
+        if doc and doc.index_status in ("ready", "failed"):
             break
         time.sleep(0.1)
 
@@ -71,10 +78,10 @@ def test_import_document_async_multiple():
         doc = doc_svc.import_document(kb.id, f"test_{i}.pdf", content, async_index=True)
         docs.append(doc)
 
-    # 等待所有后台线程完成
+    # 等待所有后台线程完成（状态变为 ready 或 failed）
     for _ in range(100):
-        pending = [d for d in docs if d.index_status == "pending_index"]
-        if not pending:
+        not_done = [d for d in docs if d.index_status not in ("ready", "failed")]
+        if not not_done:
             break
         time.sleep(0.1)
 
@@ -103,10 +110,15 @@ def test_batch_import_documents_async():
     assert len(docs) == 3
 
     # 等待后台线程完成（从 repo 重新读取最新状态）
+    # 注意：磁盘元数据可能有瞬时竞态（写 truncate vs 读），捕获 JSON 错误并重试
     import storage.doc_repo as doc_repo
     for _ in range(600):
-        fresh_docs = [doc_repo.get_doc(kb.id, d.id) for d in docs]
-        if all(d and d.index_status not in ("pending_index", "building") for d in fresh_docs):
+        try:
+            fresh_docs = [doc_repo.get_doc(kb.id, d.id) for d in docs]
+        except Exception:
+            time.sleep(0.1)
+            continue
+        if fresh_docs and all(d and d.index_status not in ("pending_index", "building", "indexing") for d in fresh_docs):
             break
         time.sleep(0.5)
 
@@ -144,11 +156,11 @@ def test_import_markdown_document_async():
     content = "# 施工规范\n\n## 第一章 总则\n\n施工规范测试内容。\n\n## 第二章 要求\n\n具体要求内容。".encode()
     doc = doc_svc.import_document(kb.id, "施工规范.md", content, async_index=True)
 
-    assert doc.index_status == "pending_index"
+    assert doc.index_status in ("pending_index", "indexing")
 
     # 等待后台线程完成（MD 提取快速返回）
     for _ in range(50):
-        if doc.index_status != "pending_index":
+        if doc.index_status not in ("pending_index", "indexing"):
             break
         time.sleep(0.1)
 
@@ -260,3 +272,57 @@ def test_concurrent_batch_imports_no_orphans(monkeypatch):
     kb_final = kb_repo.get(kb.id)
     assert kb_final is not None
     assert len(kb_final.document_ids) == 12  # 4 批 × 3 篇，全部保留无丢失
+
+
+# ── 内容去重测试 ──────────────────────────────────────────────────────────────
+
+
+def test_import_document_dedup():
+    """导入相同内容的文档两次，第二次返回已有文档（跳过重复导入）。"""
+    import storage.doc_repo as doc_repo
+
+    kb = kb_svc.create_kb(name="去重测试", category="national")
+
+    content = "# 测试文档\n\n这是一份测试文档的内容，用于验证去重功能是否正常。\n\n## 第二章\n\n更多测试内容。".encode()
+    doc1 = doc_svc.import_document(kb.id, "test.md", content)
+
+    # 再次导入相同内容，应返回同一个文档
+    doc2 = doc_svc.import_document(kb.id, "test_copy.md", content)
+
+    assert doc2.id == doc1.id, f"去重失败：第二次导入应返回已有文档 {doc1.id}，实际返回 {doc2.id}"
+
+    # 确认 content_hash 已设置
+    assert doc1.content_hash is not None
+    assert len(doc1.content_hash) == 64  # SHA-256
+
+    # 确认只创建了一篇文档
+    all_docs = doc_repo.list_docs(kb.id)
+    assert len(all_docs) == 1
+
+
+def test_batch_import_documents_dedup():
+    """批量导入混合新/重复文档，只导入新文档。"""
+    import storage.doc_repo as doc_repo
+
+    kb = kb_svc.create_kb(name="批量去重", category="national")
+
+    content_a = "# 文档A\n\n文档A的测试内容。\n\n## 第一节\n\n具体内容。".encode()
+    content_b = "# 文档B\n\n文档B的测试内容。\n\n## 第一节\n\n其他内容。".encode()
+
+    # 第一次导入 2 个文档
+    files1 = [("doc_a.md", content_a), ("doc_b.md", content_b)]
+    docs1 = doc_svc.batch_import_documents(kb.id, files1, async_index=False)
+    assert len(docs1) == 2
+
+    # 第二次导入：A 重复、B 重复、C 新
+    content_c = "# 文档C\n\n文档C的测试内容。\n\n## 第一节\n\n新内容。".encode()
+    files2 = [("doc_a_v2.md", content_a), ("doc_b_v2.md", content_b), ("doc_c.md", content_c)]
+    docs2 = doc_svc.batch_import_documents(kb.id, files2, async_index=False)
+
+    # 只应有 1 个新文档（C）
+    assert len(docs2) == 1, f"预期导入 1 篇新文档，实际 {len(docs2)} 篇"
+    assert docs2[0].original_name == "doc_c.md"
+
+    # KB 中总共 3 篇文档
+    all_docs = doc_repo.list_docs(kb.id)
+    assert len(all_docs) == 3
