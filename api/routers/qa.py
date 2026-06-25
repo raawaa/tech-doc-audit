@@ -175,6 +175,7 @@ def chat_stream(req: ChatRequest):
             thread.start()
 
             text_started = False
+            step_counter = 0
 
             while True:
                 try:
@@ -188,27 +189,35 @@ def chat_stream(req: ChatRequest):
                 t = event.get("type", "")
 
                 if t == "reasoning":
+                    step_counter += 1
                     yield _sse("data-progress", {
                         "type": "data-progress",
+                        "id": f"step-{step_counter}",
                         "data": {"label": f"💭 {event['content'][:300]}"},
                     })
 
                 elif t == "tool_call":
+                    step_counter += 1
                     args_str = json.dumps(event.get("args", {}), ensure_ascii=False)
                     yield _sse("data-progress", {
                         "type": "data-progress",
+                        "id": f"step-{step_counter}",
                         "data": {"label": f"🔍 {event['tool']}: {args_str}"},
                     })
 
                 elif t == "tool_result":
+                    step_counter += 1
                     yield _sse("data-progress", {
                         "type": "data-progress",
+                        "id": f"step-{step_counter}",
                         "data": {"label": f"📋 {event['tool']} 完成"},
                     })
 
                 elif t == "start":
+                    step_counter += 1
                     yield _sse("data-progress", {
                         "type": "data-progress",
+                        "id": f"step-{step_counter}",
                         "data": {"label": event.get("message", "Agentic 问答开始")},
                     })
 

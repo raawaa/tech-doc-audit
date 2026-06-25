@@ -30,6 +30,7 @@ export function QA() {
   const [expandedSources, setExpandedSources] = useState<Set<string>>(new Set())
   const [agentSteps, setAgentSteps] = useState<Array<{id: string; label: string}>>([])
   const [activeAgentStepId, setActiveAgentStepId] = useState('')
+  const [isAgentRunning, setIsAgentRunning] = useState(false)
   const [input, setInput] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
 
@@ -59,6 +60,7 @@ export function QA() {
       const data = dataPart.data as { label?: string; sources?: QASource[] } | undefined
       if (dataPart.type === 'data-progress' && data?.label) {
         const stepId = dataPart.id || `step-${Date.now()}`
+        setIsAgentRunning(true)
         setAgentSteps(prev => [...prev, { id: stepId, label: data.label! }])
         setActiveAgentStepId(stepId)
       }
@@ -66,6 +68,7 @@ export function QA() {
     onFinish: ({ message }) => {
       setAgentSteps([])
       setActiveAgentStepId('')
+      setIsAgentRunning(false)
       // 从 message.parts 中提取自定义数据（data-* 事件，类型为 `data-${string}`）
       const dataParts = message.parts?.filter(p => p.type.startsWith('data-')) as Array<{ data: { sources?: QASource[]; session_id?: string; suggestions?: string[] } }> | undefined
       // data-sources: 查找 data 中有 sources 字段的
@@ -256,7 +259,7 @@ export function QA() {
               )}
 
               {/* Agent 步骤列表（搜索/推理过程） */}
-              {isStreaming && agentSteps.length > 0 && (
+              {isAgentRunning && agentSteps.length > 0 && (
                 <div className="flex justify-start">
                   <div className="max-w-[85%] rounded-lg px-4 py-3 text-xs bg-slate-50 border border-slate-100">
                     <p className="text-slate-400 mb-2 font-medium">思考过程</p>
