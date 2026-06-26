@@ -617,6 +617,109 @@ def _build_init_msg(
 def _build_tool_result_msg(result: str) -> ChatMessage:
     return ChatMessage(role=MessageRole.USER, content=f"[工具结果]\n{result}")
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 标准信息提取
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _extract_standard_info(issues: list[AuditIssue]) -> dict[int, dict]:
+    """用 LLM 批量从 issue 文本中提取标准编号和名称。
+
+    Args:
+        issues: standard_doc_id 为空的 issue 列表
+
+    Returns:
+        {issue.id: {standard_numbers: [...], standard_names: [...]}}
+        提取不到任何标准的 issue 返回空数组
+    """
+    if not issues:
+        return {}
+
+    # 构建提取输入
+    input_items = []
+    for iss in issues:
+        item = {"id": iss.id}
+        if iss.standard_reference:
+            sn = (iss.standard_reference.standard_name or "").strip()
+            if sn:
+                item["standard_name"] = sn
+        item["description"] = iss.description or ""
+        item["cited_excerpt"] = iss.cited_excerpt or ""
+        item["suggestion"] = iss.suggestion or ""
+        input_items.append(item)
+
+    system_prompt = """你是一个标准文献信息提取器。从审核问题的描述文本中提取被引用的标准编号和标准名称，输出 JSON 格式。
+
+规则：
+1. standard_numbers: 标准编号列表，如 "GB/T 20145-2006"、"GB 50016"、"CJJ 101-2016"。
+   不含纯数字编号（如"12345"不算）。从 description、cited_excerpt、suggestion 字段中提取。
+2. standard_names: 标准中文名称列表，不含书名号《》，如 "灯和灯系统的光生物安全性"。
+3. standard_name 字段如果已有值直接复用，无需重复提取。
+4. 如果问题没有涉及任何可识别的标准，返回空数组。
+
+输入格式: {"issues": [{"id": 1, "standard_name": "...", "description": "...", "cited_excerpt": "...", "suggestion": "..."}]}
+
+输出格式: {"results": [{"id": 1, "standard_numbers": ["GB/T 20145-2006"], "standard_names": ["灯和灯系统的光生物安全性"]}]}"""
+
+    user_prompt = json.dumps({"issues": input_items}, ensure_ascii=False)
+
+    try:
+        import httpx
+        from openai import OpenAI
+
+        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        if not api_key:
+            _logger.warning("_extract_standard_info: DEEPSEEK_API_KEY not set, skipping")
+            return {}
+
+        base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+        # 使用轻量模型做提取（不需要深度推理）
+        model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+
+        http_client = httpx.Client(trust_env=False, timeout=httpx.Timeout(60))
+        client = OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+            max_tokens=4096,
+        )
+
+        content = response.choices[0].message.content
+        if not content:
+            _logger.warning("_extract_standard_info: empty response from LLM")
+            return {}
+
+        data = json.loads(content)
+        results_list = data.get("results", [])
+
+        output: dict[int, dict] = {}
+        for item in results_list:
+            iss_id = item.get("id")
+            if iss_id is None:
+                continue
+            nums = item.get("standard_numbers", []) or []
+            names = item.get("standard_names", []) or []
+            if nums or names:
+                output[iss_id] = {
+                    "standard_numbers": nums,
+                    "standard_names": names,
+                }
+
+        _logger.info(
+            "_extract_standard_info: extracted standards for %d/%d issues",
+            len(output), len(issues),
+        )
+        return output
+
+    except Exception as e:
+        _logger.warning("_extract_standard_info failed: %s", e)
+        return {}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 结果构建
