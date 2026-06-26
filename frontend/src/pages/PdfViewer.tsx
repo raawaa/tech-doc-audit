@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { Loader2 } from 'lucide-react'
+import { pdfjs } from 'react-pdf'
+import 'react-pdf/dist/esm/Page/AnnotationLayer.css'
+import 'react-pdf/dist/esm/Page/TextLayer.css'
 import * as pdfjsLib from 'pdfjs-dist'
 
-// 设置 worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-  'pdfjs-dist/build/pdf.worker.min.mjs',
-  import.meta.url
-).toString()
+// 设置 worker — react-pdf 和 pdfjs-dist 共用同一个 worker
+const WORKER_SRC = '/pdfjs/pdf.worker.min.mjs'
+pdfjs.GlobalWorkerOptions.workerSrc = WORKER_SRC
+pdfjsLib.GlobalWorkerOptions.workerSrc = WORKER_SRC
 
 interface DocMeta {
   id: string
@@ -48,8 +50,9 @@ export function PdfViewer() {
     const url = `${apiBase}/api/v1/kb-documents/${docId}/file`
     pdfjsLib.getDocument({
       url,
-      cMapUrl: 'https://unpkg.com/pdfjs-dist@4.0.379/cmaps/',
+      cMapUrl: '/cmaps/',
       cMapPacked: true,
+      wasmUrl: '/pdfjs/wasm/',
     }).promise.then(doc => {
       setPdfDoc(doc)
       setTotalPages(doc.numPages)
