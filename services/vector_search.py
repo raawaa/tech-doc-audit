@@ -9,6 +9,7 @@
 """
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -69,7 +70,7 @@ def _run_rga(keyword: str, paths: list[str]) -> str:
     if rg_bin:
         try:
             result = subprocess.run(
-                [rg_bin, "-i", "--no-ignore", "-m", "10", "-C", "3",
+                [rg_bin, "-i", "--no-ignore", "-n", "-m", "10", "-C", "3",
                  "-g", "*.md", "-g", "*.txt", "-g", "*.markdown",
                  keyword, *paths],
                 capture_output=True, text=True, timeout=15,
@@ -255,3 +256,113 @@ def get_kb_content(kb_ids: list[str], query: str) -> str:
     if not results:
         return "未找到相关标准依据。"
     return _format_kb_results(results, prefix="参考标准依据（向量检索）")
+
+
+def search_doc_by_text(keyword: str, kb_ids: list[str]) -> list[dict]:
+    """用 rga 精确搜索 KB 文档原文，返回结构化结果。
+
+    适用于搜索标准编号（如 GB/T 20145-2006）等在文档正文中
+    精确出现的字符串。不依赖文件名，搜的是文档内容。
+
+    Returns:
+        [{doc_id, page_number, content}]
+        page_number 为 None 表示无法确定页码（非 PDF 或解析失败）。
+    """
+    if not keyword or not kb_ids:
+        return []
+
+    paths = _get_kb_search_paths(kb_ids)
+    if not paths:
+        return []
+
+    raw = _run_rga(keyword, paths)
+    if not raw:
+        return []
+
+    # 构建 file_path -> (kb_id, doc_id) 映射
+    import storage.doc_repo as doc_repo
+    file_to_doc: dict[str, tuple[str, str]] = {}  # resolved_path -> (kb_id, doc_id)
+    for kb_id in kb_ids:
+        for doc in doc_repo.list_docs(kb_id):
+            fp = str(Path(doc.file_path).resolve())
+            file_to_doc[fp] = (kb_id, doc.id)
+
+    # 解析 rga 输出，提取文件路径和匹配行
+    # rga 输出格式 (with -n): /path/to/file:123:text (match), /path/to/file-123-text (context)
+    # 注意：文件路径可能包含 - 字符，不能直接用简单正则从上下文行解析
+    # 改为：用已知文件路径列表来匹配行首
+    # 优先使用匹配行（:分隔符），无匹配行时才用上下文行
+    hits: list[dict] = []
+    seen_doc_ids: set[str] = set()
+    # doc_id -> best_content，优先存匹配行的内容
+    doc_best: dict[str, dict] = {}
+
+    # 预计算文件路径映射，用于逐行匹配
+    resolved_fps: set[str] = set(file_to_doc.keys())
+
+    for line in raw.split("\n"):
+        if not line or line == "--":
+            continue
+
+        # 找出匹配哪个已知文件路径
+        matched_fp = None
+        for fp in resolved_fps:
+            if line.startswith(fp):
+                matched_fp = fp
+                break
+
+        if matched_fp is None:
+            continue
+
+        suffix = line[len(matched_fp):]
+        if not suffix:
+            continue
+
+        # 分隔符可以是 :（匹配行）或 -（上下文行）
+        sep = suffix[0]
+        if sep not in (":", "-"):
+            continue
+        rest = suffix[1:]
+
+        # 提取行号和内容
+        # 格式: line_num:text 或 line_num-text
+        line_match = re.match(r"^(\d+)[:\-](.*)", rest)
+        if not line_match:
+            continue
+
+        is_match_line = sep == ":"
+        text = line_match.group(2).strip()
+
+        kb_id, doc_id = file_to_doc[matched_fp]
+
+        # 已有该 doc_id 的条目：仅当当前是匹配行且之前是上下文行时替换
+        if doc_id in doc_best:
+            prev = doc_best[doc_id]
+            if is_match_line and not prev.get("is_match_line"):
+                doc_best[doc_id] = {
+                    "doc_id": doc_id,
+                    "kb_id": kb_id,
+                    "page_number": None,
+                    "content": text[:500],
+                    "is_match_line": True,
+                }
+            continue
+
+        doc_best[doc_id] = {
+            "doc_id": doc_id,
+            "kb_id": kb_id,
+            "page_number": None,
+            "content": text[:500],
+            "is_match_line": is_match_line,
+        }
+
+    # 从 doc_best 转成 hits，只保留对外字段
+    for entry in doc_best.values():
+        hits.append({
+            "doc_id": entry["doc_id"],
+            "kb_id": entry["kb_id"],
+            "page_number": entry["page_number"],
+            "content": entry["content"],
+        })
+
+    return hits[:5]
