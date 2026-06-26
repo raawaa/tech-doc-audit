@@ -7,6 +7,7 @@ import { AuditResult } from './pages/AuditResult'
 import { KnowledgeBases } from './pages/KnowledgeBases'
 import { KnowledgeBaseDetail } from './pages/KnowledgeBaseDetail'
 import { QA } from './pages/QA'
+import { PdfViewer } from './pages/PdfViewer'
 
 export default function App() {
   return (
@@ -24,6 +25,7 @@ export default function App() {
             <Route path="/knowledge-bases" element={<KnowledgeBases />} />
             <Route path="/knowledge-bases/:id" element={<KnowledgeBaseDetail />} />
             <Route path="/qa" element={<QA />} />
+            <Route path="/pdf-viewer/:docId" element={<PdfViewer />} />
           </Routes>
         </div>
         </main>

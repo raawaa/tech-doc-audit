@@ -25,8 +25,16 @@ export function KnowledgeBaseDetail() {
     queryKey: ['kb-docs', id],
     queryFn: () => kbApi.documents.list(id!),
     enabled: !!id,
-    // 索引进行中时轮询文档状态（pending_index → ready/failed）
-    refetchInterval: kb?.index_status === 'building' ? 2000 : false,
+    // 当 KB 正在构建 或 有文档处于 pending_index / indexing 状态时持续轮询
+    refetchInterval: (query) => {
+      if (kb?.index_status === 'building') return 2000
+      // KB 已 ready 但还有文档卡在中间状态
+      const docs = query.state.data
+      if (docs && docs.some((d: any) => d.index_status === 'pending_index' || d.index_status === 'indexing')) {
+        return 2000
+      }
+      return false
+    },
   })
 
   const importDoc = useMutation({
@@ -49,7 +57,13 @@ export function KnowledgeBaseDetail() {
 
   const reindex = useMutation({
     mutationFn: () => kbApi.reindex(id!),
-    // 成功后由 refetchInterval 轮询自动获取进度，无需手动 invalidate
+    onSuccess: () => {
+      toast.success('索引重建已启动', { description: '正在后台重建，请稍候…' })
+      // 手动 invalidate 触发立即刷新（而非等下一个轮询周期）
+      qc.invalidateQueries({ queryKey: ['kb', id] })
+      qc.invalidateQueries({ queryKey: ['kb-docs', id] })
+    },
+    onError: (err) => toast.error('重建索引失败：' + (err as Error).message),
   })
 
   const handleFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -79,9 +93,13 @@ export function KnowledgeBaseDetail() {
 
       <Card>
         <CardHeader title="基本信息" action={
-          <button className="btn-secondary btn-sm" onClick={() => reindex.mutate()} disabled={kb.index_status === 'building'}>
-            <RefreshCw className={`w-3.5 h-3.5 ${kb.index_status === 'building' ? 'animate-spin' : ''}`} />
-            {kb.index_status === 'building' ? '索引中…' : '重建索引'}
+          <button
+            className="btn-secondary btn-sm"
+            onClick={() => reindex.mutate()}
+            disabled={kb.index_status === 'building' || reindex.isPending}
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${(kb.index_status === 'building' || reindex.isPending) ? 'animate-spin' : ''}`} />
+            {kb.index_status === 'building' ? '索引中…' : reindex.isPending ? '启动中…' : '重建索引'}
           </button>
         } />
         <CardBody>

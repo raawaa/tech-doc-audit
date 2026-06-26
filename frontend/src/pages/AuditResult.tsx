@@ -202,7 +202,23 @@ export function AuditResult() {
                       {/* 标准依据 + 建议 */}
                       {(issue.standard_name || issue.suggestion) && (
                         <div className="mt-2 text-xs text-slate-500 bg-blue-50/40 rounded-md p-2.5 border border-blue-100/60">
-                          {issue.standard_name && <p><span className="font-medium text-slate-600">依据：</span>{issue.standard_name}{issue.standard_clause ? ` ${issue.standard_clause}` : ''}</p>}
+                          {issue.standard_name && (
+                            <p>
+                              <span className="font-medium text-slate-600">依据：</span>
+                              {issue.standard_doc_id ? (
+                                <a
+                                  href={`/pdf-viewer/${issue.standard_doc_id}?page=${issue.standard_page_number ?? ''}&clause=${encodeURIComponent(issue.standard_clause || '')}&highlight=${encodeURIComponent(issue.standard_chunk_text || '')}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-blue-600 hover:underline cursor-pointer"
+                                >
+                                  📄 {issue.standard_name}{issue.standard_clause ? ` § ${issue.standard_clause}` : ''}
+                                </a>
+                              ) : (
+                                <span>{issue.standard_name}{issue.standard_clause ? ` § ${issue.standard_clause}` : ''}</span>
+                              )}
+                            </p>
+                          )}
                           {issue.suggestion && <p className="mt-1"><span className="font-medium text-slate-600">建议：</span>{issue.suggestion}</p>}
                         </div>
                       )}

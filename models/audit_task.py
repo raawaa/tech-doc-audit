@@ -21,6 +21,10 @@ class StandardRef(BaseModel):
     standard_id: str
     clause: Optional[str] = None
     requirement: Optional[str] = None
+    # PDF 跳转溯源
+    doc_id: Optional[str] = None          # KB 文档 ID，定位文件
+    page_number: Optional[int] = None     # 条款所在页码 (1-based)
+    chunk_text: Optional[str] = None      # chunk 原文片段，用于 PDF 高亮搜索
 
 
 class AuditIssue(BaseModel):

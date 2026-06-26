@@ -78,6 +78,10 @@ export interface AuditIssue {
   suggestion?: string
   cited_excerpt?: string
   document_position?: string
+  standard_doc_id?: string
+  standard_page_number?: number
+  standard_chunk_text?: string
+  standard_file_type?: string
 }
 
 export interface AuditResult {
@@ -106,6 +110,9 @@ export interface AuditEventIssue {
   description: string
   standard_name?: string
   standard_clause?: string
+  standard_doc_id?: string
+  standard_page_number?: number
+  standard_chunk_text?: string
 }
 
 export type AuditEvent =

@@ -184,6 +184,29 @@ class AgentAction(BaseModel):
         ),
     )
 
+    # — flag_issue 溯源参数 —
+    standard_doc_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "flag_issue: 标准文档的 ID，必须来自 search_kb 返回结果中的 doc_id 字段。"
+            "可选，但强烈建议提供——使审核结果可跳转到标准 PDF 原文。"
+        ),
+    )
+    standard_page_number: Optional[int] = Field(
+        default=None,
+        description=(
+            "flag_issue: 标准条款所在页码，来自 search_kb 返回结果中的页码字段。"
+            "从1开始计数。可选。"
+        ),
+    )
+    standard_chunk_text: Optional[str] = Field(
+        default=None,
+        description=(
+            "flag_issue: 标准条款的原文片段，来自 search_kb 返回的内容。"
+            "可选，用于在 PDF 中高亮定位。"
+        ),
+    )
+
     # — finish 参数 —
     final_summary: Optional[str] = Field(
         default=None,

@@ -53,6 +53,14 @@ class IssueResponse(BaseModel):
     standard_name: str | None
     standard_clause: str | None
     suggestion: str | None
+    # 补齐 ——
+    cited_excerpt: str | None = None
+    document_position: str | None = None
+    # PDF 跳转溯源 ——
+    standard_doc_id: str | None = None
+    standard_page_number: int | None = None
+    standard_chunk_text: str | None = None
+    standard_file_type: str | None = None
 
 
 class ResultResponse(BaseModel):
@@ -134,19 +142,33 @@ def get_audit_result(task_id: str):
     if not result:
         raise HTTPException(status_code=404, detail="结果不存在")
 
-    issues = [
-        IssueResponse(
+    issues = []
+    for issue in result.issues:
+        std_ref = issue.standard_reference
+        # 根据 doc_id 查询 file_type
+        file_type = None
+        if std_ref and std_ref.doc_id:
+            import storage.doc_repo as _doc_repo
+            doc = _doc_repo.find_doc_by_id(std_ref.doc_id)
+            if doc:
+                file_type = doc.file_type
+
+        issues.append(IssueResponse(
             id=issue.id,
             type=issue.type,
             clause_number=issue.location.clause_number,
             description=issue.description,
             severity=issue.severity,
-            standard_name=issue.standard_reference.standard_name if issue.standard_reference else None,
-            standard_clause=issue.standard_reference.clause if issue.standard_reference else None,
+            standard_name=std_ref.standard_name if std_ref else None,
+            standard_clause=std_ref.clause if std_ref else None,
             suggestion=issue.suggestion,
-        )
-        for issue in result.issues
-    ]
+            cited_excerpt=issue.cited_excerpt or None,
+            document_position=issue.document_position or None,
+            standard_doc_id=std_ref.doc_id if std_ref else None,
+            standard_page_number=std_ref.page_number if std_ref else None,
+            standard_chunk_text=std_ref.chunk_text if std_ref else None,
+            standard_file_type=file_type,
+        ))
 
     return ResultResponse(
         task_id=result.task_id,
@@ -225,7 +247,7 @@ async def stream_audit_progress(task_id: str):
         def read_from_log():
             event_index = 0
             last_check = time.time()
-            for _ in range(300):
+            for _ in range(600):  # 300s 超时，为 LLM 提取和 KB 搜索留足时间
                 new_events, event_index = get_task_events_since(task_id, event_index)
                 for evt in new_events:
                     event_queue.put(evt)

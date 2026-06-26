@@ -39,6 +39,10 @@ function formatToolArgs(tool: string, args: Record<string, unknown>): string {
 }
 
 function IssueCard({ issue }: { issue: AuditEventIssue }) {
+  const pdfUrl = issue.standard_doc_id
+    ? `/pdf-viewer/${issue.standard_doc_id}?page=${issue.standard_page_number ?? ''}&clause=${encodeURIComponent(issue.standard_clause || '')}&highlight=${encodeURIComponent(issue.standard_chunk_text || '')}`
+    : null
+
   return (
     <div className={`mt-1 px-3 py-2 rounded-md border text-sm ${severityColors[issue.severity] || severityColors.medium}`}>
       <div className="flex items-center gap-2">
@@ -51,7 +55,15 @@ function IssueCard({ issue }: { issue: AuditEventIssue }) {
       <p className="mt-1 leading-relaxed">{issue.description}</p>
       {(issue.standard_name || issue.standard_clause) && (
         <p className="mt-0.5 text-xs opacity-70">
-          依据: {issue.standard_name}{issue.standard_clause ? ` ${issue.standard_clause}` : ''}
+          依据:{' '}
+          {pdfUrl ? (
+            <a href={pdfUrl} target="_blank" rel="noopener noreferrer"
+              className="text-blue-500 hover:underline cursor-pointer">
+              📄 {issue.standard_name}{issue.standard_clause ? ` § ${issue.standard_clause}` : ''}
+            </a>
+          ) : (
+            <span>{issue.standard_name}{issue.standard_clause ? ` § ${issue.standard_clause}` : ''}</span>
+          )}
         </p>
       )}
     </div>
@@ -68,20 +80,33 @@ export function AuditStream({ taskId, docId }: Props) {
 
   const retryCount = useRef(0)
   const hasErrored = useRef(false)
+  const instanceRef = useRef(0)
   const MAX_RETRIES = 5
 
   useEffect(() => {
+    // 每次 effect 执行时递增 instance，用于忽略旧 EventSource 实例的事件
+    // 解决 React StrictMode 双重挂载时，旧实例的 close() 触发 onerror
+    // 污染新实例状态（retryCount 泄露 → 超过 MAX_RETRIES → 永久断连）
+    instanceRef.current += 1
+    const currentInstance = instanceRef.current
+
+    // 新实例创建时重置错误状态
+    hasErrored.current = false
+    retryCount.current = 0
+
     const baseUrl = import.meta.env.VITE_API_BASE_URL || ''
     const url = `${baseUrl}/api/v1/audit-tasks/${taskId}/stream`
     const es = new EventSource(url)
 
     es.onopen = () => {
+      if (currentInstance !== instanceRef.current) return
       setConnected(true)
       hasErrored.current = false
       retryCount.current = 0
     }
 
     es.onmessage = (e) => {
+      if (currentInstance !== instanceRef.current) return
       try {
         const event: AuditEvent = JSON.parse(e.data)
         setEvents((prev) => [...prev, event])
@@ -94,6 +119,7 @@ export function AuditStream({ taskId, docId }: Props) {
     }
 
     es.onerror = () => {
+      if (currentInstance !== instanceRef.current) return
       setConnected(false)
       hasErrored.current = true
       retryCount.current += 1
