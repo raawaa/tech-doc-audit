@@ -37,6 +37,7 @@ export function PdfViewer() {
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const [renderedPages, setRenderedPages] = useState(0)
   void renderedPages
+  const highlightAppliedRef = useRef('')
 
   const apiBase = import.meta.env.VITE_API_BASE_URL || ''
   const pdfUrl = meta?.file_type === 'pdf' ? `${apiBase}/api/v1/kb-documents/${docId}/file` : null
@@ -89,6 +90,7 @@ export function PdfViewer() {
     setRenderedPages(0)
     setAllPagesRendered(false)
     pageRefs.current.clear()
+    highlightAppliedRef.current = ''
   }, [numPages])
 
   // 文本降级模式（DOCX/MD）
@@ -108,6 +110,8 @@ export function PdfViewer() {
   // 高亮搜索与自动定位
   useEffect(() => {
     if (!pdfDoc || !highlight || !allPagesRendered) return
+    if (highlight === highlightAppliedRef.current) return
+    highlightAppliedRef.current = highlight
 
     const doc = pdfDoc
     const searchTerms = highlight.split(/\s+/).filter(t => t.length > 1)
