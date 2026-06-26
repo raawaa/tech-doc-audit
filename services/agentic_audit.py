@@ -110,6 +110,8 @@ search_kb（语义向量搜索）vs search_kb_text（精确文本搜索）的选
 - document_position 必须使用文档中的实际章节名称，不要使用编号
 - description 清晰说明问题和标准依据
 - 建议同时提供 suggestion（修改建议）
+- 建议提供 standard_doc_id、standard_page_number、standard_chunk_text（来自 search_kb 返回结果），
+  用于在审核报告中生成可点击跳转到标准 PDF 原文的链接
 
 ## 注意事项
 - 每次只执行一个操作（一个 action）
@@ -294,8 +296,10 @@ def _tool_search_kb(kb_ids: list[str], query: str, top_k: int = 5) -> str:
     for i, r in enumerate(results, 1):
         relevance = r.get("relevance", 0)
         doc = r.get("doc_source", "") or r.get("doc_id", "")
+        doc_id = r.get("doc_id", "")
         clause = r.get("clause_number", "")
         section = r.get("section_path", "")
+        page_number = r.get("page_number")  # 0-based from metadata
         content = (r.get("content", "") or "")
 
         label_parts = []
@@ -307,7 +311,14 @@ def _tool_search_kb(kb_ids: list[str], query: str, top_k: int = 5) -> str:
             label_parts.append(section)
         label = " ".join(label_parts) if label_parts else "未知来源"
 
-        lines.append(f"\n{i}. {label} (相关度: {relevance:.2f})\n   {content}")
+        meta_parts = [f"相关度: {relevance:.2f}"]
+        if doc_id:
+            meta_parts.append(f"doc_id: {doc_id}")
+        if page_number is not None:
+            meta_parts.append(f"页码: 第{page_number + 1}页")  # 0-based → 1-based display
+        meta_line = " | ".join(meta_parts)
+
+        lines.append(f"\n{i}. {label}\n   {meta_line}\n   {content}")
     return "\n".join(lines)
 
 
@@ -363,6 +374,9 @@ def _tool_flag_issue(action: AgentAction, issues: list[AuditIssue]) -> str:
             standard_id=action.standard_name or "",
             clause=action.standard_clause,
             requirement=action.standard_requirement,
+            doc_id=action.standard_doc_id,
+            page_number=action.standard_page_number,
+            chunk_text=action.standard_chunk_text,
         ),
         cited_excerpt=action.cited_excerpt or "",
         document_position=action.document_position or "",
@@ -764,6 +778,27 @@ _TOOLS_SPEC = [
                             "示例：'将防护等级从IP54修改为不低于IP65，以满足GB 4208-2008室外设备要求。'"
                         ),
                     },
+                    "standard_doc_id": {
+                        "type": "string",
+                        "description": (
+                            "标准文档的 ID，从 search_kb 返回结果的 doc_id 字段获取。"
+                            "可选，但强烈建议提供——使审核结果可跳转到标准 PDF 原文。"
+                        ),
+                    },
+                    "standard_page_number": {
+                        "type": "integer",
+                        "description": (
+                            "标准条款所在页码，从 search_kb 返回结果的页码字段获取。"
+                            "从1开始计数。可选。"
+                        ),
+                    },
+                    "standard_chunk_text": {
+                        "type": "string",
+                        "description": (
+                            "标准条款的原文片段，从 search_kb 返回的内容中摘录。"
+                            "可选，用于在 PDF 中高亮定位。"
+                        ),
+                    },
                 },
                 "required": ["issue_type", "severity", "description", "cited_excerpt"],
             },
@@ -800,6 +835,8 @@ NATIVE_SYSTEM_PROMPT = """你是一个严格的技术文档审核专家。你的
 - standard_name 和 standard_clause 必须来自搜索工具的返回结果
 - document_position 必须使用文档中的实际章节名称，不要使用编号
 - description 清晰说明问题和标准依据
+- 建议提供 standard_doc_id、standard_page_number、standard_chunk_text
+  来自搜索工具返回结果中的 doc_id、页码、内容字段
 
 ## 注意事项
 - compliance 类型问题必须先搜索到相关标准才能调用 flag_issue
@@ -844,6 +881,9 @@ def _execute_native_tool(
             cited_excerpt=args.get("cited_excerpt"),
             document_position=args.get("document_position"),
             issue_suggestion=args.get("suggestion"),
+            standard_doc_id=args.get("standard_doc_id"),
+            standard_page_number=args.get("standard_page_number"),
+            standard_chunk_text=args.get("standard_chunk_text"),
         )
         return _tool_flag_issue(action, issues)
     return (
@@ -1020,6 +1060,9 @@ def _run_native_tool_calling(
                         "description": new_issue.description[:300],
                         "standard_name": new_issue.standard_reference.standard_name if new_issue.standard_reference else None,
                         "standard_clause": new_issue.standard_reference.clause if new_issue.standard_reference else None,
+                        "standard_doc_id": new_issue.standard_reference.doc_id if new_issue.standard_reference else None,
+                        "standard_page_number": new_issue.standard_reference.page_number if new_issue.standard_reference else None,
+                        "standard_chunk_text": new_issue.standard_reference.chunk_text if new_issue.standard_reference else None,
                     },
                 })
                 issue_count_before = len(issues)
@@ -1201,6 +1244,9 @@ def _run_structured_llm_loop(
                         "description": new_issue.description[:300],
                         "standard_name": new_issue.standard_reference.standard_name if new_issue.standard_reference else None,
                         "standard_clause": new_issue.standard_reference.clause if new_issue.standard_reference else None,
+                        "standard_doc_id": new_issue.standard_reference.doc_id if new_issue.standard_reference else None,
+                        "standard_page_number": new_issue.standard_reference.page_number if new_issue.standard_reference else None,
+                        "standard_chunk_text": new_issue.standard_reference.chunk_text if new_issue.standard_reference else None,
                     },
                 })
                 issue_count_before = len(issues)
