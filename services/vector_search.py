@@ -169,16 +169,18 @@ def vec_search(kb_ids: list[str], query: str, top_k: int = 5, rebuild_if_missing
 # ── 文档索引管理（公开 API）───────────────────────────────────────────────
 
 
-def index_document(kb_id: str, doc_id: str, file_path: str, source_name: str = ""):
+def index_document(kb_id: str, doc_id: str, file_path: str, source_name: str = "",
+                   page_texts: list[str] | None = None):
     """对单篇 KB 文档分块 + embedding 并写入 FAISS 索引。
 
     source_name: 来源标签，为空时自动从文件名提取。
+    page_texts: 逐页文本列表（page_texts[0] = 第1页），用于按页创建 chunk 以保留页码信息。
     """
     text = _extract_text(file_path)
     if not text or len(text) < 20:
         return
     source_name = source_name or Path(file_path).stem
-    _index_to_store(kb_id, doc_id, text, source_name)
+    _index_to_store(kb_id, doc_id, text, source_name, page_texts=page_texts)
 
 
 def remove_document_index(kb_id: str, doc_id: str):
