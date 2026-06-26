@@ -57,7 +57,7 @@ def _run_rga(keyword: str, paths: list[str]) -> str:
     if rga_bin:
         try:
             result = subprocess.run(
-                [rga_bin, "-i", "--no-ignore", "--hidden", "-m", "15", "-C", "2", keyword, *paths],
+                [rga_bin, "-i", "--no-ignore", "--hidden", "-n", "-m", "15", "-C", "2", keyword, *paths],
                 capture_output=True, text=True, timeout=30,
             )
             if result.stdout.strip():
@@ -293,7 +293,6 @@ def search_doc_by_text(keyword: str, kb_ids: list[str]) -> list[dict]:
     # 改为：用已知文件路径列表来匹配行首
     # 优先使用匹配行（:分隔符），无匹配行时才用上下文行
     hits: list[dict] = []
-    seen_doc_ids: set[str] = set()
     # doc_id -> best_content，优先存匹配行的内容
     doc_best: dict[str, dict] = {}
 

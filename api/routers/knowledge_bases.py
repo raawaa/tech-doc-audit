@@ -6,8 +6,52 @@ from typing import Literal
 
 import services.kb_service as kb_svc
 import storage.doc_repo as doc_repo
+from core.logger import get_logger
+
+_logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/knowledge-bases", tags=["knowledge-bases"])
+
+
+def _get_actually_indexed_doc_ids(kb_id: str) -> set[str]:
+    """读取 FAISS docstore，返回实际已索引的 doc_id 集合。
+
+    用于 rebuild 后验证哪些文档成功进入了向量索引。
+    不依赖内存中的 index_cache（rebuild 后缓存可能已失效）。
+
+    兼容两种 docstore 格式：
+    1. 新格式（rebuild 产物）：docstore/data → 每个节点 metadata.doc_id
+    2. 旧格式（增量索引）：docstore/ref_doc_info → {doc_id: {node_ids: [...]}}
+    """
+    from pathlib import Path
+    import json as _json
+    import os as _os
+
+    vectors_dir = Path(_os.environ.get("AUDIT_DATA_DIR", "data")) / "kbs" / kb_id / "vectors"
+    docstore_path = vectors_dir / "docstore.json"
+    if not docstore_path.exists():
+        return set()
+    try:
+        docstore = _json.loads(docstore_path.read_text(encoding="utf-8"))
+
+        # 格式1（新）：docstore/data — 每个节点存储 metadata.doc_id
+        data = docstore.get("docstore/data", {})
+        if data:
+            doc_ids = set()
+            for node_data in data.values():
+                meta = node_data.get("__data__", {}).get("metadata", {})
+                doc_id = meta.get("doc_id", "")
+                if doc_id:
+                    doc_ids.add(doc_id)
+            if doc_ids:
+                return doc_ids
+
+        # 格式2（旧）：docstore/ref_doc_info
+        ref_info = docstore.get("docstore/ref_doc_info", {})
+        return set(ref_info.keys())
+    except Exception as e:
+        _logger.warning("failed to read docstore for kb %s: %s", kb_id, e)
+        return set()
 
 
 class CreateKBRequest(BaseModel):
@@ -110,11 +154,17 @@ def reindex_kb(kb_id: str):
     if kb.index_status == "building":
         raise HTTPException(status_code=409, detail="索引正在重建中")
 
-    # 标记为 building
+    # 标记为 building，所有文档标记为 pending_index
     kb.index_status = "building"
     kb.index_progress = 0.0
     kb.index_current_doc = ""
     kb_svc.update_kb(kb)
+
+    # 将所有关联文档的状态重置为 pending_index，表示正在等待重建
+    all_docs = doc_repo.list_docs(kb_id)
+    for doc in all_docs:
+        doc.index_status = "pending_index"
+        doc_repo._save_doc_meta(doc)
 
     def _on_progress(current: int, total: int, doc_name: str):
         """每索引完一篇文档的回调，更新 KB 状态供前端轮询。"""
@@ -127,13 +177,33 @@ def reindex_kb(kb_id: str):
         import services.vector_search as vs
         try:
             vs.rebuild_kb_index(kb_id, progress_callback=_on_progress)
-            # 重建完成
+
+            # 重建完成后，检查实际索引结果并更新各文档状态
+            # （rebuild_kb_index 内部可能因节点不匹配等原因跳过某些文档，
+            #   所以需要核实 FAISS 索引中实际包含哪些文档）
+            indexed_doc_ids = _get_actually_indexed_doc_ids(kb_id)
+            for doc in all_docs:
+                if doc.id in indexed_doc_ids:
+                    doc.index_status = "ready"
+                else:
+                    doc.index_status = "failed"
+                    _logger.warning(
+                        "reindex: doc %s (%s) not found in FAISS index after rebuild, marked as failed",
+                        doc.id, doc.original_name,
+                    )
+                doc_repo._save_doc_meta(doc)
+
             kb.index_status = "ready"
             kb.index_progress = 1.0
             kb.index_current_doc = ""
         except Exception as e:
             kb.index_status = "failed"
             kb.index_current_doc = f"错误: {e}"
+            # 将仍在 pending_index 的文档标记为 failed
+            for doc in all_docs:
+                if doc.index_status == "pending_index":
+                    doc.index_status = "failed"
+                    doc_repo._save_doc_meta(doc)
         kb_svc.update_kb(kb)
 
     import threading

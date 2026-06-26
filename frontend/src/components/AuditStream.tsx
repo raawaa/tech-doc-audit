@@ -80,20 +80,33 @@ export function AuditStream({ taskId, docId }: Props) {
 
   const retryCount = useRef(0)
   const hasErrored = useRef(false)
+  const instanceRef = useRef(0)
   const MAX_RETRIES = 5
 
   useEffect(() => {
+    // 每次 effect 执行时递增 instance，用于忽略旧 EventSource 实例的事件
+    // 解决 React StrictMode 双重挂载时，旧实例的 close() 触发 onerror
+    // 污染新实例状态（retryCount 泄露 → 超过 MAX_RETRIES → 永久断连）
+    instanceRef.current += 1
+    const currentInstance = instanceRef.current
+
+    // 新实例创建时重置错误状态
+    hasErrored.current = false
+    retryCount.current = 0
+
     const baseUrl = import.meta.env.VITE_API_BASE_URL || ''
     const url = `${baseUrl}/api/v1/audit-tasks/${taskId}/stream`
     const es = new EventSource(url)
 
     es.onopen = () => {
+      if (currentInstance !== instanceRef.current) return
       setConnected(true)
       hasErrored.current = false
       retryCount.current = 0
     }
 
     es.onmessage = (e) => {
+      if (currentInstance !== instanceRef.current) return
       try {
         const event: AuditEvent = JSON.parse(e.data)
         setEvents((prev) => [...prev, event])
@@ -106,6 +119,7 @@ export function AuditStream({ taskId, docId }: Props) {
     }
 
     es.onerror = () => {
+      if (currentInstance !== instanceRef.current) return
       setConnected(false)
       hasErrored.current = true
       retryCount.current += 1

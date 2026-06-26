@@ -208,6 +208,23 @@ def batch_import_documents(
         doc = doc_repo.save_doc(kb_id, original_name, content, file_type)
         doc.content_hash = file_hash
         doc.index_status = "pending_index"
+
+        # 提取 PDF 页数（与 import_document 路径保持一致）
+        if file_type == "pdf":
+            try:
+                import tempfile
+                from core.text_extraction import extract_text_by_page
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                    tmp.write(content)
+                    tmp_path = tmp.name
+                with pdfplumber.open(tmp_path) as pdf:
+                    doc.page_count = len(pdf.pages)
+                page_texts = extract_text_by_page(tmp_path)
+                doc.metadata["page_texts"] = [text for _, text in page_texts]
+                os.unlink(tmp_path)
+            except Exception as e:
+                _logger.warning("batch import: failed to extract page data for %s: %s", doc.id, e)
+
         doc_repo._save_doc_meta(doc)
         docs.append(doc)
 
