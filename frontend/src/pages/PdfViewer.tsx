@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { Loader2 } from 'lucide-react'
-import { pdfjs } from 'react-pdf'
+import { Document, Page, pdfjs } from 'react-pdf'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
 import * as pdfjsLib from 'pdfjs-dist'
@@ -28,10 +28,17 @@ export function PdfViewer() {
   const [meta, setMeta] = useState<DocMeta | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [numPages, setNumPages] = useState(0)
   const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null)
-  const canvasRef = useRef<HTMLCanvasElement>(null)
   const [currentPage, setCurrentPage] = useState(targetPage)
-  const [totalPages, setTotalPages] = useState(0)
+  const [totalPages] = useState(0)
+  const [allPagesRendered, setAllPagesRendered] = useState(false)
+  const pageRefs = useRef<Map<number, HTMLCanvasElement>>(new Map())
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const [renderedPages, setRenderedPages] = useState(0)
+
+  const apiBase = import.meta.env.VITE_API_BASE_URL || ''
+  const pdfUrl = meta?.file_type === 'pdf' ? `${apiBase}/api/v1/kb-documents/${docId}/file` : null
 
   // 获取文档元数据
   useEffect(() => {
@@ -43,7 +50,7 @@ export function PdfViewer() {
       .finally(() => setLoading(false))
   }, [docId])
 
-  // 加载 PDF
+  // 并行加载 PDF 文档用于文本搜索（浏览器缓存确保只下载一次）
   useEffect(() => {
     if (!meta || meta.file_type !== 'pdf') return
     const apiBase = import.meta.env.VITE_API_BASE_URL || ''
@@ -55,46 +62,33 @@ export function PdfViewer() {
       wasmUrl: '/pdfjs/wasm/',
     }).promise.then(doc => {
       setPdfDoc(doc)
-      setTotalPages(doc.numPages)
     }).catch(e => setError(`PDF 加载失败: ${e.message}`))
   }, [meta, docId])
 
-  // 渲染当前页 + 高亮
-  useEffect(() => {
-    if (!pdfDoc || !canvasRef.current) return
-    const pageNum = Math.min(Math.max(currentPage, 1), totalPages)
-    pdfDoc.getPage(pageNum).then(page => {
-      const canvas = canvasRef.current!
-      const viewport = page.getViewport({ scale: 1.5 })
-      canvas.height = viewport.height
-      canvas.width = viewport.width
-      const ctx = canvas.getContext('2d')!
-      page.render({ canvas, viewport }).promise.then(() => {
-        if (!highlight || canvas.width === 0) return
-        // 搜索并高亮文本
-        page.getTextContent().then(textContent => {
-          const searchTerms = highlight.split(/\s+/).filter(t => t.length > 1)
-          if (searchTerms.length === 0) return
-          const scale = 1.5
-          for (const item of textContent.items) {
-            const textItem = item as { str: string; transform: number[] }
-            const str = textItem.str || ''
-            for (const term of searchTerms) {
-              if (str.includes(term)) {
-                const tx = textItem.transform
-                const x = tx[4] * scale
-                const y = canvas.height - tx[5] * scale
-                const w = (str.length * (tx[0] || 8)) * scale * 0.6
-                const h = 14
-                ctx.fillStyle = 'rgba(255, 255, 0, 0.4)'
-                ctx.fillRect(x - 1, y - h, w + 2, h + 4)
-              }
-            }
-          }
-        })
-      })
+  // 追踪 react-pdf 总页数
+  function handleDocumentLoadSuccess({ numPages: total }: { numPages: number }) {
+    setNumPages(total)
+  }
+
+  // 追踪页面渲染完成
+  const handlePageRenderSuccess = useCallback((_pageNumber: number) => {
+    setRenderedPages(prev => {
+      const next = prev + 1
+      // 当所有页面渲染完成时标记
+      if (next >= numPages) {
+        // 使用 setTimeout 确保状态更新完成
+        setTimeout(() => setAllPagesRendered(true), 100)
+      }
+      return next
     })
-  }, [pdfDoc, currentPage, highlight, totalPages])
+  }, [numPages])
+
+  // 重置渲染计数器（PDF 文档变化时）
+  useEffect(() => {
+    setRenderedPages(0)
+    setAllPagesRendered(false)
+    pageRefs.current.clear()
+  }, [numPages])
 
   // 文本降级模式（DOCX/MD）
   const [textContent, setTextContent] = useState('')
@@ -113,6 +107,10 @@ export function PdfViewer() {
   if (loading) return <div className="flex justify-center py-20"><Loader2 className="w-6 h-6 animate-spin text-slate-400" /></div>
   if (error) return <div className="text-center py-20 text-red-500">{error}</div>
   if (!meta) return <div className="text-center py-20 text-slate-500">文档不存在</div>
+
+  // Suppress TS6133 — consumed in Task 4 (search/highlight)
+  void allPagesRendered
+  void renderedPages
 
   return (
     <div className="min-h-screen bg-slate-100">
@@ -140,19 +138,55 @@ export function PdfViewer() {
       </div>
 
       {/* Content */}
-      <div className="flex justify-center py-6">
+      <div
+        ref={scrollContainerRef}
+        className="flex-1 overflow-auto"
+        style={{ height: 'calc(100vh - 57px)' }}
+      >
         {meta.file_type === 'pdf' ? (
-          <div className="bg-white shadow-lg rounded">
-            <canvas ref={canvasRef} className="max-w-full" />
+          <div className="flex flex-col items-center py-6 gap-4">
+            {pdfUrl && (
+              <Document
+                file={pdfUrl}
+                onLoadSuccess={handleDocumentLoadSuccess}
+                loading={
+                  <div className="flex justify-center py-20">
+                    <Loader2 className="w-6 h-6 animate-spin text-slate-400" />
+                  </div>
+                }
+                error={
+                  <div className="text-center py-20 text-red-500">
+                    PDF 加载失败，请刷新重试
+                  </div>
+                }
+              >
+                {Array.from(new Array(numPages), (_, index) => (
+                  <Page
+                    key={`page_${index + 1}`}
+                    pageNumber={index + 1}
+                    canvasRef={(ref: HTMLCanvasElement) => {
+                      if (ref) {
+                        pageRefs.current.set(index + 1, ref)
+                      }
+                    }}
+                    onRenderSuccess={() => handlePageRenderSuccess(index + 1)}
+                    renderTextLayer={false}
+                    className="bg-white shadow-lg rounded"
+                  />
+                ))}
+              </Document>
+            )}
           </div>
         ) : (
-          <div className="bg-white shadow-lg rounded p-8 max-w-3xl w-full">
-            <pre className="text-sm text-slate-700 whitespace-pre-wrap font-sans leading-relaxed">
-              {textContent || '（该页无文本内容）'}
-            </pre>
-            {textTotalPages > 0 && (
-              <p className="text-xs text-slate-400 mt-4">第 {targetPage} / {textTotalPages} 页</p>
-            )}
+          <div className="flex justify-center py-6">
+            <div className="bg-white shadow-lg rounded p-8 max-w-3xl w-full">
+              <pre className="text-sm text-slate-700 whitespace-pre-wrap font-sans leading-relaxed">
+                {textContent || '（该页无文本内容）'}
+              </pre>
+              {textTotalPages > 0 && (
+                <p className="text-xs text-slate-400 mt-4">第 {targetPage} / {textTotalPages} 页</p>
+              )}
+            </div>
           </div>
         )}
       </div>
