@@ -102,6 +102,37 @@ def extract_text(file_path: str) -> str:
         return ""
 
 
+def extract_text_by_page(file_path: str) -> list[tuple[int, str]]:
+    """逐页提取 PDF 文本，返回 [(页码_0based, 文本), ...]。
+
+    PDF 文件用 pdfplumber 逐页提取，保留页边界。
+    非 PDF 文件整个文本作为单页（页码 0）返回。
+    提取失败时返回 [(0, "")]。
+
+    注意：只使用 pdfplumber 路径（PaddleOCR/MinerU 无法提供页级粒度）。
+    """
+    ext = Path(file_path).suffix.lower()
+
+    if ext == '.pdf':
+        try:
+            import pdfplumber
+            pages: list[tuple[int, str]] = []
+            with pdfplumber.open(file_path) as pdf:
+                for i, page in enumerate(pdf.pages):
+                    text = page.extract_text() or ""
+                    if text.strip():
+                        pages.append((i, text))
+            if not pages:
+                return [(0, "")]
+            return pages
+        except Exception:
+            pass
+
+    # 非 PDF 或 PDF 提取失败：整个文本作为单页
+    full_text = extract_text(file_path)
+    return [(0, full_text)] if full_text else []
+
+
 def _extract_with_paddleocr(file_path: str) -> str:
     """用 PaddleOCR-VL-1.6 在线 API 解析 PDF。
 
