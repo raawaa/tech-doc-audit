@@ -127,11 +127,13 @@ export function PdfViewer() {
     const searchTerms = highlight.split(/\s+/).filter(t => t.length > 1)
     if (searchTerms.length === 0) return
 
+    let cancelled = false
     let firstHighlightedPage: number | null = null
 
     // 逐页搜索文本
     async function searchAndHighlight() {
       for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+        if (cancelled) return
         try {
           const page = await doc.getPage(pageNum)
           const textContent = await page.getTextContent()
@@ -181,6 +183,7 @@ export function PdfViewer() {
     }
 
     searchAndHighlight()
+    return () => { cancelled = true }
   }, [pdfDoc, highlight, numPages, allPagesRendered])
 
   if (loading) return <div className="flex justify-center py-20"><Loader2 className="w-6 h-6 animate-spin text-slate-400" /></div>
