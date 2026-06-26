@@ -722,6 +722,161 @@ def _extract_standard_info(issues: list[AuditIssue]) -> dict[int, dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 标准关联
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _search_and_link_standards(
+    issues: list[AuditIssue],
+    kb_ids: list[str],
+    extracted: dict[int, dict],
+) -> None:
+    """搜索知识库并回填 standard_doc_id 等字段。
+
+    搜索策略（按优先级）：
+    1. 精确文本搜索（rga）— 标准编号
+    2. 向量语义搜索 — 标准编号 + 标准名称
+    3. 结果精确验证 — 命中内容的 content 必须包含标准编号
+
+    结果缓存：同一标准编号只搜一次。
+
+    Args:
+        issues: 待处理的 issue 列表（原地修改）
+        kb_ids: 审核任务关联的知识库 ID 列表
+        extracted: _extract_standard_info() 的返回值
+    """
+    if not issues or not kb_ids:
+        return
+
+    from services.vector_search import search_doc_by_text, vec_search
+
+    # 搜索结果缓存：standard_number -> {doc_id, page_number, chunk_text} | None
+    _search_cache: dict[str, dict | None] = {}
+
+    # 按 issue id 索引
+    issue_by_id = {iss.id: iss for iss in issues}
+
+    for iss_id, info in extracted.items():
+        issue = issue_by_id.get(iss_id)
+        if not issue or not issue.standard_reference:
+            continue
+
+        standard_numbers = info.get("standard_numbers", []) or []
+        standard_names = info.get("standard_names", []) or []
+
+        best_hit = None
+
+        # ── 策略1: 精确文本搜索 ──
+        for std_num in standard_numbers:
+            if std_num in _search_cache:
+                best_hit = _search_cache[std_num]
+                break
+
+            text_hits = search_doc_by_text(std_num, kb_ids)
+            if text_hits:
+                # 文本搜索命中了文档，但缺少 page_number
+                # 用向量搜索补充 page_number 和 chunk_text
+                query = f"{std_num} {standard_names[0]}" if standard_names else std_num
+                vec_hits = vec_search(kb_ids, query, top_k=3)
+
+                # 精确验证：vec hits 的 content 必须包含标准编号
+                matched_doc_ids = {h["doc_id"] for h in text_hits}
+                for vh in vec_hits:
+                    if vh["doc_id"] in matched_doc_ids:
+                        content = vh.get("content", "")
+                        if any(sn in content for sn in standard_numbers):
+                            best_hit = {
+                                "doc_id": vh["doc_id"],
+                                "page_number": vh.get("page_number"),
+                                "chunk_text": content[:500],
+                            }
+                            break
+
+                _search_cache[std_num] = best_hit
+                break
+
+        # ── 策略2: 向量语义搜索（文本搜索无结果时） ──
+        if not best_hit and (standard_numbers or standard_names):
+            query_parts = standard_numbers + standard_names
+            query = " ".join(query_parts[:3])  # 最多3个词
+            vec_hits = vec_search(kb_ids, query, top_k=5)
+
+            for vh in vec_hits:
+                content = vh.get("content", "")
+                # 精确验证
+                verified = False
+                if standard_numbers:
+                    verified = any(sn in content for sn in standard_numbers)
+                else:
+                    verified = any(nm in content for nm in standard_names)
+
+                if verified:
+                    best_hit = {
+                        "doc_id": vh["doc_id"],
+                        "page_number": vh.get("page_number"),
+                        "chunk_text": content[:500],
+                    }
+                    if standard_numbers:
+                        _search_cache[standard_numbers[0]] = best_hit
+                    break
+
+        # ── 回填 ──
+        if best_hit:
+            sr = issue.standard_reference
+            sr.doc_id = best_hit["doc_id"]
+            sr.page_number = best_hit.get("page_number")
+            sr.chunk_text = best_hit.get("chunk_text")
+            # 如果 standard_name 为空，用提取到的首条编号补上
+            if not sr.standard_name and standard_numbers:
+                sr.standard_name = standard_numbers[0]
+                sr.standard_id = standard_numbers[0]
+            _logger.info(
+                "_search_and_link_standards: linked issue #%d to doc %s",
+                issue.id, best_hit["doc_id"],
+            )
+
+
+def _link_standards_to_kb(
+    issues: list[AuditIssue],
+    kb_ids: list[str],
+) -> None:
+    """审核后处理：将 issue 中引用的标准关联到 KB 文档。
+
+    筛选 standard_doc_id 为空的 issue → LLM 提取标准信息 →
+    搜索 KB → 回填 doc_id/page_number/chunk_text。
+
+    任何步骤失败都不影响审核结果。
+    """
+    if not issues or not kb_ids:
+        return
+
+    # 筛选：standard_doc_id 为空的 issue
+    pending = []
+    for iss in issues:
+        if iss.standard_reference and not iss.standard_reference.doc_id:
+            pending.append(iss)
+
+    if not pending:
+        return
+
+    _logger.info("_link_standards_to_kb: %d issues need standard linking", len(pending))
+
+    try:
+        extracted = _extract_standard_info(pending)
+    except Exception as e:
+        _logger.warning("_link_standards_to_kb: extraction failed: %s", e)
+        return
+
+    if not extracted:
+        return
+
+    try:
+        _search_and_link_standards(pending, kb_ids, extracted)
+    except Exception as e:
+        _logger.warning("_link_standards_to_kb: search failed: %s", e)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 结果构建
 # ═══════════════════════════════════════════════════════════════════════════════
 
