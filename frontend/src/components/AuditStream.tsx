@@ -39,6 +39,10 @@ function formatToolArgs(tool: string, args: Record<string, unknown>): string {
 }
 
 function IssueCard({ issue }: { issue: AuditEventIssue }) {
+  const pdfUrl = issue.standard_doc_id
+    ? `/pdf-viewer/${issue.standard_doc_id}?page=${issue.standard_page_number ?? ''}&clause=${encodeURIComponent(issue.standard_clause || '')}&highlight=${encodeURIComponent(issue.standard_chunk_text || '')}`
+    : null
+
   return (
     <div className={`mt-1 px-3 py-2 rounded-md border text-sm ${severityColors[issue.severity] || severityColors.medium}`}>
       <div className="flex items-center gap-2">
@@ -51,7 +55,15 @@ function IssueCard({ issue }: { issue: AuditEventIssue }) {
       <p className="mt-1 leading-relaxed">{issue.description}</p>
       {(issue.standard_name || issue.standard_clause) && (
         <p className="mt-0.5 text-xs opacity-70">
-          依据: {issue.standard_name}{issue.standard_clause ? ` ${issue.standard_clause}` : ''}
+          依据:{' '}
+          {pdfUrl ? (
+            <a href={pdfUrl} target="_blank" rel="noopener noreferrer"
+              className="text-blue-500 hover:underline cursor-pointer">
+              📄 {issue.standard_name}{issue.standard_clause ? ` § ${issue.standard_clause}` : ''}
+            </a>
+          ) : (
+            <span>{issue.standard_name}{issue.standard_clause ? ` § ${issue.standard_clause}` : ''}</span>
+          )}
         </p>
       )}
     </div>
