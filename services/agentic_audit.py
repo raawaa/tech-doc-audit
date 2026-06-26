@@ -1505,6 +1505,9 @@ def _run_native_tool_calling(
         finished=finished,
     )
 
+    # 后处理：将 issue 中引用的标准关联到知识库文档
+    _link_standards_to_kb(issues, kb_ids)
+
     return _build_result(task_id, doc_id, doc_name, issues, raw_analysis)
 
 
@@ -1689,6 +1692,9 @@ def _run_structured_llm_loop(
         provider=os.environ.get("LLM_PROVIDER", "unknown"),
         finished=finished,
     )
+
+    # 后处理：将 issue 中引用的标准关联到知识库文档
+    _link_standards_to_kb(issues, kb_ids)
 
     return _build_result(task_id, doc_id, doc_name, issues, raw_analysis)
 
