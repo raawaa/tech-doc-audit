@@ -21,7 +21,7 @@ interface DocMeta {
 export function PdfViewer() {
   const pathname = window.location.pathname
   const docId = pathname.split('/').pop() || ''
-  const [searchParams] = useSearchParams()
+  const [searchParams, setSearchParams] = useSearchParams()
   const targetPage = parseInt(searchParams.get('page') || '1', 10)
   const highlight = searchParams.get('highlight') || ''
 
@@ -30,8 +30,6 @@ export function PdfViewer() {
   const [error, setError] = useState('')
   const [numPages, setNumPages] = useState(0)
   const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null)
-  const [currentPage, setCurrentPage] = useState(targetPage)
-  const [totalPages] = useState(0)
   const [allPagesRendered, setAllPagesRendered] = useState(false)
   const pageRefs = useRef<Map<number, HTMLCanvasElement>>(new Map())
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -92,6 +90,18 @@ export function PdfViewer() {
     pageRefs.current.clear()
     highlightAppliedRef.current = ''
   }, [numPages])
+
+  // 页码跳转（PDF 模式）
+  const handleJumpToPage = (page: number) => {
+    if (!scrollContainerRef.current) return
+    const clamped = Math.min(Math.max(page, 1), numPages)
+    const pageEl = scrollContainerRef.current.querySelector(
+      `[data-page-number="${clamped}"]`
+    )
+    if (pageEl) {
+      pageEl.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
+  }
 
   // 文本降级模式（DOCX/MD）
   const [textContent, setTextContent] = useState('')
@@ -186,16 +196,35 @@ export function PdfViewer() {
           <p className="text-xs text-slate-400">{meta.file_type.toUpperCase()} · {meta.page_count || '?'} 页</p>
         </div>
         <div className="flex items-center gap-3 text-sm">
-          {pdfDoc && (
+          {/* PDF 模式：页码跳转 */}
+          {numPages > 0 && (
+            <div className="flex items-center gap-2 text-xs text-slate-500">
+              <span>跳至</span>
+              <input
+                type="number"
+                className="w-14 px-2 py-1 border rounded text-center text-xs"
+                min={1}
+                max={numPages}
+                defaultValue={targetPage}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    handleJumpToPage(parseInt((e.target as HTMLInputElement).value))
+                  }
+                }}
+              />
+              <span>页 / 共 {numPages} 页</span>
+            </div>
+          )}
+          {/* 非 PDF 模式：翻页按钮 */}
+          {!numPages && textTotalPages > 0 && (
             <>
               <button className="px-2 py-1 rounded hover:bg-slate-100 disabled:opacity-30"
-                disabled={currentPage <= 1} onClick={() => setCurrentPage(p => p - 1)}>←</button>
-              <span className="text-slate-600 tabular-nums">{currentPage} / {totalPages}</span>
+                disabled={targetPage <= 1}
+                onClick={() => setSearchParams({ page: String(targetPage - 1) })}>←</button>
+              <span className="text-slate-600 tabular-nums text-sm">{targetPage} / {textTotalPages}</span>
               <button className="px-2 py-1 rounded hover:bg-slate-100 disabled:opacity-30"
-                disabled={currentPage >= totalPages} onClick={() => setCurrentPage(p => p + 1)}>→</button>
-              <input type="number" className="w-14 px-2 py-1 border rounded text-center text-xs"
-                min={1} max={totalPages} value={currentPage}
-                onChange={e => { const v = parseInt(e.target.value); if (v >= 1 && v <= totalPages) setCurrentPage(v) }} />
+                disabled={targetPage >= textTotalPages}
+                onClick={() => setSearchParams({ page: String(targetPage + 1) })}>→</button>
             </>
           )}
           {highlight && <span className="text-xs text-amber-600 ml-2">🔍 高亮: {highlight.slice(0, 50)}</span>}
