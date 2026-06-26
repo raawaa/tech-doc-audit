@@ -92,6 +92,22 @@ def _save_doc_meta(doc: KBDocument) -> None:
         json.dump(_doc_to_json(doc), f, ensure_ascii=False, indent=2)
 
 
+def find_doc_by_id(doc_id: str) -> Optional[KBDocument]:
+    """跨所有 KB 查找指定 ID 的文档。
+
+    扫描 data/kbs/ 下所有 KB 目录的 meta 文件。
+    """
+    validate_id(doc_id, "doc_id")
+    for kb_dir in DATA_DIR.glob("kbs/*"):
+        if not kb_dir.is_dir():
+            continue
+        kb_id = kb_dir.name
+        doc = get_doc(kb_id, doc_id)
+        if doc:
+            return doc
+    return None
+
+
 def delete_doc(kb_id: str, doc_id: str) -> bool:
     meta_path = _doc_meta_file(kb_id, doc_id)
     if meta_path.exists():
