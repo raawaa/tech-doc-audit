@@ -822,20 +822,20 @@ def _search_and_link_standards(
                     break
 
         # ── 回填 ──
+        sr = issue.standard_reference
         if best_hit:
-            sr = issue.standard_reference
             sr.doc_id = best_hit["doc_id"]
             raw_page = best_hit.get("page_number")
             sr.page_number = raw_page + 1 if raw_page is not None else None
             sr.chunk_text = best_hit.get("chunk_text")
-            # 如果 standard_name 为空，用提取到的首条编号补上
-            if not sr.standard_name and standard_numbers:
-                sr.standard_name = standard_numbers[0]
-                sr.standard_id = standard_numbers[0]
             _logger.info(
                 "_search_and_link_standards: linked issue #%d to doc %s",
                 issue.id, best_hit["doc_id"],
             )
+        # 无论是否搜到 KB 文档，只要 LLM 提取出了标准编号且 standard_name 为空，就补上
+        if not sr.standard_name and standard_numbers:
+            sr.standard_name = standard_numbers[0]
+            sr.standard_id = standard_numbers[0]
 
 
 def _link_standards_to_kb(
@@ -852,10 +852,30 @@ def _link_standards_to_kb(
     if not issues or not kb_ids:
         return
 
-    # 筛选：standard_doc_id 为空的 issue
+    # 收集 KB 中所有有效的 doc_id（用于验证 LLM 填入的 doc_id 是否真实存在）
+    import storage.doc_repo as _doc_repo
+    valid_doc_ids: set[str] = set()
+    for kb_id in kb_ids:
+        try:
+            for doc in _doc_repo.list_docs(kb_id):
+                valid_doc_ids.add(doc.id)
+        except Exception:
+            pass
+
+    # 筛选：standard_doc_id 为空，或指向不存在的文档（LLM 幻觉）
     pending = []
     for iss in issues:
-        if iss.standard_reference and not iss.standard_reference.doc_id:
+        sr = iss.standard_reference
+        if not sr:
+            continue
+        doc_id = sr.doc_id
+        if not doc_id:
+            pending.append(iss)
+        elif doc_id not in valid_doc_ids:
+            # LLM 填入了无效的 doc_id，清除后重新搜索
+            sr.doc_id = None
+            sr.page_number = None
+            sr.chunk_text = None
             pending.append(iss)
 
     if not pending:

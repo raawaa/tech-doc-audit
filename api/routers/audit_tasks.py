@@ -247,7 +247,7 @@ async def stream_audit_progress(task_id: str):
         def read_from_log():
             event_index = 0
             last_check = time.time()
-            for _ in range(300):
+            for _ in range(600):  # 300s 超时，为 LLM 提取和 KB 搜索留足时间
                 new_events, event_index = get_task_events_since(task_id, event_index)
                 for evt in new_events:
                     event_queue.put(evt)
