@@ -114,12 +114,37 @@ def doc_delete(
 @index_app.command("rebuild")
 def index_rebuild(
     kb_id: str = typer.Option(..., "--kb-id", help="知识库 ID"),
+    doc_id: str = typer.Option(None, "--doc-id", help="仅重建指定文档（需重新提取文本以获取页码信息）"),
     model: str = typer.Option("", "--model", "-m", hidden=True),
 ):
-    typer.echo(f"开始重建知识库 {kb_id} 的向量索引...")
-    from services.vector_search import rebuild_kb_index as rebuild_vec
-    rebuild_vec(kb_id)
-    typer.echo("向量索引重建完成")
+    """重建知识库向量索引。--doc-id 指定时仅重建单个文档。"""
+    if doc_id:
+        import storage.doc_repo as _doc_repo
+        doc = _doc_repo.get_doc(kb_id, doc_id)
+        if not doc:
+            typer.echo(f"文档不存在: {doc_id}")
+            raise typer.Exit(1)
+
+        if not doc.file_path or not Path(doc.file_path).exists():
+            typer.echo(f"文档文件不存在: {doc.file_path}")
+            raise typer.Exit(1)
+
+        typer.echo(f"重新导入文档 {doc.original_name} 以获取页码信息...")
+        with open(doc.file_path, "rb") as f:
+            content = f.read()
+
+        # 先删除旧索引
+        from services.vector_search import remove_document_index
+        remove_document_index(kb_id, doc_id)
+
+        # 重新导入（会重新提取逐页文本并索引）
+        doc_svc.import_document(kb_id, doc.original_name, content, async_index=False)
+        typer.echo(f"文档 {doc_id} 重建完成")
+    else:
+        typer.echo(f"开始重建知识库 {kb_id} 的向量索引...")
+        from services.vector_search import rebuild_kb_index as rebuild_vec
+        rebuild_vec(kb_id)
+        typer.echo("向量索引重建完成")
 
 
 @index_app.command("status")
