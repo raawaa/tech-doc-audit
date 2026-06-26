@@ -286,6 +286,9 @@ def search_doc_by_text(keyword: str, kb_ids: list[str]) -> list[dict]:
         for doc in doc_repo.list_docs(kb_id):
             fp = str(Path(doc.file_path).resolve())
             file_to_doc[fp] = (kb_id, doc.id)
+            # 同时注册同目录下的 .txt 提取文件（当 rga 不可用时，rg 只搜到 .txt 也能匹配）
+            txt_fp = str(Path(fp).parent / f'{doc.id}_extracted.txt')
+            file_to_doc[txt_fp] = (kb_id, doc.id)
 
     # 解析 rga 输出，提取文件路径和匹配行
     # rga 输出格式 (with -n): /path/to/file:123:text (match), /path/to/file-123-text (context)
