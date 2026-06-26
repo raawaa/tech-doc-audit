@@ -204,12 +204,16 @@ def _embed_batch_with_retry(embed_model, texts: list[str]) -> list:
 
 # ── 文档索引 ────────────────────────────────────────────────────────────────────
 
-def index_document(kb_id: str, doc_id: str, text: str, source_name: str = ""):
+def index_document(kb_id: str, doc_id: str, text: str, source_name: str = "",
+                   page_texts: list[str] | None = None):
     """对文档文本分块 → embedding → 写入 KB 索引 + 持久化向量。
 
     优先使用 MarkdownNodeParser 按标题层级切块（适合带 # 标题的文本），
     降级到 SentenceSplitter 按 token 数切块。
     embedding 结果同时保存为 .npy 文件，供后续快速重建。
+
+    若提供 page_texts，按页独立创建 Document 再分块，使每个 node
+    继承对应的 page_number metadata（用于 PDF 跳转定位）。
     """
     if not text or len(text) < 20:
         return
@@ -221,33 +225,56 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = ""):
 
         index = get_kb_index(kb_id)
 
-        doc = Document(
-            text=text,
-            id_=doc_id,
-            metadata={"doc_id": doc_id, "source": source_name or doc_id},
-        )
+        all_nodes = []
 
-        nodes = _split_document(doc)
-        _enrich_chunk_metadata(nodes, doc_id, source_name or doc_id)
-
-        if not nodes:
+        if page_texts and len(page_texts) > 0:
+            # 按页创建 Document，每页生成独立 chunks（继承 page_number）
+            for page_num, page_text in enumerate(page_texts):
+                if not page_text or len(page_text.strip()) < 10:
+                    continue
+                doc = Document(
+                    text=page_text,
+                    id_=f"{doc_id}_p{page_num}",
+                    metadata={
+                        "doc_id": doc_id,
+                        "source": source_name or doc_id,
+                        "page_number": page_num,  # 0-based
+                    },
+                )
+                nodes = _split_document(doc)
+                for node in nodes:
+                    node.metadata["page_number"] = page_num
+                _enrich_chunk_metadata(nodes, doc_id, source_name or doc_id)
+                all_nodes.extend(nodes)
+                del doc
+        else:
+            doc = Document(
+                text=text,
+                id_=doc_id,
+                metadata={"doc_id": doc_id, "source": source_name or doc_id},
+            )
+            nodes = _split_document(doc)
+            _enrich_chunk_metadata(nodes, doc_id, source_name or doc_id)
+            all_nodes = nodes
             del doc
+
+        if not all_nodes:
             return
 
         # 预 embedding：拿到向量引用后再插入索引，避免重复推理
-        node_texts = [node.text or "" for node in nodes]
+        node_texts = [node.text or "" for node in all_nodes]
         with get_gpu_inference_lock():
             embeddings = _embed_batch_with_retry(embed_model, node_texts)
-        for node, emb in zip(nodes, embeddings):
+        for node, emb in zip(all_nodes, embeddings):
             node.embedding = emb
 
         # 持久化向量（索引重建时无需 GPU）
-        _save_doc_vectors(kb_id, doc_id, nodes, embeddings)
+        _save_doc_vectors(kb_id, doc_id, all_nodes, embeddings)
 
         # 插入索引（节点已有 embedding，不会重复推理）
-        index.insert_nodes(nodes)
+        index.insert_nodes(all_nodes)
 
-        del doc, nodes, embeddings
+        del all_nodes, embeddings
         gc.collect()
 
         _persist(kb_id, index)
@@ -289,7 +316,7 @@ def _enrich_chunk_metadata(
 
 def index_documents_batch(
     kb_id: str,
-    docs: list[tuple[str, str, str]],
+    docs: list,  # [(doc_id, text, source_name, page_texts?), ...] — 兼容 3/4 元组
     progress_callback=None,
 ):
     """批量索引文档：分块 → 批量 embedding → 保存向量 → 写入 FAISS。
@@ -299,7 +326,8 @@ def index_documents_batch(
 
     Args:
         kb_id: 知识库 ID。
-        docs: [(doc_id, text, source_name), ...] 列表。
+        docs: [(doc_id, text, source_name), ...] 或
+              [(doc_id, text, source_name, page_texts), ...] 列表。
         progress_callback: 可选回调 (current, total, doc_name) → None。
     """
     if not docs:
@@ -313,47 +341,71 @@ def index_documents_batch(
         index = get_kb_index(kb_id)
         total = len(docs)
 
-        for i, (doc_id, text, source_name) in enumerate(docs, 1):
+        for index, item in enumerate(docs, 1):
+            doc_id, text, source_name = item[0], item[1], item[2]
+            page_texts = item[3] if len(item) > 3 else None
+
             if progress_callback:
-                progress_callback(i, total, source_name or doc_id)
+                progress_callback(index, total, source_name or doc_id)
 
             if not text or len(text) < 20:
                 continue
 
-            doc = Document(
-                text=text,
-                id_=doc_id,
-                metadata={"doc_id": doc_id, "source": source_name or doc_id},
-            )
-            nodes = _split_document(doc)
-            _enrich_chunk_metadata(nodes, doc_id, source_name or doc_id)
+            all_nodes = []
 
-            if not nodes:
+            if page_texts and len(page_texts) > 0:
+                for page_num, page_text in enumerate(page_texts):
+                    if not page_text or len(page_text.strip()) < 10:
+                        continue
+                    doc = Document(
+                        text=page_text,
+                        id_=f"{doc_id}_p{page_num}",
+                        metadata={
+                            "doc_id": doc_id,
+                            "source": source_name or doc_id,
+                            "page_number": page_num,
+                        },
+                    )
+                    nodes = _split_document(doc)
+                    for node in nodes:
+                        node.metadata["page_number"] = page_num
+                    _enrich_chunk_metadata(nodes, doc_id, source_name or doc_id)
+                    all_nodes.extend(nodes)
+                    del doc
+            else:
+                doc = Document(
+                    text=text,
+                    id_=doc_id,
+                    metadata={"doc_id": doc_id, "source": source_name or doc_id},
+                )
+                nodes = _split_document(doc)
+                _enrich_chunk_metadata(nodes, doc_id, source_name or doc_id)
+                all_nodes = nodes
                 del doc
+
+            if not all_nodes:
                 continue
 
             # 批量 embedding 本稿件所有 chunk（GPU 锁内，失败自动重试）
-            node_texts = [node.text or "" for node in nodes]
+            node_texts = [node.text or "" for node in all_nodes]
             try:
                 with get_gpu_inference_lock():
                     embeddings = _embed_batch_with_retry(embed_model, node_texts)
             except Exception as e:
                 _logger.error("embedding failed for doc %s after retries: %s", doc_id, e)
-                del doc, nodes
+                del all_nodes
                 raise
 
-            for node, emb in zip(nodes, embeddings):
+            for node, emb in zip(all_nodes, embeddings):
                 node.embedding = emb
 
             # 持久化向量（索引重建时无需 GPU）
-            _save_doc_vectors(kb_id, doc_id, nodes, embeddings)
+            _save_doc_vectors(kb_id, doc_id, all_nodes, embeddings)
 
             # 插入索引（节点已有 embedding）
-            index.insert_nodes(nodes)
+            index.insert_nodes(all_nodes)
 
-            del doc, nodes, embeddings
-            if i % 5 == 0:
-                gc.collect()
+            del all_nodes, embeddings
 
         _persist(kb_id, index)
 
@@ -647,6 +699,7 @@ def search(kb_ids: list[str], query: str, top_k: int = 5, use_reranker: bool = T
             "doc_source": meta.get("source", ""),
             "section_path": meta.get("section_path", ""),
             "clause_number": meta.get("clause_number", ""),
+            "page_number": meta.get("page_number"),  # int or None, 0-based
             "relevance": round(node.get_score() or 0, 4),
         })
 
