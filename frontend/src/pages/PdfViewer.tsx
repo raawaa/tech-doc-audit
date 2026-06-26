@@ -36,6 +36,7 @@ export function PdfViewer() {
   const pageRefs = useRef<Map<number, HTMLCanvasElement>>(new Map())
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const [renderedPages, setRenderedPages] = useState(0)
+  void renderedPages
 
   const apiBase = import.meta.env.VITE_API_BASE_URL || ''
   const pdfUrl = meta?.file_type === 'pdf' ? `${apiBase}/api/v1/kb-documents/${docId}/file` : null
@@ -104,13 +105,73 @@ export function PdfViewer() {
       .catch(e => setError(e.message))
   }, [meta, docId, targetPage])
 
+  // 高亮搜索与自动定位
+  useEffect(() => {
+    if (!pdfDoc || !highlight || !allPagesRendered) return
+
+    const doc = pdfDoc
+    const searchTerms = highlight.split(/\s+/).filter(t => t.length > 1)
+    if (searchTerms.length === 0) return
+
+    let firstHighlightedPage: number | null = null
+
+    // 逐页搜索文本
+    async function searchAndHighlight() {
+      for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+        try {
+          const page = await doc.getPage(pageNum)
+          const textContent = await page.getTextContent()
+
+          let pageHasMatch = false
+          const canvas = pageRefs.current.get(pageNum)
+          if (!canvas) continue
+
+          const ctx = canvas.getContext('2d')
+          if (!ctx) continue
+
+          for (const item of textContent.items) {
+            const textItem = item as { str: string; transform: number[] }
+            const str = textItem.str || ''
+            for (const term of searchTerms) {
+              if (str.includes(term)) {
+                pageHasMatch = true
+                const tx = textItem.transform
+                const scale = 1.5
+                const x = tx[4] * scale
+                const y = canvas.height - tx[5] * scale
+                const w = (str.length * (tx[0] || 8)) * scale * 0.6
+                const h = 14
+                ctx.fillStyle = 'rgba(255, 255, 0, 0.4)'
+                ctx.fillRect(x - 1, y - h, w + 2, h + 4)
+              }
+            }
+          }
+
+          if (pageHasMatch && firstHighlightedPage === null) {
+            firstHighlightedPage = pageNum
+          }
+        } catch {
+          // 跳过渲染失败的页面
+        }
+      }
+
+      // 自动滚动到第一个有高亮的页面
+      if (firstHighlightedPage !== null && scrollContainerRef.current) {
+        const pageEl = scrollContainerRef.current.querySelector(
+          `[data-page-number="${firstHighlightedPage}"]`
+        )
+        if (pageEl) {
+          pageEl.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        }
+      }
+    }
+
+    searchAndHighlight()
+  }, [pdfDoc, highlight, numPages, allPagesRendered])
+
   if (loading) return <div className="flex justify-center py-20"><Loader2 className="w-6 h-6 animate-spin text-slate-400" /></div>
   if (error) return <div className="text-center py-20 text-red-500">{error}</div>
   if (!meta) return <div className="text-center py-20 text-slate-500">文档不存在</div>
-
-  // Suppress TS6133 — consumed in Task 4 (search/highlight)
-  void allPagesRendered
-  void renderedPages
 
   return (
     <div className="min-h-screen bg-slate-100">
@@ -161,18 +222,19 @@ export function PdfViewer() {
                 }
               >
                 {Array.from(new Array(numPages), (_, index) => (
-                  <Page
-                    key={`page_${index + 1}`}
-                    pageNumber={index + 1}
-                    canvasRef={(ref: HTMLCanvasElement) => {
-                      if (ref) {
-                        pageRefs.current.set(index + 1, ref)
-                      }
-                    }}
-                    onRenderSuccess={() => handlePageRenderSuccess(index + 1)}
-                    renderTextLayer={false}
-                    className="bg-white shadow-lg rounded"
-                  />
+                  <div key={`page_${index + 1}`} data-page-number={index + 1}>
+                    <Page
+                      pageNumber={index + 1}
+                      canvasRef={(ref: HTMLCanvasElement) => {
+                        if (ref) {
+                          pageRefs.current.set(index + 1, ref)
+                        }
+                      }}
+                      onRenderSuccess={() => handlePageRenderSuccess(index + 1)}
+                      renderTextLayer={false}
+                      className="bg-white shadow-lg rounded"
+                    />
+                  </div>
                 ))}
               </Document>
             )}
