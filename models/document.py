@@ -17,7 +17,8 @@ class KBDocument(BaseModel):
     page_count: Optional[int] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
-    index_status: Literal["none", "building", "ready", "failed", "pending_index"] = "none"
+    index_status: Literal["none", "building", "indexing", "ready", "failed", "pending_index"] = "none"
+    content_hash: Optional[str] = None  # SHA-256 of raw file bytes, for dedup
     metadata: dict = Field(default_factory=dict)
 
     class Config:

@@ -184,5 +184,65 @@ def test_cascade_delete():
     print("✓ 级联删除测试通过")
 
 
+# ── 启动恢复测试 ──────────────────────────────────────────────────────────────
+
+
+def test_recover_stuck_indexes():
+    """验证崩溃后启动恢复正确重置卡住的 KB 和文档状态。"""
+    import services.kb_service as kb_svc
+    import services.doc_service as doc_svc
+    import storage.kb_repo as kb_repo
+    import storage.doc_repo as doc_repo
+    from api.main import recover_stuck_indexes
+
+    # 场景 1：KB 卡在 building
+    kb_building = kb_svc.create_kb(name="卡住的KB", category="national")
+    kb_building.index_status = "building"
+    kb_repo.update(kb_building)
+
+    # 场景 2：文档卡在 pending_index
+    kb_pending = kb_svc.create_kb(name="pending文档", category="national")
+    doc_pending = doc_repo.save_doc(kb_pending.id, "pending_doc.md", b"# Test\n\nTest content for pending doc.", "md")
+    doc_pending.index_status = "pending_index"
+    doc_repo._save_doc_meta(doc_pending)
+    kb_pending.document_ids.append(doc_pending.id)
+    kb_repo.update(kb_pending)
+
+    # 场景 3：文档卡在 indexing（崩溃中）
+    doc_indexing = doc_repo.save_doc(kb_pending.id, "indexing_doc.md", b"# Test2\n\nTest content for indexing doc.", "md")
+    doc_indexing.index_status = "indexing"
+    doc_repo._save_doc_meta(doc_indexing)
+    kb_pending.document_ids.append(doc_indexing.id)
+    kb_repo.update(kb_pending)
+
+    # 场景 4：正常状态的文档（不应被改动）
+    doc_ready = doc_repo.save_doc(kb_pending.id, "ready_doc.md", b"# Test3\n\nTest content for ready doc.", "md")
+    doc_ready.index_status = "ready"
+    doc_repo._save_doc_meta(doc_ready)
+    kb_pending.document_ids.append(doc_ready.id)
+    kb_repo.update(kb_pending)
+
+    # 执行恢复
+    recover_stuck_indexes()
+
+    # 验证 KB building → none
+    kb_building_after = kb_repo.get(kb_building.id)
+    assert kb_building_after.index_status == "none"
+    assert kb_building_after.index_progress is None
+
+    # 验证 doc pending_index → none
+    doc_pending_after = doc_repo.get_doc(kb_pending.id, doc_pending.id)
+    assert doc_pending_after.index_status == "none"
+
+    # 验证 doc indexing → pending_index
+    doc_indexing_after = doc_repo.get_doc(kb_pending.id, doc_indexing.id)
+    assert doc_indexing_after.index_status == "pending_index", \
+        f"indexing 应重置为 pending_index，实际 {doc_indexing_after.index_status}"
+
+    # 验证正常文档未被改动
+    doc_ready_after = doc_repo.get_doc(kb_pending.id, doc_ready.id)
+    assert doc_ready_after.index_status == "ready", "ready 状态的文档不应被改动"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

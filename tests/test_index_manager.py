@@ -247,9 +247,9 @@ def test_async_md_index_builds_faiss():
     ).encode()
     doc = doc_svc.import_document(kb.id, "技术规范.md", content, async_index=True)
 
-    # 等待后台索引线程完成
+    # 等待后台索引线程完成（pending_index → indexing → ready）
     for _ in range(100):
-        if doc.index_status != "pending_index":
+        if doc.index_status not in ("pending_index", "indexing"):
             break
         time.sleep(0.1)
 
@@ -258,3 +258,180 @@ def test_async_md_index_builds_faiss():
 
     kb = kb_repo.get(kb.id)
     assert doc.id in kb.document_ids
+
+
+# ── 向量持久化测试 ────────────────────────────────────────────────────────────
+
+
+def test_save_and_cleanup_doc_vectors():
+    """索引文档后验证 .npy 和 _nodes.json 文件落盘，删除后验证清理。"""
+    from core.index_manager import _save_doc_vectors, _cleanup_doc_vectors, _vectors_dir
+
+    kb_id = "test_kb_vectors_persist"
+
+    # 索引文档
+    index_document(
+        kb_id, "doc_v1",
+        "向量持久化测试文档内容，验证 .npy 文件和节点元数据 JSON 文件是否正确落盘。",
+        source_name="vectors_test.txt",
+    )
+
+    vectors_dir = _vectors_dir(kb_id)
+    npy_file = vectors_dir / "doc_v1.npy"
+    nodes_file = vectors_dir / "doc_v1_nodes.json"
+
+    assert npy_file.exists(), f".npy 文件应存在: {npy_file}"
+    assert nodes_file.exists(), f"_nodes.json 文件应存在: {nodes_file}"
+
+    # 验证 .npy 格式
+    vec = __import__('numpy').load(str(npy_file))
+    assert vec.dtype == __import__('numpy').float32, f"向量应为 float32，实际 {vec.dtype}"
+    assert vec.ndim == 2, f"向量应为 2D (n_chunks, dim)，实际 shape {vec.shape}"
+    assert vec.shape[1] == 1024, f"向量维度应为 1024，实际 {vec.shape[1]}"
+
+    # 验证 _nodes.json 格式
+    import json
+    nodes_data = json.loads(nodes_file.read_text())
+    assert isinstance(nodes_data, list)
+    assert len(nodes_data) == vec.shape[0], f"节点数 ({len(nodes_data)}) 应与向量行数 ({vec.shape[0]}) 一致"
+    for nd in nodes_data:
+        assert "node_id" in nd
+        assert "text" in nd
+        assert "metadata" in nd
+
+    # 清理并验证
+    _cleanup_doc_vectors(kb_id, "doc_v1")
+    assert not npy_file.exists(), ".npy 文件应已删除"
+    assert not nodes_file.exists(), "_nodes.json 文件应已删除"
+
+
+def test_rebuild_from_vectors():
+    """从已保存的 .npy 向量文件重建索引后可搜索。"""
+    from core.index_manager import _rebuild_from_vectors, _vectors_dir, clear_cache, _save_doc_vectors, _cleanup_doc_vectors
+
+    # 用 llm mocked? 不，先正常 index 生成缓存
+    kb_id = "test_kb_rebuild_from_vec"
+
+    index_document(
+        kb_id, "doc_vec_rebuild",
+        "从向量缓存重建索引的功能测试文档，验证重建后仍能正确搜索到相关内容与关键字匹配。",
+        source_name="rebuild_test.txt",
+    )
+
+    # 确认向量文件存在
+    vectors_dir = _vectors_dir(kb_id)
+    assert (vectors_dir / "doc_vec_rebuild.npy").exists()
+
+    # 清缓存 + 删 FAISS 索引文件，模拟"只有向量缓存，没有索引"的状态
+    clear_cache()
+    store_file = vectors_dir / "default__vector_store.json"
+    if store_file.exists():
+        store_file.unlink()
+
+    # 重建
+    progress = []
+    _rebuild_from_vectors(kb_id, ["doc_vec_rebuild"], progress_callback=lambda c, t, n: progress.append((c, t, n)))
+
+    # 验证 progress 回调
+    assert len(progress) >= 1
+    assert progress[-1][1] == 1  # total = 1
+
+    # 验证搜索可用
+    results = search([kb_id], "向量缓存重建", top_k=5)
+    assert len(results) >= 1, "从向量缓存重建后应能搜索到结果"
+
+    # 清理
+    _cleanup_doc_vectors(kb_id, "doc_vec_rebuild")
+
+
+def test_remove_document_fallback_path(monkeypatch):
+    """强制 delete_ref_doc 抛异常 → fallback 到 _rebuild_from_vectors 路径。"""
+    from core.index_manager import _vectors_dir
+    import storage.kb_repo as kb_repo
+    from models.knowledge_base import KnowledgeBase
+
+    kb_id = "test_kb_remove_fallback"
+
+    # 创建 KB 元数据（remove_document fallback 依赖 kb.document_ids）
+    kb = KnowledgeBase(id=kb_id, name="fallback测试", category="national")
+    kb_repo.update(kb)
+
+    index_document(kb_id, "doc_fb_1", "建设工程质量管理条例内容分析与解读规范文件全文", source_name="fb1.txt")
+    index_document(kb_id, "doc_fb_2", "建设工程安全生产管理条例全文规定与实施细则", source_name="fb2.txt")
+
+    # 更新 KB document_ids（正常路径由 doc_service 维护，这里手动补上）
+    kb = kb_repo.get(kb_id)
+    kb.document_ids = ["doc_fb_1", "doc_fb_2"]
+    kb_repo.update(kb)
+
+    # 验证索引已建立
+    assert get_kb_index_built(kb_id)
+
+    # 强制 delete_ref_doc 抛异常，触发 fallback 路径
+    original_delete = get_kb_index(kb_id).delete_ref_doc
+
+    def _raise(*a, **k):
+        raise RuntimeError("simulated delete_ref_doc failure")
+
+    monkeypatch.setattr(get_kb_index(kb_id), "delete_ref_doc", _raise)
+
+    # 删除 doc_fb_2（应该走 fallback 路径）
+    remove_document(kb_id, "doc_fb_2")
+
+    # 恢复后验证：doc_fb_1 仍然可搜索
+    monkeypatch.setattr(get_kb_index(kb_id), "delete_ref_doc", original_delete)
+    results = search([kb_id], "建设工程质量", top_k=5)
+    assert len(results) >= 1, "fallback 重建后应仍能搜索到剩余文档"
+
+    # 验证被删除文档的向量文件已清理
+    vectors_dir = _vectors_dir(kb_id)
+    assert not (vectors_dir / "doc_fb_2.npy").exists(), "被删除文档的向量缓存应已清理"
+    assert (vectors_dir / "doc_fb_1.npy").exists(), "剩余文档的向量缓存应保留"
+
+
+def test_rebuild_kb_index_mixed_vectors():
+    """rebuild_kb_index：部分文档有向量缓存、部分没有的混合场景。"""
+    import services.kb_service as kb_svc
+    import services.doc_service as doc_svc
+    import storage.kb_repo as kb_repo
+    import storage.doc_repo as doc_repo
+
+    kb = kb_svc.create_kb(name="混合重建", category="national")
+
+    # doc_A：正常导入（会建索引 + 向量缓存）
+    doc_a = doc_svc.import_document(
+        kb.id, "doc_a.md",
+        "# 设计说明\n\n## 第一章 总则\n\n建筑工程设计文件编制深度规定内容与标准要求。\n\n## 第二章 要求\n\n各项设计应符合国家标准。".encode(),
+    )
+    assert doc_a.index_status == "ready"
+
+    # doc_B：模拟 bulk_import 场景（只保存文件，不建索引，无向量缓存）
+    content_b = "# 施工规范\n\n## 第一章 总则\n\n建筑施工组织设计规范标准要求与实施指南内容。\n\n## 第二章 验收\n\n施工质量应符合设计文件要求。".encode()
+    doc_b = doc_repo.save_doc(kb.id, "doc_b.md", content_b, "md")
+    doc_b.content_hash = __import__('hashlib').sha256(content_b).hexdigest()
+    doc_b.index_status = "none"
+    doc_repo._save_doc_meta(doc_b)
+    # 追加到 KB document_ids
+    kb = kb_repo.get(kb.id)
+    kb.document_ids.append(doc_b.id)
+    kb_repo.update(kb)
+
+    # 确认 doc_A 有向量缓存，doc_B 没有
+    from core.index_manager import _vectors_dir
+    vectors_dir = _vectors_dir(kb.id)
+    assert (vectors_dir / f"{doc_a.id}.npy").exists(), "doc_A 应有向量缓存"
+    assert not (vectors_dir / f"{doc_b.id}.npy").exists(), "doc_B 应无向量缓存"
+
+    # 重建索引
+    progress = []
+    rebuild_kb_index(kb.id, progress_callback=lambda c, t, n: progress.append((c, t, n)))
+
+    # 两个文档都应被处理（progress 应包含两者）
+    assert len(progress) >= 2, f"应处理 2 篇文档，实际 {len(progress)} 篇"
+
+    # 重建后两者都应可搜索
+    results_a = search([kb.id], "建筑工程设计", top_k=5)
+    assert len(results_a) >= 1, "doc_A 重建后应可搜索"
+
+    results_b = search([kb.id], "施工组织设计", top_k=5)
+    assert len(results_b) >= 1, "doc_B 重建后应可搜索"

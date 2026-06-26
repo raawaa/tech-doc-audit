@@ -100,7 +100,9 @@ def get_embed_model():
                 model_name=_model_path,
                 normalize=True,
                 device=os.getenv("EMBED_DEVICE", None),
-                embed_batch_size=2,   # 默认 10，减少为 2 以降低峰值内存 ~80%
+                embed_batch_size=int(os.environ.get("EMBED_BATCH_SIZE", "8")),
+                # bge-m3 ~2GB VRAM，batch_size=8 峰值约 3-4GB。
+                # 显存紧张时设 EMBED_BATCH_SIZE=2
                 max_length=512,       # 匹配 chunk_size，防止超长序列拉高内存
             )
             Settings.embed_model = _embed_model

@@ -34,6 +34,7 @@ dependencies = [
     "socksio>=1.0.0",
     "llama-index-embeddings-openai>=0.6.0",
     "pytesseract>=0.3.13",
+    "tenacity>=9.0.0",
 ]
 
 [dependency-groups]
