@@ -817,14 +817,16 @@ def _search_and_link_standards(
                         "chunk_text": content[:500],
                     }
                     if standard_numbers:
-                        _search_cache[standard_numbers[0]] = best_hit
+                        for sn in standard_numbers:
+                            _search_cache[sn] = best_hit
                     break
 
         # ── 回填 ──
         if best_hit:
             sr = issue.standard_reference
             sr.doc_id = best_hit["doc_id"]
-            sr.page_number = best_hit.get("page_number")
+            raw_page = best_hit.get("page_number")
+            sr.page_number = raw_page + 1 if raw_page is not None else None
             sr.chunk_text = best_hit.get("chunk_text")
             # 如果 standard_name 为空，用提取到的首条编号补上
             if not sr.standard_name and standard_numbers:
