@@ -21,3 +21,7 @@ Thumbs.db
 # Environment
 .env.local
 .env.*.local
+
+# PDF.js runtime assets (copied from node_modules at install/build time)
+public/cmaps/
+public/pdfjs/wasm/
