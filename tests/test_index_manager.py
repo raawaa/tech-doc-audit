@@ -1,7 +1,7 @@
 """index_manager 核心函数测试。
 
-注意：这些测试会触发 bge-m3 embedding 模型加载和 FAISS 索引操作，
-第一次运行耗时较长（~30s 加载模型），后续因缓存加速较快。
+通过 fake_models fixture 注入确定性假 embedder，**不加载 bge-m3**；
+FAISS 建索引/查询走假向量（断言结构与计数，不依赖语义相关性）。
 """
 
 import os
@@ -27,6 +27,12 @@ def cleanup():
     data_dir = os.environ["AUDIT_DATA_DIR"]
     if os.path.exists(data_dir):
         shutil.rmtree(data_dir)
+
+
+@pytest.fixture(autouse=True)
+def _use_fake_models(fake_models):
+    """本文件所有测试统一注入假模型，不加载 bge-m3。"""
+    yield
 
 
 def _text_doc(text: str, doc_id: str = "doc_001") -> tuple[str, str, str]:
