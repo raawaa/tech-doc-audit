@@ -15,7 +15,8 @@
 ## 审核执行
 
 - **Agentic ReAct 审核** — LLM 在 ReAct 循环中自主调用工具完成审核。入口 `services/agentic_audit.py: run_agentic_audit()`。两条实现路径（native function calling / structured_llm）由 `LLM_PROVIDER` 选择。
-- **四个 agent 工具** — `search_kb`（语义搜索）/ `search_kb_text`（精确文本搜索）/ `read_chapter`（章节阅读）/ `flag_issue`（记录问题）。
+- **四个 agent 工具** — `search_kb`（语义搜索）/ `search_kb_text`（精确文本搜索）/ `read_chapter`（章节阅读）/ `flag_issue`（记录问题）。前两个是 KB 查找工具，审核与问答共用（实现将集中在 `services/agent_tools.py`）；后两个是审核文档域、仅审核用，留在 `agentic_audit.py`。
+- **对话跟踪 (Trace)** — 一次 agent 运行的完整对话记录（系统提示、每轮 tool_calls 及其结果、reasoning），运行结束 best-effort 持久化到 `data/audits/{doc_id}/tasks/traces/`（审核）或 `data/qa_traces/`（问答），用于事后诊断 agent 行为；写入失败不影响运行结果。
 
 ## 后处理
 
