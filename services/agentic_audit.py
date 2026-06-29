@@ -16,14 +16,15 @@ Agent 自主调用工具逐章审核文档：
 import json
 import os
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
 from llama_index.core.llms import ChatMessage, MessageRole
 
 from core.logger import get_logger
-from core.settings import get_llm
+from core.settings import get_llm, make_deepseek_client
+from services.agent_tools import search_kb, search_kb_text
+from services.agent_trace import save_trace
 from core.degradation import record as _deg_record
 from models.audit_document import DocumentStructure
 from models.audit_task import (
@@ -31,6 +32,7 @@ from models.audit_task import (
     ResultSummary, StandardRef,
 )
 from models.llm_schemas import AgentAction
+from services.standard_linker import link_standards
 
 _logger = get_logger(__name__)
 
@@ -68,6 +70,57 @@ def clear_task_events(task_id: str):
     """清理任务事件日志。"""
     with _task_log_lock:
         _task_event_logs.pop(task_id, None)
+
+
+def _make_emitter(
+    task_id: str,
+    event_callback: Callable[[dict], None] | None,
+) -> Callable[[dict], None]:
+    """构造 audit loop 共用的事件发射闭包。
+
+    每次调用把事件 append 进 per-task 共享日志（供 SSE 长轮询读取），
+    并尽力推给当前 SSE 连接的 callback（失败静默，不阻塞审核）。
+
+    audit 的 native 与 structured 两 loop 曾逐字重复此逻辑，抽到此处复用。
+    qa 的 _emit 不写共享日志、结构不同，不复用本函数。
+    """
+    def _emit(event: dict):
+        with _task_log_lock:
+            if task_id not in _task_event_logs:
+                _task_event_logs[task_id] = []
+            _task_event_logs[task_id].append(event)
+        if event_callback:
+            try:
+                event_callback(event)
+            except Exception:
+                pass
+
+    return _emit
+
+
+def _check_cancelled(
+    task_id: str,
+    emit: Callable[[dict], None],
+    turn: int,
+    issues_count: int,
+) -> str | None:
+    """检查审核任务是否已被取消。
+
+    已取消：发 cancelled 事件、记日志，返回用于 raw_analysis 的文案。
+    未取消：返回 None。
+    读取任务状态本身失败时不阻塞审核，返回 None。
+    """
+    try:
+        from storage.audit_task_repo import get_task
+        current_task = get_task(task_id)
+    except Exception:
+        return None
+
+    if current_task and current_task.status == "cancelled":
+        emit({"type": "cancelled", "message": "审核任务已被取消"})
+        _logger.info("audit task %s cancelled at turn %d", task_id, turn)
+        return f"审核已取消（第 {turn} 轮），已记录 {issues_count} 个问题。"
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -337,111 +390,6 @@ def _format_chapter_text(text: str, index: int, label: str) -> str:
     )
 
 
-def _tool_search_kb(kb_ids: list[str], query: str, top_k: int = 5) -> str:
-    """搜索知识库，返回格式化的标准条款。"""
-    if not query or not kb_ids:
-        return "（未提供搜索关键词或知识库）"
-
-    from services.vector_search import vec_search
-
-    try:
-        results = vec_search(kb_ids, query, top_k=top_k)
-    except Exception as e:
-        _logger.warning("search_kb failed for query '%s': %s", query, e)
-        error_msg = str(e)
-        return (
-            f"（语义搜索失败: {error_msg}。\n"
-            f"建议：1) 尝试用更简短的关键词（如去掉修饰词）；"
-            f"2) 如果是精确术语或标准编号，改用 search_kb_text；"
-            f"3) 如果持续失败，跳过当前搜索点继续审核其他内容）"
-        )
-
-    if not results:
-        return f"（未找到与「{query}」相关的标准）"
-
-    lines = [f"【知识库搜索结果（搜索词: {query}，共 {len(results)} 条）】"]
-
-    # 统计来源多样性
-    unique_doc_ids: set[str] = set()
-    unique_sources: set[str] = set()
-
-    for i, r in enumerate(results, 1):
-        relevance = r.get("relevance", 0)
-        doc = r.get("doc_source", "") or r.get("doc_id", "")
-        doc_id = r.get("doc_id", "")
-        clause = r.get("clause_number", "")
-        section = r.get("section_path", "")
-        page_number = r.get("page_number")  # 0-based from metadata
-        content = (r.get("content", "") or "")
-
-        if doc_id:
-            unique_doc_ids.add(doc_id)
-        if doc:
-            unique_sources.add(doc)
-
-        label_parts = []
-        if doc:
-            label_parts.append(f"【{doc}】")
-        if clause:
-            label_parts.append(f"第{clause}条")
-        if section and not clause:
-            label_parts.append(section)
-        label = " ".join(label_parts) if label_parts else "未知来源"
-
-        meta_parts = [f"相关度: {relevance:.2f}"]
-        if doc_id:
-            meta_parts.append(f"doc_id: {doc_id}")
-        if page_number is not None:
-            meta_parts.append(f"页码: 第{page_number + 1}页")  # 0-based → 1-based display
-        meta_line = " | ".join(meta_parts)
-
-        lines.append(f"\n{i}. {label}\n   {meta_line}\n   {content}")
-
-    # 来源单一性警告：当所有结果来自 ≤1 个文档时提示
-    if len(unique_doc_ids) <= 1 and len(results) > 0:
-        source_label = "、".join(sorted(unique_sources)) if unique_sources else "未知来源"
-        lines.append(
-            f"\n⚠️ 来源单一性警告：所有 {len(results)} 条结果均来自同一份标准文档"
-            f"（{source_label}）。"
-            f"如果该文档的技术领域与当前搜索意图不匹配，"
-            f"请换用完全不同的关键词重搜，或转向审核文档的其他主题。"
-        )
-
-    return "\n".join(lines)
-
-
-def _tool_search_kb_text(kb_ids: list[str], query: str) -> str:
-    """纯文本关键词搜索知识库（rga/rg），精确匹配。"""
-    if not query or not kb_ids:
-        return "（未提供搜索关键词或知识库）"
-
-    from services.vector_search import _get_kb_search_paths, _run_rga
-
-    paths = _get_kb_search_paths(kb_ids)
-    if not paths:
-        return "（知识库无可用文档路径）"
-
-    try:
-        result = _run_rga(query, paths)
-    except Exception as e:
-        _logger.warning("search_kb_text failed for query '%s': %s", query, e)
-        error_msg = str(e)
-        return (
-            f"（文本搜索失败: {error_msg}。\n"
-            f"建议：1) 简化搜索词为更短的关键词；"
-            f"2) 如果是概念性要求，改用 search_kb 语义搜索；"
-            f"3) 如果持续失败，跳过当前搜索继续审核其他内容）"
-        )
-
-    if not result:
-        return f"（未找到与「{query}」匹配的文本）"
-
-    # 截断
-    if len(result) > 5000:
-        result = result[:5000] + "\n... [截断]"
-    return f"【知识库文本搜索结果（精确匹配: {query}）】\n{result}"
-
-
 def _tool_flag_issue(action: AgentAction, issues: list[AuditIssue]) -> str:
     """记录审核问题（含去重检查）。"""
     warnings = []
@@ -543,11 +491,11 @@ def _execute_tool(
     elif tool_name == "search_kb":
         query = action.search_query or ""
         top_k = action.search_top_k or 5
-        return _tool_search_kb(kb_ids, query, top_k)
+        return search_kb(kb_ids, query, top_k)
 
     elif tool_name == "search_kb_text":
         query = action.search_query or ""
-        return _tool_search_kb_text(kb_ids, query)
+        return search_kb_text(kb_ids, query)
 
     elif tool_name == "flag_issue":
         return _tool_flag_issue(action, issues)
@@ -618,287 +566,6 @@ def _build_tool_result_msg(result: str) -> ChatMessage:
     return ChatMessage(role=MessageRole.USER, content=f"[工具结果]\n{result}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 标准信息提取
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _extract_standard_info(issues: list[AuditIssue]) -> dict[int, dict]:
-    """用 LLM 批量从 issue 文本中提取标准编号和名称。
-
-    Args:
-        issues: standard_doc_id 为空的 issue 列表
-
-    Returns:
-        {issue.id: {standard_numbers: [...], standard_names: [...]}}
-        提取不到任何标准的 issue 返回空数组
-    """
-    if not issues:
-        return {}
-
-    # 构建提取输入
-    input_items = []
-    for iss in issues:
-        item = {"id": iss.id}
-        if iss.standard_reference:
-            sn = (iss.standard_reference.standard_name or "").strip()
-            if sn:
-                item["standard_name"] = sn
-        item["description"] = iss.description or ""
-        item["cited_excerpt"] = iss.cited_excerpt or ""
-        item["suggestion"] = iss.suggestion or ""
-        input_items.append(item)
-
-    system_prompt = """你是一个标准文献信息提取器。从审核问题的描述文本中提取被引用的标准编号和标准名称，输出 JSON 格式。
-
-规则：
-1. standard_numbers: 标准编号列表，如 "GB/T 20145-2006"、"GB 50016"、"CJJ 101-2016"。
-   不含纯数字编号（如"12345"不算）。从 description、cited_excerpt、suggestion 字段中提取。
-2. standard_names: 标准中文名称列表，不含书名号《》，如 "灯和灯系统的光生物安全性"。
-3. standard_name 字段如果已有值直接复用，无需重复提取。
-4. 如果问题没有涉及任何可识别的标准，返回空数组。
-
-输入格式: {"issues": [{"id": 1, "standard_name": "...", "description": "...", "cited_excerpt": "...", "suggestion": "..."}]}
-
-输出格式: {"results": [{"id": 1, "standard_numbers": ["GB/T 20145-2006"], "standard_names": ["灯和灯系统的光生物安全性"]}]}"""
-
-    user_prompt = json.dumps({"issues": input_items}, ensure_ascii=False)
-
-    try:
-        import httpx
-        from openai import OpenAI
-
-        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-        if not api_key:
-            _logger.warning("_extract_standard_info: DEEPSEEK_API_KEY not set, skipping")
-            return {}
-
-        base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-        # 使用轻量模型做提取（不需要深度推理）
-        model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-
-        http_client = httpx.Client(trust_env=False, timeout=httpx.Timeout(60))
-        client = OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
-
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
-            max_tokens=4096,
-        )
-
-        content = response.choices[0].message.content
-        if not content:
-            _logger.warning("_extract_standard_info: empty response from LLM")
-            return {}
-
-        data = json.loads(content)
-        results_list = data.get("results", [])
-
-        output: dict[int, dict] = {}
-        for item in results_list:
-            iss_id = item.get("id")
-            if iss_id is None:
-                continue
-            nums = item.get("standard_numbers", []) or []
-            names = item.get("standard_names", []) or []
-            if nums or names:
-                output[iss_id] = {
-                    "standard_numbers": nums,
-                    "standard_names": names,
-                }
-
-        _logger.info(
-            "_extract_standard_info: extracted standards for %d/%d issues",
-            len(output), len(issues),
-        )
-        return output
-
-    except Exception as e:
-        _logger.warning("_extract_standard_info failed: %s", e)
-        return {}
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 标准关联
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _search_and_link_standards(
-    issues: list[AuditIssue],
-    kb_ids: list[str],
-    extracted: dict[int, dict],
-) -> None:
-    """搜索知识库并回填 standard_doc_id 等字段。
-
-    搜索策略（按优先级）：
-    1. 精确文本搜索（rga）— 标准编号
-    2. 向量语义搜索 — 标准编号 + 标准名称
-    3. 结果精确验证 — 命中内容的 content 必须包含标准编号
-
-    结果缓存：同一标准编号只搜一次。
-
-    Args:
-        issues: 待处理的 issue 列表（原地修改）
-        kb_ids: 审核任务关联的知识库 ID 列表
-        extracted: _extract_standard_info() 的返回值
-    """
-    if not issues or not kb_ids:
-        return
-
-    from services.vector_search import search_doc_by_text, vec_search
-
-    # 搜索结果缓存：standard_number -> {doc_id, page_number, chunk_text} | None
-    _search_cache: dict[str, dict | None] = {}
-
-    # 按 issue id 索引
-    issue_by_id = {iss.id: iss for iss in issues}
-
-    for iss_id, info in extracted.items():
-        issue = issue_by_id.get(iss_id)
-        if not issue or not issue.standard_reference:
-            continue
-
-        standard_numbers = info.get("standard_numbers", []) or []
-        standard_names = info.get("standard_names", []) or []
-
-        best_hit = None
-
-        # ── 策略1: 精确文本搜索 ──
-        for std_num in standard_numbers:
-            if std_num in _search_cache:
-                best_hit = _search_cache[std_num]
-                break
-
-            text_hits = search_doc_by_text(std_num, kb_ids)
-            if text_hits:
-                # 文本搜索命中了文档，但缺少 page_number
-                # 用向量搜索补充 page_number 和 chunk_text
-                query = f"{std_num} {standard_names[0]}" if standard_names else std_num
-                vec_hits = vec_search(kb_ids, query, top_k=3)
-
-                # 精确验证：vec hits 的 content 必须包含标准编号
-                matched_doc_ids = {h["doc_id"] for h in text_hits}
-                for vh in vec_hits:
-                    if vh["doc_id"] in matched_doc_ids:
-                        content = vh.get("content", "")
-                        if any(sn in content for sn in standard_numbers):
-                            best_hit = {
-                                "doc_id": vh["doc_id"],
-                                "page_number": vh.get("page_number"),
-                                "chunk_text": content[:500],
-                            }
-                            break
-
-                _search_cache[std_num] = best_hit
-                break
-
-        # ── 策略2: 向量语义搜索（文本搜索无结果时） ──
-        if not best_hit and (standard_numbers or standard_names):
-            query_parts = standard_numbers + standard_names
-            query = " ".join(query_parts[:3])  # 最多3个词
-            vec_hits = vec_search(kb_ids, query, top_k=5)
-
-            for vh in vec_hits:
-                content = vh.get("content", "")
-                # 精确验证
-                verified = False
-                if standard_numbers:
-                    verified = any(sn in content for sn in standard_numbers)
-                else:
-                    verified = any(nm in content for nm in standard_names)
-
-                if verified:
-                    best_hit = {
-                        "doc_id": vh["doc_id"],
-                        "page_number": vh.get("page_number"),
-                        "chunk_text": content[:500],
-                    }
-                    if standard_numbers:
-                        for sn in standard_numbers:
-                            _search_cache[sn] = best_hit
-                    break
-
-        # ── 回填 ──
-        sr = issue.standard_reference
-        if best_hit:
-            sr.doc_id = best_hit["doc_id"]
-            raw_page = best_hit.get("page_number")
-            sr.page_number = raw_page + 1 if raw_page is not None else None
-            sr.chunk_text = best_hit.get("chunk_text")
-            _logger.info(
-                "_search_and_link_standards: linked issue #%d to doc %s",
-                issue.id, best_hit["doc_id"],
-            )
-        # 无论是否搜到 KB 文档，只要 LLM 提取出了标准编号且 standard_name 为空，就补上
-        if not sr.standard_name and standard_numbers:
-            sr.standard_name = standard_numbers[0]
-            sr.standard_id = standard_numbers[0]
-
-
-def _link_standards_to_kb(
-    issues: list[AuditIssue],
-    kb_ids: list[str],
-) -> None:
-    """审核后处理：将 issue 中引用的标准关联到 KB 文档。
-
-    筛选 standard_doc_id 为空的 issue → LLM 提取标准信息 →
-    搜索 KB → 回填 doc_id/page_number/chunk_text。
-
-    任何步骤失败都不影响审核结果。
-    """
-    if not issues or not kb_ids:
-        return
-
-    # 收集 KB 中所有有效的 doc_id（用于验证 LLM 填入的 doc_id 是否真实存在）
-    import storage.doc_repo as _doc_repo
-    valid_doc_ids: set[str] = set()
-    for kb_id in kb_ids:
-        try:
-            for doc in _doc_repo.list_docs(kb_id):
-                valid_doc_ids.add(doc.id)
-        except Exception:
-            pass
-
-    # 筛选：standard_doc_id 为空，或指向不存在的文档（LLM 幻觉）
-    pending = []
-    for iss in issues:
-        sr = iss.standard_reference
-        if not sr:
-            continue
-        doc_id = sr.doc_id
-        if not doc_id:
-            pending.append(iss)
-        elif doc_id not in valid_doc_ids:
-            # LLM 填入了无效的 doc_id，清除后重新搜索
-            sr.doc_id = None
-            sr.page_number = None
-            sr.chunk_text = None
-            pending.append(iss)
-
-    if not pending:
-        return
-
-    _logger.info("_link_standards_to_kb: %d issues need standard linking", len(pending))
-
-    try:
-        extracted = _extract_standard_info(pending)
-    except Exception as e:
-        _logger.warning("_link_standards_to_kb: extraction failed: %s", e)
-        return
-
-    if not extracted:
-        return
-
-    try:
-        _search_and_link_standards(pending, kb_ids, extracted)
-    except Exception as e:
-        _logger.warning("_link_standards_to_kb: search failed: %s", e)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # 结果构建
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -926,74 +593,6 @@ def _build_result(
         issues=issues,
         raw_analysis=raw_analysis,
     )
-
-
-def _save_trace(
-    task_id: str,
-    doc_id: str,
-    doc_name: str,
-    issues_count: int,
-    total_iterations: int,
-    messages: list[dict],
-    *,
-    provider: str = "deepseek",
-    model: str = "",
-    finished: bool = True,
-) -> Path | None:
-    """持久化 agentic 审核的完整对话跟踪记录。
-
-    保存到 data/audits/{doc_id}/tasks/{task_id}_trace.json，包含完整的
-    消息历史（系统提示、用户消息、每轮 tool_calls 及其结果、reasoning），
-    便于事后诊断 agent 行为、验证工具描述效果、分析 LLM 决策质量。
-    """
-    try:
-        trace_dir = _TRACE_DIR / doc_id / "tasks" / "traces"
-        trace_dir.mkdir(parents=True, exist_ok=True)
-        trace_path = trace_dir / f"{task_id}_trace.json"
-
-        # 序列化消息：去重过大的内容避免文件膨胀
-        serializable_messages = []
-        for m in messages:
-            sm = dict(m)
-            # content 可能为 None（assistant 只有 tool_calls 时）
-            if sm.get("content") and len(str(sm["content"])) > 10000:
-                sm["content"] = str(sm["content"])[:10000] + (
-                    f"\n…[content truncated from "
-                    f"{len(str(m['content']))} chars]"
-                )
-            # tool_calls 中的 arguments 也可能很大
-            if "tool_calls" in sm:
-                for tc in sm["tool_calls"]:
-                    if "function" in tc and "arguments" in tc["function"]:
-                        args_str = tc["function"]["arguments"]
-                        if isinstance(args_str, str) and len(args_str) > 5000:
-                            tc["function"]["arguments"] = (
-                                args_str[:5000] + "…[truncated]"
-                            )
-            serializable_messages.append(sm)
-
-        trace = {
-            "task_id": task_id,
-            "doc_id": doc_id,
-            "doc_name": doc_name,
-            "provider": provider,
-            "model": model or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "finished": finished,
-            "total_iterations": total_iterations,
-            "issues_count": issues_count,
-            "messages": serializable_messages,
-        }
-
-        with open(trace_path, "w", encoding="utf-8") as f:
-            json.dump(trace, f, ensure_ascii=False, indent=2)
-
-        _logger.info("agentic trace saved: %s (%d messages, %.1f KB)",
-                      trace_path, len(messages), trace_path.stat().st_size / 1024)
-        return trace_path
-    except Exception as e:
-        _logger.warning("failed to save agentic trace: %s", e)
-        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1289,13 +888,13 @@ def _execute_native_tool(
             args.get("chapter_index", 1),
         )
     elif func_name == "search_kb":
-        return _tool_search_kb(
+        return search_kb(
             kb_ids,
             args.get("query", ""),
             args.get("top_k", 5),
         )
     elif func_name == "search_kb_text":
-        return _tool_search_kb_text(kb_ids, args.get("query", ""))
+        return search_kb_text(kb_ids, args.get("query", ""))
     elif func_name == "flag_issue":
         action = AgentAction(
             thought="",
@@ -1337,31 +936,14 @@ def _run_native_tool_calling(
     - thinking 模式启用，审核判断更准确
     - 支持一次请求内连续调用多个工具
     """
-    from openai import OpenAI
-    import httpx
-
-    def _emit(event: dict):
-        # 存入共享日志
-        with _task_log_lock:
-            if task_id not in _task_event_logs:
-                _task_event_logs[task_id] = []
-            _task_event_logs[task_id].append(event)
-        # 同时推送给当前 SSE 连接的回调
-        if event_callback:
-            try:
-                event_callback(event)
-            except Exception:
-                pass
+    _emit = _make_emitter(task_id, event_callback)
 
     _emit({"type": "start", "message": "Agentic 审核开始 (DeepSeek thinking 模式)"})
 
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-    base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
     model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
-    # 绕过 SOCKS 代理（与 settings.py 中 DeepSeek provider 行为一致）
-    http_client = httpx.Client(trust_env=False, timeout=httpx.Timeout(300))
-    client = OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+    # 原生 OpenAI SDK client；代理绕过集中在 core.settings.make_deepseek_client
+    client = make_deepseek_client()
 
     issues: list[AuditIssue] = []
     issue_count_before = 0
@@ -1399,16 +981,10 @@ def _run_native_tool_calling(
 
     for iteration in range(max_iterations):
         # 检查任务是否被取消
-        try:
-            from storage.audit_task_repo import get_task
-            current_task = get_task(task_id)
-            if current_task and current_task.status == "cancelled":
-                _emit({"type": "cancelled", "message": "审核任务已被取消"})
-                _logger.info("agentic audit task %s cancelled at iteration %d", task_id, iteration)
-                raw_analysis = f"审核已取消（第 {iteration} 轮），已记录 {len(issues)} 个问题。"
-                break
-        except Exception:
-            pass  # 取消检查失败不阻塞审核
+        cancelled = _check_cancelled(task_id, _emit, iteration, len(issues))
+        if cancelled is not None:
+            raw_analysis = cancelled
+            break
 
         try:
             response = client.chat.completions.create(
@@ -1515,18 +1091,23 @@ def _run_native_tool_calling(
         _emit({"type": "complete", "summary": raw_analysis, "issues_count": len(issues)})
 
     # 持久化完整对话跟踪
-    _save_trace(
-        task_id, doc_id, doc_name,
-        issues_count=len(issues),
-        total_iterations=iteration + 1,
-        messages=messages,
-        provider="deepseek",
-        model=model,
-        finished=finished,
+    save_trace(
+        _TRACE_DIR / doc_id / "tasks" / "traces" / f"{task_id}_trace.json",
+        messages,
+        metadata={
+            "task_id": task_id,
+            "doc_id": doc_id,
+            "doc_name": doc_name,
+            "provider": "deepseek",
+            "model": model or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
+            "finished": finished,
+            "total_iterations": iteration + 1,
+            "issues_count": len(issues),
+        },
     )
 
     # 后处理：将 issue 中引用的标准关联到知识库文档
-    _link_standards_to_kb(issues, kb_ids)
+    link_standards(issues, kb_ids)
 
     return _build_result(task_id, doc_id, doc_name, issues, raw_analysis)
 
@@ -1549,18 +1130,7 @@ def _run_structured_llm_loop(
     通过 as_structured_llm 让 LLM 输出 AgentAction JSON 来表达工具调用意图。
     适用非 DeepSeek provider（MiniMax、OpenAI 等）或 DeepSeek 原生路径失败时。
     """
-    def _emit(event: dict):
-        # 存入共享日志
-        with _task_log_lock:
-            if task_id not in _task_event_logs:
-                _task_event_logs[task_id] = []
-            _task_event_logs[task_id].append(event)
-        # 同时推送给当前 SSE 连接的回调
-        if event_callback:
-            try:
-                event_callback(event)
-            except Exception:
-                pass
+    _emit = _make_emitter(task_id, event_callback)
 
     _emit({"type": "start", "message": "Agentic 审核开始 (structured_llm 模式)"})
 
@@ -1588,16 +1158,10 @@ def _run_structured_llm_loop(
 
     for turn in range(MAX_TURNS):
         # 检查任务是否被取消
-        try:
-            from storage.audit_task_repo import get_task
-            current_task = get_task(task_id)
-            if current_task and current_task.status == "cancelled":
-                _emit({"type": "cancelled", "message": "审核任务已被取消"})
-                _logger.info("structured_llm audit task %s cancelled at turn %d", task_id, turn)
-                raw_analysis = f"审核已取消（第 {turn} 轮），已记录 {len(issues)} 个问题。"
-                break
-        except Exception:
-            pass
+        cancelled = _check_cancelled(task_id, _emit, turn, len(issues))
+        if cancelled is not None:
+            raw_analysis = cancelled
+            break
 
         try:
             response = structured_llm.chat(messages)
@@ -1704,17 +1268,23 @@ def _run_structured_llm_loop(
         if hasattr(m, "additional_kwargs") and m.additional_kwargs:
             sm["additional_kwargs"] = m.additional_kwargs
         serializable_messages.append(sm)
-    _save_trace(
-        task_id, doc_id, doc_name,
-        issues_count=len(issues),
-        total_iterations=turn + 1,
-        messages=serializable_messages,
-        provider=os.environ.get("LLM_PROVIDER", "unknown"),
-        finished=finished,
+    save_trace(
+        _TRACE_DIR / doc_id / "tasks" / "traces" / f"{task_id}_trace.json",
+        serializable_messages,
+        metadata={
+            "task_id": task_id,
+            "doc_id": doc_id,
+            "doc_name": doc_name,
+            "provider": os.environ.get("LLM_PROVIDER", "unknown"),
+            "model": os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
+            "finished": finished,
+            "total_iterations": turn + 1,
+            "issues_count": len(issues),
+        },
     )
 
     # 后处理：将 issue 中引用的标准关联到知识库文档
-    _link_standards_to_kb(issues, kb_ids)
+    link_standards(issues, kb_ids)
 
     return _build_result(task_id, doc_id, doc_name, issues, raw_analysis)
 

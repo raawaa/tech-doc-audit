@@ -9,13 +9,17 @@ AUDIT_DATA_DIR 必须在任何 storage 模块被 import 之前设置——
 脆弱的模块级 ``os.environ`` 赋值。
 """
 
+import hashlib
 import os
 import shutil
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
+from llama_index.core import Settings as _LISettings
+from llama_index.core.embeddings import BaseEmbedding
 
 
 @pytest.fixture(autouse=True)
@@ -55,3 +59,90 @@ def mock_llm():
     llm.as_structured_llm.return_value = structured
     llm.chat.return_value.message.content = ""
     return llm
+
+
+# ── fake_models：注入假 LLM/embedder，取代 core.settings 单例 ────────────────────
+
+
+class _FakeEmbedder(BaseEmbedding):
+    """确定性 embedder：md5(text) → seed RNG → dim 维单位向量。仅供测试。
+
+    向量无语义意义，但维度/类型/批量接口与真 bge-m3 兼容，足以驱动 LlamaIndex
+    FAISS 建索引 + 查询，让测试无需加载 ~2GB bge-m3。
+    """
+
+    dim: int = 1024
+
+    def _vec(self, text: str) -> list[float]:
+        h = hashlib.md5((text or "").encode()).digest()
+        rng = np.random.default_rng(np.frombuffer(h * 4, dtype=np.uint32))
+        v = rng.standard_normal(self.dim).astype(np.float32)
+        n = np.linalg.norm(v)
+        return (v / n).tolist()
+
+    def _get_query_embedding(self, query: str) -> list[float]:
+        return self._vec(query)
+
+    def _get_text_embedding(self, text: str) -> list[float]:
+        return self._vec(text)
+
+    def _get_text_embeddings(self, texts: list[str]) -> list[list[float]]:
+        return [self._vec(t) for t in texts]
+
+    async def _aget_query_embedding(self, query: str) -> list[float]:
+        return self._vec(query)
+
+    async def _aget_text_embedding(self, text: str) -> list[float]:
+        return self._vec(text)
+
+
+@pytest.fixture
+def fake_models(monkeypatch):
+    """opt-in：注入假 LLM/embedder，让测试零模型加载（不载 bge-m3、不连 LLM API）。
+
+    覆盖 core.settings 单例的**双重真值源**：
+    - ``get_embed_model``/``get_llm`` → 返回假模型。patch 各顶层 import 处
+      （core.settings、core.index_manager、services.qa_service）+ 源模块，
+      因为 ``from core.settings import get_embed_model`` 会在 import 处绑定名字。
+    - ``Settings.embed_model``/``Settings.llm`` → 同步设为假模型
+      （``_create_index`` 等走 LlamaIndex 全局 Settings 的路径）。
+    - ``run_reranker`` → 原样返回 nodes（不载真 cross-encoder）。
+
+    Returns ``{"embed_model", "llm"}``；teardown 还原 Settings。
+    """
+    import importlib
+
+    embed = _FakeEmbedder(dim=1024, model_name="fake-deterministic")
+    llm = MagicMock(name="fake_llm")
+
+    # patch 所有顶层 import 了 getter 的模块 + 源模块
+    for mod_name in ("core.settings", "core.index_manager", "services.qa_service"):
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:
+            continue
+        if hasattr(mod, "get_embed_model"):
+            monkeypatch.setattr(mod, "get_embed_model", lambda: embed)
+        if hasattr(mod, "get_llm"):
+            monkeypatch.setattr(mod, "get_llm", lambda: llm)
+        if hasattr(mod, "run_reranker"):
+            monkeypatch.setattr(mod, "run_reranker", lambda nodes, query, config=None: nodes)
+
+    def _peek(attr):
+        # Settings.embed_model 是惰性 property：未设置时读取会触发 resolve
+        # → 回落 OpenAI → 报错。用 try/except 安全捕获旧值，不触发 resolve。
+        try:
+            return getattr(_LISettings, attr)
+        except Exception:
+            return None
+
+    prev_embed, prev_llm = _peek("embed_model"), _peek("llm")
+    _LISettings.embed_model = embed
+    # Settings.llm 必须是 LLM 实例（LlamaIndex 类型校验）；None → MockLLM。
+    # get_llm() 另返 MagicMock（供直接调用 llm.chat 的模块，如 agentic_audit）。
+    _LISettings.llm = None
+    try:
+        yield {"embed_model": embed, "llm": llm}
+    finally:
+        _LISettings.embed_model = prev_embed
+        _LISettings.llm = prev_llm

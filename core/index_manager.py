@@ -341,12 +341,12 @@ def index_documents_batch(
         index = get_kb_index(kb_id)
         total = len(docs)
 
-        for index, item in enumerate(docs, 1):
+        for idx, item in enumerate(docs, 1):
             doc_id, text, source_name = item[0], item[1], item[2]
             page_texts = item[3] if len(item) > 3 else None
 
             if progress_callback:
-                progress_callback(index, total, source_name or doc_id)
+                progress_callback(idx, total, source_name or doc_id)
 
             if not text or len(text) < 20:
                 continue

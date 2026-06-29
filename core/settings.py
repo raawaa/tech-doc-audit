@@ -278,6 +278,34 @@ def get_llm():
     return _llm
 
 
+def make_deepseek_client(*, timeout: int = 300) -> "OpenAI":
+    """构造原生 OpenAI SDK client，供 agentic loop 的原生 function calling / 流式调用使用。
+
+    代理绕过与 get_llm() 的 DeepSeek provider 一致：
+    - httpx.Client(trust_env=False) 绕过 SOCKS 代理干扰；
+    - 在 _proxy_env_lock 下临时摘除 ALL_PROXY/all_proxy，避免 httpx.Client() 初始化时读取，构造后恢复。
+
+    注意：返回原生 openai.OpenAI（用于 client.chat.completions.create），
+    不同于 get_llm() 返回的 LlamaIndex OpenAILLM（供 as_structured_llm 使用）。
+    三处代理绕过（本函数 / get_llm 的 DeepSeek 分支 / _create_safe_ollama）共享同一 _proxy_env_lock 模式。
+    """
+    from openai import OpenAI
+    import httpx
+
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+    http_client = httpx.Client(trust_env=False, timeout=httpx.Timeout(timeout))
+
+    with _proxy_env_lock:
+        _orig = os.environ.pop("ALL_PROXY", None)
+        os.environ.pop("all_proxy", None)
+        try:
+            return OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+        finally:
+            if _orig is not None:
+                os.environ["ALL_PROXY"] = _orig
+
+
 def _create_safe_ollama(*, model: str, base_url: str, timeout: int, temperature: float = 0.0):
     """创建绕过 SOCKS 代理问题的 Ollama LLM 实例。"""
     with _proxy_env_lock:

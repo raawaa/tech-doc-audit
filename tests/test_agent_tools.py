@@ -1,0 +1,116 @@
+"""services.agent_tools 的格式化测试。
+
+monkeypatch 底层检索（vec_search / _get_kb_search_paths / _run_rga），
+覆盖结果格式化、来源单一性警告、空结果、失败建议文案——不加载任何模型。
+"""
+import services.vector_search as vector_search
+from services.agent_tools import search_kb, search_kb_text
+
+
+def _result(**kw):
+    base = {
+        "relevance": 0.8,
+        "doc_source": "GB-标准A",
+        "doc_id": "doc_a",
+        "clause_number": "",
+        "section_path": "",
+        "page_number": None,
+        "content": "条款内容",
+    }
+    base.update(kw)
+    return base
+
+
+# ── search_kb ────────────────────────────────────────────────────────────────
+
+def test_search_kb_empty_query_or_kb():
+    assert "未提供" in search_kb([], "q")
+    assert "未提供" in search_kb(["kb1"], "")
+
+
+def test_search_kb_formats_results(monkeypatch):
+    monkeypatch.setattr(
+        vector_search, "vec_search",
+        lambda kb_ids, query, top_k=5: [_result(relevance=0.82, content="条款内容X")],
+    )
+    out = search_kb(["kb1"], "质保期")
+    assert "知识库搜索结果" in out
+    assert "质保期" in out
+    assert "相关度: 0.82" in out
+    assert "条款内容X" in out
+
+
+def test_search_kb_source_diversity_warning(monkeypatch):
+    # 两条结果来自同一 doc_id → 触发来源单一性警告（QA 采用 audit 版本后的行为变更）
+    monkeypatch.setattr(
+        vector_search, "vec_search",
+        lambda kb_ids, query, top_k=5: [_result(doc_id="doc_a"), _result(doc_id="doc_a")],
+    )
+    out = search_kb(["kb1"], "q")
+    assert "来源单一性警告" in out
+
+
+def test_search_kb_multi_doc_no_warning(monkeypatch):
+    monkeypatch.setattr(
+        vector_search, "vec_search",
+        lambda kb_ids, query, top_k=5: [_result(doc_id="doc_a"), _result(doc_id="doc_b")],
+    )
+    out = search_kb(["kb1"], "q")
+    assert "来源单一性警告" not in out
+
+
+def test_search_kb_no_results(monkeypatch):
+    monkeypatch.setattr(vector_search, "vec_search", lambda kb_ids, query, top_k=5: [])
+    out = search_kb(["kb1"], "q")
+    assert "未找到" in out
+
+
+def test_search_kb_failure_advice(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(vector_search, "vec_search", boom)
+    out = search_kb(["kb1"], "q")
+    assert "语义搜索失败" in out
+    assert "建议" in out
+    assert "search_kb_text" in out  # 失败建议指向兄弟工具
+
+
+# ── search_kb_text ───────────────────────────────────────────────────────────
+
+def test_search_kb_text_formats(monkeypatch):
+    monkeypatch.setattr(vector_search, "_get_kb_search_paths", lambda kb_ids: ["p"])
+    monkeypatch.setattr(vector_search, "_run_rga", lambda query, paths: "命中行A\n命中行B")
+    out = search_kb_text(["kb1"], "GB/T 12345")
+    assert "知识库文本搜索结果" in out
+    assert "命中行A" in out
+
+
+def test_search_kb_text_truncates(monkeypatch):
+    monkeypatch.setattr(vector_search, "_get_kb_search_paths", lambda kb_ids: ["p"])
+    monkeypatch.setattr(vector_search, "_run_rga", lambda query, paths: "X" * 6000)
+    out = search_kb_text(["kb1"], "q")
+    assert "截断" in out
+
+
+def test_search_kb_text_no_paths(monkeypatch):
+    monkeypatch.setattr(vector_search, "_get_kb_search_paths", lambda kb_ids: [])
+    out = search_kb_text(["kb1"], "q")
+    assert "无可用文档路径" in out
+
+
+def test_search_kb_text_no_results(monkeypatch):
+    monkeypatch.setattr(vector_search, "_get_kb_search_paths", lambda kb_ids: ["p"])
+    monkeypatch.setattr(vector_search, "_run_rga", lambda query, paths: "")
+    out = search_kb_text(["kb1"], "q")
+    assert "未找到" in out
+
+
+def test_search_kb_text_failure_advice(monkeypatch):
+    monkeypatch.setattr(vector_search, "_get_kb_search_paths", lambda kb_ids: ["p"])
+
+    def boom(query, paths):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(vector_search, "_run_rga", boom)
+    out = search_kb_text(["kb1"], "q")
+    assert "文本搜索失败" in out
+    assert "建议" in out
