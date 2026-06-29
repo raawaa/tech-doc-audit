@@ -72,6 +72,57 @@ def clear_task_events(task_id: str):
         _task_event_logs.pop(task_id, None)
 
 
+def _make_emitter(
+    task_id: str,
+    event_callback: Callable[[dict], None] | None,
+) -> Callable[[dict], None]:
+    """构造 audit loop 共用的事件发射闭包。
+
+    每次调用把事件 append 进 per-task 共享日志（供 SSE 长轮询读取），
+    并尽力推给当前 SSE 连接的 callback（失败静默，不阻塞审核）。
+
+    audit 的 native 与 structured 两 loop 曾逐字重复此逻辑，抽到此处复用。
+    qa 的 _emit 不写共享日志、结构不同，不复用本函数。
+    """
+    def _emit(event: dict):
+        with _task_log_lock:
+            if task_id not in _task_event_logs:
+                _task_event_logs[task_id] = []
+            _task_event_logs[task_id].append(event)
+        if event_callback:
+            try:
+                event_callback(event)
+            except Exception:
+                pass
+
+    return _emit
+
+
+def _check_cancelled(
+    task_id: str,
+    emit: Callable[[dict], None],
+    turn: int,
+    issues_count: int,
+) -> str | None:
+    """检查审核任务是否已被取消。
+
+    已取消：发 cancelled 事件、记日志，返回用于 raw_analysis 的文案。
+    未取消：返回 None。
+    读取任务状态本身失败时不阻塞审核，返回 None。
+    """
+    try:
+        from storage.audit_task_repo import get_task
+        current_task = get_task(task_id)
+    except Exception:
+        return None
+
+    if current_task and current_task.status == "cancelled":
+        emit({"type": "cancelled", "message": "审核任务已被取消"})
+        _logger.info("audit task %s cancelled at turn %d", task_id, turn)
+        return f"审核已取消（第 {turn} 轮），已记录 {issues_count} 个问题。"
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # System Prompt
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -885,18 +936,7 @@ def _run_native_tool_calling(
     - thinking 模式启用，审核判断更准确
     - 支持一次请求内连续调用多个工具
     """
-    def _emit(event: dict):
-        # 存入共享日志
-        with _task_log_lock:
-            if task_id not in _task_event_logs:
-                _task_event_logs[task_id] = []
-            _task_event_logs[task_id].append(event)
-        # 同时推送给当前 SSE 连接的回调
-        if event_callback:
-            try:
-                event_callback(event)
-            except Exception:
-                pass
+    _emit = _make_emitter(task_id, event_callback)
 
     _emit({"type": "start", "message": "Agentic 审核开始 (DeepSeek thinking 模式)"})
 
@@ -941,16 +981,10 @@ def _run_native_tool_calling(
 
     for iteration in range(max_iterations):
         # 检查任务是否被取消
-        try:
-            from storage.audit_task_repo import get_task
-            current_task = get_task(task_id)
-            if current_task and current_task.status == "cancelled":
-                _emit({"type": "cancelled", "message": "审核任务已被取消"})
-                _logger.info("agentic audit task %s cancelled at iteration %d", task_id, iteration)
-                raw_analysis = f"审核已取消（第 {iteration} 轮），已记录 {len(issues)} 个问题。"
-                break
-        except Exception:
-            pass  # 取消检查失败不阻塞审核
+        cancelled = _check_cancelled(task_id, _emit, iteration, len(issues))
+        if cancelled is not None:
+            raw_analysis = cancelled
+            break
 
         try:
             response = client.chat.completions.create(
@@ -1096,18 +1130,7 @@ def _run_structured_llm_loop(
     通过 as_structured_llm 让 LLM 输出 AgentAction JSON 来表达工具调用意图。
     适用非 DeepSeek provider（MiniMax、OpenAI 等）或 DeepSeek 原生路径失败时。
     """
-    def _emit(event: dict):
-        # 存入共享日志
-        with _task_log_lock:
-            if task_id not in _task_event_logs:
-                _task_event_logs[task_id] = []
-            _task_event_logs[task_id].append(event)
-        # 同时推送给当前 SSE 连接的回调
-        if event_callback:
-            try:
-                event_callback(event)
-            except Exception:
-                pass
+    _emit = _make_emitter(task_id, event_callback)
 
     _emit({"type": "start", "message": "Agentic 审核开始 (structured_llm 模式)"})
 
@@ -1135,16 +1158,10 @@ def _run_structured_llm_loop(
 
     for turn in range(MAX_TURNS):
         # 检查任务是否被取消
-        try:
-            from storage.audit_task_repo import get_task
-            current_task = get_task(task_id)
-            if current_task and current_task.status == "cancelled":
-                _emit({"type": "cancelled", "message": "审核任务已被取消"})
-                _logger.info("structured_llm audit task %s cancelled at turn %d", task_id, turn)
-                raw_analysis = f"审核已取消（第 {turn} 轮），已记录 {len(issues)} 个问题。"
-                break
-        except Exception:
-            pass
+        cancelled = _check_cancelled(task_id, _emit, turn, len(issues))
+        if cancelled is not None:
+            raw_analysis = cancelled
+            break
 
         try:
             response = structured_llm.chat(messages)

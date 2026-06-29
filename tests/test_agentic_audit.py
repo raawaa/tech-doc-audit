@@ -260,3 +260,75 @@ class TestFallbackParser:
         from services.agentic_audit import _parse_action_fallback
         result = _parse_action_fallback('{"thought": "test"}')
         assert result is None
+
+
+class TestLoopHelpers:
+    """测试 audit 两 loop 共用辅助 _make_emitter / _check_cancelled。"""
+
+    def teardown_method(self):
+        # 清理 per-task 共享事件日志，避免用例间污染
+        import services.agentic_audit as agentic
+        agentic._task_event_logs.clear()
+
+    def test_make_emitter_writes_shared_log_and_pushes_callback(self):
+        from services.agentic_audit import _make_emitter, get_task_events_since
+
+        pushed = []
+        emit = _make_emitter("task_x", pushed.append)
+        emit({"type": "start", "message": "hi"})
+
+        assert pushed == [{"type": "start", "message": "hi"}]
+        log, next_idx = get_task_events_since("task_x", 0)
+        assert log == [{"type": "start", "message": "hi"}]
+        assert next_idx == 1
+
+    def test_make_emitter_no_callback_ok(self):
+        from services.agentic_audit import _make_emitter, get_task_events_since
+
+        emit = _make_emitter("task_y", None)
+        emit({"type": "start", "message": "hi"})  # callback=None 不应抛异常
+        assert get_task_events_since("task_y", 0)[0] == [{"type": "start", "message": "hi"}]
+
+    def test_make_emitter_swallows_callback_exception(self):
+        from services.agentic_audit import _make_emitter, get_task_events_since
+
+        def bad_cb(_event):
+            raise RuntimeError("SSE 连接已断")
+
+        emit = _make_emitter("task_z", bad_cb)
+        emit({"type": "start", "message": "hi"})  # callback 抛异常不应冒泡
+        # 共享日志仍应写入（audit 不应因 SSE 断开而中断）
+        assert get_task_events_since("task_z", 0)[0] == [{"type": "start", "message": "hi"}]
+
+    def test_check_cancelled_emits_and_returns_text_when_cancelled(self):
+        from services.agentic_audit import _check_cancelled
+
+        task = MagicMock(status="cancelled")
+        emitted = []
+        with patch("storage.audit_task_repo.get_task", return_value=task):
+            result = _check_cancelled("task_c", emitted.append, turn=3, issues_count=5)
+
+        assert result is not None
+        assert "第 3 轮" in result
+        assert "5" in result  # 已记录 5 个问题
+        assert emitted == [{"type": "cancelled", "message": "审核任务已被取消"}]
+
+    def test_check_cancelled_returns_none_when_running(self):
+        from services.agentic_audit import _check_cancelled
+
+        task = MagicMock(status="running")
+        with patch("storage.audit_task_repo.get_task", return_value=task):
+            assert _check_cancelled("task_n", lambda _e: None, 1, 0) is None
+
+    def test_check_cancelled_returns_none_when_task_missing(self):
+        from services.agentic_audit import _check_cancelled
+
+        with patch("storage.audit_task_repo.get_task", return_value=None):
+            assert _check_cancelled("task_m", lambda _e: None, 1, 0) is None
+
+    def test_check_cancelled_returns_none_when_get_task_raises(self):
+        from services.agentic_audit import _check_cancelled
+
+        # 读取任务状态失败不应阻塞审核（等价于未取消）
+        with patch("storage.audit_task_repo.get_task", side_effect=RuntimeError("db down")):
+            assert _check_cancelled("task_e", lambda _e: None, 1, 0) is None
