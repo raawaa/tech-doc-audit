@@ -16,6 +16,7 @@ from typing import Callable, Optional
 from core.logger import get_logger
 from core.degradation import record as _deg_record
 from core.settings import make_deepseek_client
+from services.agent_tools import search_kb, search_kb_text
 
 _logger = get_logger(__name__)
 
@@ -134,88 +135,15 @@ _TOOLS_SPEC = [
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 工具实现（复用 agentic_audit 的搜索工具）
+# 工具分发（search_kb / search_kb_text 实现见 services.agent_tools）
 # ═══════════════════════════════════════════════════════════════════════════════
-
-def _tool_search_kb(kb_ids: list[str], query: str, top_k: int = 5) -> str:
-    """语义搜索知识库。"""
-    if not query or not kb_ids:
-        return "（未提供搜索关键词或知识库）"
-
-    from services.vector_search import vec_search
-
-    try:
-        results = vec_search(kb_ids, query, top_k=top_k)
-    except Exception as e:
-        _logger.warning("search_kb failed for query '%s': %s", query, e)
-        error_msg = str(e)
-        return (
-            f"（语义搜索失败: {error_msg}。\n"
-            f"建议：1) 尝试用更简短的关键词；"
-            f"2) 如果是精确术语或标准编号，改用 search_kb_text；"
-            f"3) 如果持续失败，尝试换一个角度提问）"
-        )
-
-    if not results:
-        return f"（未找到与「{query}」相关的内容，建议换关键词或改用 search_kb_text 精确搜索）"
-
-    lines = [f"【知识库搜索结果（搜索词: {query}，共 {len(results)} 条）】"]
-    for i, r in enumerate(results, 1):
-        relevance = r.get("relevance", 0)
-        doc = r.get("doc_source", "") or r.get("doc_id", "")
-        clause = r.get("clause_number", "")
-        section = r.get("section_path", "")
-        content = (r.get("content", "") or "")
-
-        label_parts = []
-        if doc:
-            label_parts.append(f"【{doc}】")
-        if clause:
-            label_parts.append(f"第{clause}条")
-        if section and not clause:
-            label_parts.append(section)
-        label = " ".join(label_parts) if label_parts else "未知来源"
-
-        lines.append(f"\n{i}. {label} (相关度: {relevance:.2f})\n   {content}")
-    return "\n".join(lines)
-
-
-def _tool_search_kb_text(kb_ids: list[str], query: str) -> str:
-    """精确文本搜索知识库。"""
-    if not query or not kb_ids:
-        return "（未提供搜索关键词或知识库）"
-
-    from services.vector_search import _get_kb_search_paths, _run_rga
-
-    paths = _get_kb_search_paths(kb_ids)
-    if not paths:
-        return "（知识库无可用文档路径）"
-
-    try:
-        result = _run_rga(query, paths)
-    except Exception as e:
-        _logger.warning("search_kb_text failed for query '%s': %s", query, e)
-        error_msg = str(e)
-        return (
-            f"（文本搜索失败: {error_msg}。\n"
-            f"建议：1) 简化搜索词为更短的关键词；"
-            f"2) 如果是概念性内容，改用 search_kb 语义搜索）"
-        )
-
-    if not result:
-        return f"（未找到与「{query}」匹配的文本，建议换关键词或改用 search_kb 语义搜索）"
-
-    if len(result) > 5000:
-        result = result[:5000] + "\n... [截断]"
-    return f"【知识库文本搜索结果（精确匹配: {query}）】\n{result}"
-
 
 def _execute_tool(func_name: str, args: dict, kb_ids: list[str]) -> str:
     """工具分发。"""
     if func_name == "search_kb":
-        return _tool_search_kb(kb_ids, args.get("query", ""), args.get("top_k", 5))
+        return search_kb(kb_ids, args.get("query", ""), args.get("top_k", 5))
     elif func_name == "search_kb_text":
-        return _tool_search_kb_text(kb_ids, args.get("query", ""))
+        return search_kb_text(kb_ids, args.get("query", ""))
     return f"未知工具: {func_name}。可用工具：search_kb、search_kb_text。"
 
 

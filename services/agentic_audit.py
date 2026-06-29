@@ -24,6 +24,7 @@ from llama_index.core.llms import ChatMessage, MessageRole
 
 from core.logger import get_logger
 from core.settings import get_llm, make_deepseek_client
+from services.agent_tools import search_kb, search_kb_text
 from core.degradation import record as _deg_record
 from models.audit_document import DocumentStructure
 from models.audit_task import (
@@ -338,111 +339,6 @@ def _format_chapter_text(text: str, index: int, label: str) -> str:
     )
 
 
-def _tool_search_kb(kb_ids: list[str], query: str, top_k: int = 5) -> str:
-    """搜索知识库，返回格式化的标准条款。"""
-    if not query or not kb_ids:
-        return "（未提供搜索关键词或知识库）"
-
-    from services.vector_search import vec_search
-
-    try:
-        results = vec_search(kb_ids, query, top_k=top_k)
-    except Exception as e:
-        _logger.warning("search_kb failed for query '%s': %s", query, e)
-        error_msg = str(e)
-        return (
-            f"（语义搜索失败: {error_msg}。\n"
-            f"建议：1) 尝试用更简短的关键词（如去掉修饰词）；"
-            f"2) 如果是精确术语或标准编号，改用 search_kb_text；"
-            f"3) 如果持续失败，跳过当前搜索点继续审核其他内容）"
-        )
-
-    if not results:
-        return f"（未找到与「{query}」相关的标准）"
-
-    lines = [f"【知识库搜索结果（搜索词: {query}，共 {len(results)} 条）】"]
-
-    # 统计来源多样性
-    unique_doc_ids: set[str] = set()
-    unique_sources: set[str] = set()
-
-    for i, r in enumerate(results, 1):
-        relevance = r.get("relevance", 0)
-        doc = r.get("doc_source", "") or r.get("doc_id", "")
-        doc_id = r.get("doc_id", "")
-        clause = r.get("clause_number", "")
-        section = r.get("section_path", "")
-        page_number = r.get("page_number")  # 0-based from metadata
-        content = (r.get("content", "") or "")
-
-        if doc_id:
-            unique_doc_ids.add(doc_id)
-        if doc:
-            unique_sources.add(doc)
-
-        label_parts = []
-        if doc:
-            label_parts.append(f"【{doc}】")
-        if clause:
-            label_parts.append(f"第{clause}条")
-        if section and not clause:
-            label_parts.append(section)
-        label = " ".join(label_parts) if label_parts else "未知来源"
-
-        meta_parts = [f"相关度: {relevance:.2f}"]
-        if doc_id:
-            meta_parts.append(f"doc_id: {doc_id}")
-        if page_number is not None:
-            meta_parts.append(f"页码: 第{page_number + 1}页")  # 0-based → 1-based display
-        meta_line = " | ".join(meta_parts)
-
-        lines.append(f"\n{i}. {label}\n   {meta_line}\n   {content}")
-
-    # 来源单一性警告：当所有结果来自 ≤1 个文档时提示
-    if len(unique_doc_ids) <= 1 and len(results) > 0:
-        source_label = "、".join(sorted(unique_sources)) if unique_sources else "未知来源"
-        lines.append(
-            f"\n⚠️ 来源单一性警告：所有 {len(results)} 条结果均来自同一份标准文档"
-            f"（{source_label}）。"
-            f"如果该文档的技术领域与当前搜索意图不匹配，"
-            f"请换用完全不同的关键词重搜，或转向审核文档的其他主题。"
-        )
-
-    return "\n".join(lines)
-
-
-def _tool_search_kb_text(kb_ids: list[str], query: str) -> str:
-    """纯文本关键词搜索知识库（rga/rg），精确匹配。"""
-    if not query or not kb_ids:
-        return "（未提供搜索关键词或知识库）"
-
-    from services.vector_search import _get_kb_search_paths, _run_rga
-
-    paths = _get_kb_search_paths(kb_ids)
-    if not paths:
-        return "（知识库无可用文档路径）"
-
-    try:
-        result = _run_rga(query, paths)
-    except Exception as e:
-        _logger.warning("search_kb_text failed for query '%s': %s", query, e)
-        error_msg = str(e)
-        return (
-            f"（文本搜索失败: {error_msg}。\n"
-            f"建议：1) 简化搜索词为更短的关键词；"
-            f"2) 如果是概念性要求，改用 search_kb 语义搜索；"
-            f"3) 如果持续失败，跳过当前搜索继续审核其他内容）"
-        )
-
-    if not result:
-        return f"（未找到与「{query}」匹配的文本）"
-
-    # 截断
-    if len(result) > 5000:
-        result = result[:5000] + "\n... [截断]"
-    return f"【知识库文本搜索结果（精确匹配: {query}）】\n{result}"
-
-
 def _tool_flag_issue(action: AgentAction, issues: list[AuditIssue]) -> str:
     """记录审核问题（含去重检查）。"""
     warnings = []
@@ -544,11 +440,11 @@ def _execute_tool(
     elif tool_name == "search_kb":
         query = action.search_query or ""
         top_k = action.search_top_k or 5
-        return _tool_search_kb(kb_ids, query, top_k)
+        return search_kb(kb_ids, query, top_k)
 
     elif tool_name == "search_kb_text":
         query = action.search_query or ""
-        return _tool_search_kb_text(kb_ids, query)
+        return search_kb_text(kb_ids, query)
 
     elif tool_name == "flag_issue":
         return _tool_flag_issue(action, issues)
@@ -1009,13 +905,13 @@ def _execute_native_tool(
             args.get("chapter_index", 1),
         )
     elif func_name == "search_kb":
-        return _tool_search_kb(
+        return search_kb(
             kb_ids,
             args.get("query", ""),
             args.get("top_k", 5),
         )
     elif func_name == "search_kb_text":
-        return _tool_search_kb_text(kb_ids, args.get("query", ""))
+        return search_kb_text(kb_ids, args.get("query", ""))
     elif func_name == "flag_issue":
         action = AgentAction(
             thought="",
