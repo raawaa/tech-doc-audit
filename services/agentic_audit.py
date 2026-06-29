@@ -16,6 +16,7 @@ Agent 自主调用工具逐章审核文档：
 import json
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -992,6 +993,124 @@ class StructuredLLMStep:
         return ToolCalls(calls=[{"name": action.action, "args": args, "id": ""}])
 
 
+class StreamingLLMStep:
+    """流式 function calling adapter：OpenAI tools + streaming + 增量事件发射。
+
+    与 NativeLLMStep 不同：使用 stream=True，在 LLM 调用期间逐 token 发送
+    reasoning_start / reasoning_delta / reasoning_end 和
+    text_start / text_delta / text_end 事件，并将增量到达的 tool_call
+    参数累积后返回 ToolCalls。
+    """
+
+    def __init__(self, tools_spec: list[dict]) -> None:
+        self.client = make_deepseek_client()
+        self.model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+        self.tools_spec = tools_spec
+
+    def step(
+        self, messages: list[dict], emit: Callable[[dict], None],
+    ) -> Final | ToolCalls:
+        try:
+            stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=self.tools_spec,
+                stream=True,
+                extra_body={"thinking": {"type": "enabled"}},
+            )
+        except Exception as e:
+            raise RuntimeError(f"LLM streaming call failed: {e}")
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_call_accumulators: dict[int, dict] = {}
+        reasoning_started = False
+        reasoning_ended = False
+        text_started = False
+
+        try:
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+
+                rc = getattr(delta, 'reasoning_content', None)
+                if rc:
+                    if not reasoning_started:
+                        reasoning_started = True
+                        emit({"type": "reasoning_start"})
+                    reasoning_parts.append(rc)
+                    emit({"type": "reasoning_delta", "content": rc})
+
+                if delta.content:
+                    if reasoning_started and not reasoning_ended:
+                        emit({"type": "reasoning_end"})
+                        reasoning_ended = True
+                    if not text_started:
+                        text_started = True
+                        emit({"type": "text_start"})
+                    content_parts.append(delta.content)
+                    emit({"type": "text_delta", "content": delta.content})
+
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_call_accumulators:
+                            tool_call_accumulators[idx] = {
+                                "id": "",
+                                "name": "",
+                                "arguments": "",
+                            }
+                        acc = tool_call_accumulators[idx]
+                        if tc_delta.id:
+                            acc["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                acc["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                acc["arguments"] += tc_delta.function.arguments
+        except Exception as e:
+            raise RuntimeError(f"流式响应中断: {e}")
+
+        if reasoning_started and not reasoning_ended:
+            emit({"type": "reasoning_end"})
+        if text_started:
+            emit({"type": "text_end"})
+
+        content = "".join(content_parts)
+        reasoning_content = "".join(reasoning_parts)
+
+        tool_calls_list: list[dict] = []
+        for idx in sorted(tool_call_accumulators.keys()):
+            acc = tool_call_accumulators[idx]
+            if acc["id"] and acc["name"]:
+                tool_calls_list.append({
+                    "id": acc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": acc["name"],
+                        "arguments": acc["arguments"],
+                    },
+                })
+
+        assistant_msg: dict = {"role": "assistant", "content": content}
+        if reasoning_content:
+            assistant_msg["reasoning_content"] = reasoning_content
+        if tool_calls_list:
+            assistant_msg["tool_calls"] = tool_calls_list
+        messages.append(assistant_msg)
+
+        if not tool_calls_list:
+            return Final(answer=content)
+
+        return ToolCalls(calls=[
+            {
+                "name": tc["function"]["name"],
+                "args": _safe_json_parse(tc["function"]["arguments"]),
+                "id": tc["id"],
+            }
+            for tc in tool_calls_list
+        ])
+
+
 def _safe_json_parse(s: str) -> dict:
     try:
         return json.loads(s)
@@ -1025,28 +1144,54 @@ def _agent_action_to_args(action: AgentAction) -> dict:
     return {}
 
 
+@dataclass
+class LoopOutput:
+    """统一 agent loop 的原始输出，由调用方按场景做后处理。"""
+    raw_analysis: str
+    messages: list[dict]
+    finished: bool
+    issues: list  # list[AuditIssue] in audit mode, [] in QA mode
+
+
 def run_agent_loop(
     llm_step,
     initial_messages: list[dict],
-    parsed_content: str,
-    structure: DocumentStructure | None,
-    kb_ids: list[str],
-    doc_name: str,
-    task_id: str,
-    doc_id: str,
+    parsed_content: str = "",
+    structure: DocumentStructure | None = None,
+    kb_ids: list[str] | None = None,
+    doc_name: str = "",
+    task_id: str = "",
+    doc_id: str = "",
     event_callback: Callable[[dict], None] | None = None,
     max_turns: int = MAX_TURNS,
     start_event_msg: str = "Agentic 审核开始",
     model_provider: str = "",
     model_name: str = "",
-) -> AuditResult:
-    """统一 agent loop：迭代、cancel、工具分发、trace、后处理。
+    *,
+    emitter: Callable[[dict], None] | None = None,
+    tool_executor: Callable[[str, dict], str] | None = None,
+    cancel_checker: Callable[[], str | None] | None = None,
+    max_consecutive_failures: int | None = None,
+) -> LoopOutput:
+    """统一 agent loop：迭代、cancel、工具分发。
 
     llm_step 是实现 LLMStep 协议的对象：step(messages, emit) -> StepResult。
-    native 与 structured 各提供一个 adapter，loop 主体对两者无分支。
+    native / structured / streaming 各提供一个 adapter，loop 主体无分支。
+
+    audit 场景：不传 emitter / tool_executor / cancel_checker，
+        使用内建的 _make_emitter / _dispatch_tool / _check_cancelled，
+        跟踪 issues，发射 issue_found。
+    QA 场景：传入 emitter / tool_executor，不传 cancel_checker，
+        跳过 issue 跟踪，所有工具结果统一发射 tool_result。
+
+    Returns:
+        LoopOutput：调用方据此做 save_trace / link_standards / 结果构建。
     """
-    _emit = _make_emitter(task_id, event_callback)
-    _emit({"type": "start", "message": start_event_msg})
+    default_emit = _make_emitter(task_id, event_callback)
+    _emit = emitter or default_emit
+
+    if start_event_msg:
+        _emit({"type": "start", "message": start_event_msg})
 
     issues: list[AuditIssue] = []
     issue_count_before = 0
@@ -1056,8 +1201,27 @@ def run_agent_loop(
     consecutive_failures = 0
     finished = False
 
+    # 是否处于 audit 模式（有自己的 emitter + tool dispatch）
+    is_audit = tool_executor is None
+    kb_ids = kb_ids or []
+
+    def _audit_tool_executor(name: str, args: dict) -> str:
+        return _dispatch_tool(
+            name, args, parsed_content, structure, kb_ids, doc_name, issues,
+        )
+
+    _exec_tool = tool_executor or _audit_tool_executor
+    _max_failures = max_consecutive_failures if max_consecutive_failures is not None else MAX_CONSECUTIVE_FAILURES
+
     for turn in range(max_turns):
-        cancelled = _check_cancelled(task_id, _emit, turn, len(issues))
+        # cancel check
+        if is_audit and cancel_checker is None:
+            cancelled = _check_cancelled(task_id, _emit, turn, len(issues))
+        elif cancel_checker is not None:
+            cancelled = cancel_checker()
+        else:
+            cancelled = None
+
         if cancelled is not None:
             raw_analysis = cancelled
             break
@@ -1067,13 +1231,18 @@ def run_agent_loop(
         except Exception as e:
             consecutive_failures += 1
             _logger.warning("agent loop turn %d step failed: %s", turn, e)
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            if consecutive_failures >= _max_failures:
                 _deg_record("agentic_audit", "too_many_failures",
                             f"Turn {turn}: {consecutive_failures} consecutive step failures, aborting")
-                raw_analysis = (
-                    f"审核在 {turn} 轮后因连续失败中止，"
-                    f"已记录 {len(issues)} 个问题。"
-                )
+                if is_audit:
+                    raw_analysis = (
+                        f"审核在 {turn} 轮后因连续失败中止，"
+                        f"已记录 {len(issues)} 个问题。"
+                    )
+                else:
+                    raw_analysis = (
+                        f"问答在 {turn} 轮后因连续失败中止。"
+                    )
                 _emit({"type": "error", "message": raw_analysis})
                 break
             continue
@@ -1081,7 +1250,7 @@ def run_agent_loop(
         consecutive_failures = 0
 
         if isinstance(result, Final):
-            raw_analysis = result.answer or "审核完成"
+            raw_analysis = result.answer or ("" if not is_audit else "审核完成")
             finished = True
             _emit({"type": "complete", "summary": raw_analysis, "issues_count": len(issues)})
             _logger.info("agent loop finished, %d issues found", len(issues))
@@ -1097,15 +1266,12 @@ def run_agent_loop(
             _logger.debug("agent tool call: %s(%s)", func_name, func_args)
 
             try:
-                tool_result = _dispatch_tool(
-                    func_name, func_args,
-                    parsed_content, structure, kb_ids, doc_name, issues,
-                )
+                tool_result = _exec_tool(func_name, func_args)
             except Exception as e:
                 tool_result = f"工具执行失败: {e}"
                 _emit({"type": "error", "message": f"{func_name} 执行失败: {e}"})
 
-            if func_name == "flag_issue" and len(issues) > issue_count_before:
+            if is_audit and func_name == "flag_issue" and len(issues) > issue_count_before:
                 new_issue = issues[-1]
                 _emit({
                     "type": "issue_found",
@@ -1131,33 +1297,25 @@ def run_agent_loop(
                 "content": tool_result,
             })
     else:
-        _deg_record("agentic_audit", "max_turns_exhausted",
-                     f"Reached {max_turns} turns, stopping with {len(issues)} issues")
-        raw_analysis = (
-            f"审核在 {max_turns} 轮后强制终止，"
-            f"已完成 {len(issues)} 个问题的记录。"
-        )
+        if is_audit:
+            _deg_record("agentic_audit", "max_turns_exhausted",
+                         f"Reached {max_turns} turns, stopping with {len(issues)} issues")
+            raw_analysis = (
+                f"审核在 {max_turns} 轮后强制终止，"
+                f"已完成 {len(issues)} 个问题的记录。"
+            )
+        else:
+            _deg_record("agentic_qa", "max_turns_exhausted",
+                         f"Reached {max_turns} turns")
+            raw_analysis = "抱歉，问答搜索次数已达上限，请尝试缩小问题范围。"
         _emit({"type": "complete", "summary": raw_analysis, "issues_count": len(issues)})
 
-    provider = model_provider or os.environ.get("LLM_PROVIDER", "unknown")
-    mname = model_name or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-    save_trace(
-        _TRACE_DIR / doc_id / "tasks" / "traces" / f"{task_id}_trace.json",
-        messages,
-        metadata={
-            "task_id": task_id,
-            "doc_id": doc_id,
-            "doc_name": doc_name,
-            "provider": provider,
-            "model": mname,
-            "finished": finished,
-            "total_iterations": turn + 1,
-            "issues_count": len(issues),
-        },
+    return LoopOutput(
+        raw_analysis=raw_analysis,
+        messages=messages,
+        finished=finished,
+        issues=issues,
     )
-
-    link_standards(issues, kb_ids)
-    return _build_result(task_id, doc_id, doc_name, issues, raw_analysis)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1210,6 +1368,37 @@ def _build_structured_initial_messages(
     ]
 
 
+def _audit_post_process(
+    loop_out: LoopOutput,
+    task_id: str,
+    doc_id: str,
+    doc_name: str,
+    kb_ids: list[str],
+    model_provider: str,
+    model_name: str,
+) -> AuditResult:
+    """audit 后处理：save_trace + link_standards + _build_result。"""
+    provider = model_provider or os.environ.get("LLM_PROVIDER", "unknown")
+    mname = model_name or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+    save_trace(
+        _TRACE_DIR / doc_id / "tasks" / "traces" / f"{task_id}_trace.json",
+        loop_out.messages,
+        metadata={
+            "task_id": task_id,
+            "doc_id": doc_id,
+            "doc_name": doc_name,
+            "provider": provider,
+            "model": mname,
+            "finished": loop_out.finished,
+            "total_iterations": len(loop_out.messages),
+            "issues_count": len(loop_out.issues),
+        },
+    )
+
+    link_standards(loop_out.issues, kb_ids)
+    return _build_result(task_id, doc_id, doc_name, loop_out.issues, loop_out.raw_analysis)
+
+
 def run_agentic_audit(
     parsed_content: str,
     structure: DocumentStructure | None,
@@ -1235,7 +1424,7 @@ def run_agentic_audit(
                 parsed_content, structure, kb_ids, doc_name,
             )
             native_step = NativeLLMStep()
-            return run_agent_loop(
+            loop_out = run_agent_loop(
                 llm_step=native_step,
                 initial_messages=initial_messages,
                 parsed_content=parsed_content,
@@ -1247,8 +1436,10 @@ def run_agentic_audit(
                 event_callback=event_callback,
                 max_turns=100,
                 start_event_msg="Agentic 审核开始 (DeepSeek thinking 模式)",
-                model_provider="deepseek",
-                model_name=native_step.model,
+            )
+            return _audit_post_process(
+                loop_out, task_id, doc_id, doc_name, kb_ids,
+                model_provider="deepseek", model_name=native_step.model,
             )
         except Exception as e:
             _logger.warning(
@@ -1279,7 +1470,7 @@ def run_agentic_audit(
         doc_name, structure, parsed_content, kb_ids,
     )
     structured_step = StructuredLLMStep(llm, structured_llm)
-    return run_agent_loop(
+    loop_out = run_agent_loop(
         llm_step=structured_step,
         initial_messages=initial_messages,
         parsed_content=parsed_content,
@@ -1290,6 +1481,9 @@ def run_agentic_audit(
         doc_id=doc_id,
         event_callback=event_callback,
         start_event_msg="Agentic 审核开始 (structured_llm 模式)",
+    )
+    return _audit_post_process(
+        loop_out, task_id, doc_id, doc_name, kb_ids,
         model_provider=os.environ.get("LLM_PROVIDER", "unknown"),
         model_name=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
     )

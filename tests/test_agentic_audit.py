@@ -380,7 +380,7 @@ class TestUnifiedLoop:
             start_event_msg="start",
         )
         assert result.raw_analysis == "审核通过"
-        assert result.summary.issues_count == 0
+        assert len(result.issues) == 0
         assert len(fake.calls) == 1
 
     @patch("services.agent_trace.save_trace")
@@ -457,7 +457,7 @@ class TestUnifiedLoop:
                 max_turns=5,
             )
 
-        assert result.summary.issues_count == 1
+        assert len(result.issues) == 1
         assert result.issues[0].type == "compliance"
         assert result.issues[0].severity == "high"
 
