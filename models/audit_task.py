@@ -27,6 +27,15 @@ class StandardRef(BaseModel):
     chunk_text: Optional[str] = None      # chunk 原文片段，用于 PDF 高亮搜索
 
 
+class ExtractedStandard(BaseModel):
+    """LLM 从 issue 文本中提取出的标准信息（标准关联的中间产物）。
+
+    由标准 extractor 产出、供关联策略消费；不持久化。
+    """
+    numbers: list[str] = Field(default_factory=list)   # 标准编号，如 "GB/T 20145-2006"
+    names: list[str] = Field(default_factory=list)     # 标准中文名，不含书名号《》
+
+
 class AuditIssue(BaseModel):
     """审核问题"""
     id: int
