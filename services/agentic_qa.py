@@ -15,6 +15,7 @@ from typing import Callable, Optional
 
 from core.logger import get_logger
 from core.degradation import record as _deg_record
+from core.settings import make_deepseek_client
 
 _logger = get_logger(__name__)
 
@@ -299,9 +300,6 @@ def run_agentic_qa(
     Returns:
         {"answer": str, "sources": list[dict]}
     """
-    from openai import OpenAI
-    import httpx
-
     def _emit(event: dict):
         if event_callback:
             try:
@@ -311,12 +309,10 @@ def run_agentic_qa(
 
     _emit({"type": "start", "message": "Agentic 问答开始"})
 
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-    base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
     model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
-    http_client = httpx.Client(trust_env=False, timeout=httpx.Timeout(300))
-    client = OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+    # 原生 OpenAI SDK client；代理绕过集中在 core.settings.make_deepseek_client
+    client = make_deepseek_client()
 
     # 构建消息历史
     messages: list[dict] = [

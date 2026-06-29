@@ -23,7 +23,7 @@ from typing import Callable, Optional
 from llama_index.core.llms import ChatMessage, MessageRole
 
 from core.logger import get_logger
-from core.settings import get_llm
+from core.settings import get_llm, make_deepseek_client
 from core.degradation import record as _deg_record
 from models.audit_document import DocumentStructure
 from models.audit_task import (
@@ -1057,9 +1057,6 @@ def _run_native_tool_calling(
     - thinking 模式启用，审核判断更准确
     - 支持一次请求内连续调用多个工具
     """
-    from openai import OpenAI
-    import httpx
-
     def _emit(event: dict):
         # 存入共享日志
         with _task_log_lock:
@@ -1075,13 +1072,10 @@ def _run_native_tool_calling(
 
     _emit({"type": "start", "message": "Agentic 审核开始 (DeepSeek thinking 模式)"})
 
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-    base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
     model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
-    # 绕过 SOCKS 代理（与 settings.py 中 DeepSeek provider 行为一致）
-    http_client = httpx.Client(trust_env=False, timeout=httpx.Timeout(300))
-    client = OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+    # 原生 OpenAI SDK client；代理绕过集中在 core.settings.make_deepseek_client
+    client = make_deepseek_client()
 
     issues: list[AuditIssue] = []
     issue_count_before = 0
