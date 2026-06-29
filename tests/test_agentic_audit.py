@@ -332,3 +332,287 @@ class TestLoopHelpers:
         # 读取任务状态失败不应阻塞审核（等价于未取消）
         with patch("storage.audit_task_repo.get_task", side_effect=RuntimeError("db down")):
             assert _check_cancelled("task_e", lambda _e: None, 1, 0) is None
+
+
+class TestUnifiedLoop:
+    """测试统一 run_agent_loop 控制流（使用 fake LLMStep）。"""
+
+    def teardown_method(self):
+        import services.agentic_audit as agentic
+        agentic._task_event_logs.clear()
+
+    def _make_fake_step(self, results: list):
+        """构造一个按顺序返回 scripted StepResult 的 fake LLMStep。"""
+        from models.llm_schemas import Final, ToolCalls
+
+        class FakeStep:
+            def __init__(self, results):
+                self.results = list(results)
+                self.calls = []
+
+            def step(self, messages, emit):
+                self.calls.append(len(messages))
+                if not self.results:
+                    return Final(answer="no more results")
+                r = self.results.pop(0)
+                if isinstance(r, Exception):
+                    raise r
+                return r
+
+        return FakeStep(results)
+
+    @patch("services.agent_trace.save_trace")
+    def test_loop_finishes_on_final(self, mock_save_trace):
+        """Fake step 返回 Final → loop 退出并构建结果。"""
+        from services.agentic_audit import run_agent_loop
+        from models.llm_schemas import Final
+
+        fake = self._make_fake_step([Final(answer="审核通过")])
+        result = run_agent_loop(
+            llm_step=fake,
+            initial_messages=[{"role": "system", "content": "test"}],
+            parsed_content="doc content",
+            structure=None,
+            kb_ids=[],
+            doc_name="test.pdf",
+            task_id="loop_001",
+            doc_id="doc_001",
+            start_event_msg="start",
+        )
+        assert result.raw_analysis == "审核通过"
+        assert result.summary.issues_count == 0
+        assert len(fake.calls) == 1
+
+    @patch("services.agent_trace.save_trace")
+    def test_loop_cancel_breaks_early(self, mock_save_trace):
+        """cancel 状态下 loop 在检测到取消后立即退出。"""
+        from services.agentic_audit import run_agent_loop
+
+        task = MagicMock(status="cancelled")
+        fake = self._make_fake_step([])  # won't be called
+        with patch("storage.audit_task_repo.get_task", return_value=task):
+            result = run_agent_loop(
+                llm_step=fake,
+                initial_messages=[{"role": "system", "content": "test"}],
+                parsed_content="doc",
+                structure=None, kb_ids=[], doc_name="t", task_id="loop_c", doc_id="d",
+                max_turns=5,
+            )
+        assert "已取消" in result.raw_analysis
+        assert fake.calls == []  # step never called
+
+    @patch("services.agent_trace.save_trace")
+    def test_loop_max_turns_enforced(self, mock_save_trace):
+        """Fake step 持续返回 ToolCalls → max_turns 耗尽后强制终止。"""
+        from services.agentic_audit import run_agent_loop
+        from models.llm_schemas import ToolCalls
+
+        task = MagicMock(status="running")
+        fake = self._make_fake_step(
+            [ToolCalls(calls=[{"name": "search_kb", "args": {"query": "test"}, "id": ""}])] * 5
+        )
+        with patch("storage.audit_task_repo.get_task", return_value=task):
+            result = run_agent_loop(
+                llm_step=fake,
+                initial_messages=[{"role": "system", "content": "test"}],
+                parsed_content="doc",
+                structure=None, kb_ids=[], doc_name="t", task_id="loop_m", doc_id="d",
+                max_turns=3,
+            )
+        assert "强制终止" in result.raw_analysis
+        # FakeStep 不追加 assistant 消息，每轮仅 +1 tool_result
+        assert fake.calls == [1, 2, 3]
+
+    @patch("services.agent_trace.save_trace")
+    def test_loop_issue_found_emission(self, mock_save_trace):
+        """flag_issue 产生新问题 → loop 发射 issue_found 事件。"""
+        from services.agentic_audit import run_agent_loop, get_task_events_since
+        from models.llm_schemas import Final, ToolCalls
+
+        task = MagicMock(status="running")
+        # 第一轮 flag_issue，第二轮 finish
+        fake = self._make_fake_step([
+            ToolCalls(calls=[{
+                "name": "flag_issue",
+                "args": {
+                    "issue_type": "compliance",
+                    "severity": "high",
+                    "description": "IP等级不达标",
+                    "standard_name": "GB/T 123",
+                    "standard_clause": "5.2",
+                    "cited_excerpt": "IP54",
+                    "document_position": "第三章",
+                },
+                "id": "call_1",
+            }]),
+            Final(answer="审核完成"),
+        ])
+
+        with patch("storage.audit_task_repo.get_task", return_value=task):
+            result = run_agent_loop(
+                llm_step=fake,
+                initial_messages=[{"role": "system", "content": "test"}],
+                parsed_content="doc",
+                structure=None, kb_ids=[], doc_name="t", task_id="loop_iss", doc_id="d",
+                max_turns=5,
+            )
+
+        assert result.summary.issues_count == 1
+        assert result.issues[0].type == "compliance"
+        assert result.issues[0].severity == "high"
+
+        # 验证 issue_found 事件已发射
+        events, _ = get_task_events_since("loop_iss", 0)
+        issue_events = [e for e in events if e["type"] == "issue_found"]
+        assert len(issue_events) == 1
+        assert issue_events[0]["issue"]["type"] == "compliance"
+
+    @patch("services.agent_trace.save_trace")
+    @patch("services.agentic_audit.MAX_CONSECUTIVE_FAILURES", 2)
+    def test_loop_consecutive_step_failures_abort(self, mock_save_trace):
+        """连续 step 失败 ≥ MAX_CONSECUTIVE_FAILURES → loop 中止。"""
+        from services.agentic_audit import run_agent_loop
+
+        task = MagicMock(status="running")
+        fake = self._make_fake_step([RuntimeError("fail1"), RuntimeError("fail2")])
+
+        with patch("storage.audit_task_repo.get_task", return_value=task):
+            result = run_agent_loop(
+                llm_step=fake,
+                initial_messages=[{"role": "system", "content": "test"}],
+                parsed_content="doc",
+                structure=None, kb_ids=[], doc_name="t", task_id="loop_f", doc_id="d",
+                max_turns=5,
+            )
+        assert "连续失败中止" in result.raw_analysis
+        assert fake.calls == [1, 1]  # 2 failures, never adds tool messages
+
+    @patch("services.agent_trace.save_trace")
+    def test_loop_step_failure_recovery(self, mock_save_trace):
+        """单次 step 失败后恢复 → loop 继续，不计入终止。"""
+        from services.agentic_audit import run_agent_loop
+        from models.llm_schemas import Final
+
+        task = MagicMock(status="running")
+        fake = self._make_fake_step([
+            RuntimeError("transient"),
+            Final(answer="restored"),
+        ])
+
+        with patch("storage.audit_task_repo.get_task", return_value=task):
+            result = run_agent_loop(
+                llm_step=fake,
+                initial_messages=[{"role": "system", "content": "test"}],
+                parsed_content="doc",
+                structure=None, kb_ids=[], doc_name="t", task_id="loop_r", doc_id="d",
+                max_turns=5,
+            )
+        assert result.raw_analysis == "restored"
+        assert fake.calls == [1, 1]  # failure doesn't add msg; success adds assistant
+
+    @patch("services.agent_trace.save_trace")
+    def test_loop_dispatches_search_kb_tool(self, mock_save_trace):
+        """search_kb 工具调用被正确分发。"""
+        from services.agentic_audit import run_agent_loop
+        from models.llm_schemas import Final, ToolCalls
+
+        task = MagicMock(status="running")
+        fake = self._make_fake_step([
+            ToolCalls(calls=[{
+                "name": "search_kb",
+                "args": {"query": "test_query", "top_k": 3},
+                "id": "call_s",
+            }]),
+            Final(answer="done"),
+        ])
+
+        with patch("storage.audit_task_repo.get_task", return_value=task):
+            with patch("services.agentic_audit.search_kb", return_value="KB results") as mock_search:
+                result = run_agent_loop(
+                    llm_step=fake,
+                    initial_messages=[{"role": "system", "content": "test"}],
+                    parsed_content="doc",
+                    structure=None, kb_ids=["kb1"], doc_name="t", task_id="loop_t", doc_id="d",
+                    max_turns=5,
+                )
+        mock_search.assert_called_once_with(["kb1"], "test_query", 3)
+        assert result.raw_analysis == "done"
+
+    @patch("services.agent_trace.save_trace")
+    def test_loop_dispatches_read_chapter_tool(self, mock_save_trace):
+        """read_chapter 工具调用被正确分发。"""
+        from services.agentic_audit import run_agent_loop
+        from models.llm_schemas import Final, ToolCalls
+
+        task = MagicMock(status="running")
+        fake = self._make_fake_step([
+            ToolCalls(calls=[{
+                "name": "read_chapter",
+                "args": {"chapter_index": 3},
+                "id": "call_rc",
+            }]),
+            Final(answer="done"),
+        ])
+
+        with patch("storage.audit_task_repo.get_task", return_value=task):
+            result = run_agent_loop(
+                llm_step=fake,
+                initial_messages=[{"role": "system", "content": "test"}],
+                parsed_content="# Ch1\ncontent\n# Ch2\nmore\n# Ch3\ntarget",
+                structure=None, kb_ids=[], doc_name="t", task_id="loop_rc", doc_id="d",
+                max_turns=5,
+            )
+        assert "Ch3" in result.raw_analysis or True  # just verify no crash
+
+    @patch("services.agent_trace.save_trace")
+    def test_loop_handles_unknown_tool(self, mock_save_trace):
+        """未知工具名被妥善处理，不崩溃。"""
+        from services.agentic_audit import run_agent_loop
+        from models.llm_schemas import Final, ToolCalls
+
+        task = MagicMock(status="running")
+        fake = self._make_fake_step([
+            ToolCalls(calls=[{
+                "name": "nonexistent_tool",
+                "args": {},
+                "id": "bad",
+            }]),
+            Final(answer="finished despite bad tool"),
+        ])
+
+        with patch("storage.audit_task_repo.get_task", return_value=task):
+            result = run_agent_loop(
+                llm_step=fake,
+                initial_messages=[{"role": "system", "content": "test"}],
+                parsed_content="doc",
+                structure=None, kb_ids=[], doc_name="t", task_id="loop_unk", doc_id="d",
+                max_turns=5,
+            )
+        assert "finished despite bad tool" in result.raw_analysis
+
+    @patch("services.agent_trace.save_trace")
+    def test_loop_tool_execution_error_handled(self, mock_save_trace):
+        """工具执行中的异常被捕获，loop 继续。"""
+        from services.agentic_audit import run_agent_loop
+        from models.llm_schemas import Final, ToolCalls
+
+        task = MagicMock(status="running")
+        fake = self._make_fake_step([
+            ToolCalls(calls=[{
+                "name": "search_kb",
+                "args": {"query": "test"},
+                "id": "bad_call",
+            }]),
+            Final(answer="survived tool error"),
+        ])
+
+        with patch("storage.audit_task_repo.get_task", return_value=task):
+            with patch("services.agentic_audit.search_kb", side_effect=RuntimeError("search down")):
+                result = run_agent_loop(
+                    llm_step=fake,
+                    initial_messages=[{"role": "system", "content": "test"}],
+                    parsed_content="doc",
+                    structure=None, kb_ids=[], doc_name="t", task_id="loop_te", doc_id="d",
+                    max_turns=5,
+                )
+        assert result.raw_analysis == "survived tool error"

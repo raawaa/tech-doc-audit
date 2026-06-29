@@ -31,7 +31,7 @@ from models.audit_task import (
     AuditIssue, AuditResult, IssueLocation,
     ResultSummary, StandardRef,
 )
-from models.llm_schemas import AgentAction
+from models.llm_schemas import AgentAction, Final, ToolCalls
 from services.standard_linker import link_standards
 
 _logger = get_logger(__name__)
@@ -470,40 +470,6 @@ def _tool_flag_issue(action: AgentAction, issues: list[AuditIssue]) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 工具分发
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _execute_tool(
-    action: AgentAction,
-    parsed_content: str,
-    structure: DocumentStructure | None,
-    kb_ids: list[str],
-    doc_name: str,
-    issues: list[AuditIssue],
-) -> str:
-    """根据 action 分发到对应工具函数。"""
-    tool_name = action.action
-
-    if tool_name == "read_chapter":
-        idx = action.chapter_index or 1
-        return _tool_read_chapter(parsed_content, structure, idx)
-
-    elif tool_name == "search_kb":
-        query = action.search_query or ""
-        top_k = action.search_top_k or 5
-        return search_kb(kb_ids, query, top_k)
-
-    elif tool_name == "search_kb_text":
-        query = action.search_query or ""
-        return search_kb_text(kb_ids, query)
-
-    elif tool_name == "flag_issue":
-        return _tool_flag_issue(action, issues)
-
-    return f"未知操作: {tool_name}"
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # 降级解析（structured_llm 失败时）
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -561,9 +527,6 @@ def _build_init_msg(
         )
     return ChatMessage(role=MessageRole.USER, content=content)
 
-
-def _build_tool_result_msg(result: str) -> ChatMessage:
-    return ChatMessage(role=MessageRole.USER, content=f"[工具结果]\n{result}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 结果构建
@@ -872,141 +835,95 @@ NATIVE_SYSTEM_PROMPT = """你是一个严格的技术文档审核专家。你的
   在完成可直接发现的问题后应尽快给出审核总结，不要反复搜索"""
 
 
-def _execute_native_tool(
-    func_name: str,
-    args: dict,
+# ═══════════════════════════════════════════════════════════════════════════════
+# 统一 agent loop（ADR-0001）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _dispatch_tool(
+    tool_name: str,
+    tool_args: dict,
     parsed_content: str,
     structure: DocumentStructure | None,
     kb_ids: list[str],
     doc_name: str,
     issues: list[AuditIssue],
 ) -> str:
-    """原生 function calling 的工具分发。"""
-    if func_name == "read_chapter":
+    """统一工具分发：将归一化的 tool_call 路由到对应实现。"""
+    if tool_name == "read_chapter":
         return _tool_read_chapter(
             parsed_content, structure,
-            args.get("chapter_index", 1),
+            tool_args.get("chapter_index", 1),
         )
-    elif func_name == "search_kb":
+    elif tool_name == "search_kb":
         return search_kb(
             kb_ids,
-            args.get("query", ""),
-            args.get("top_k", 5),
+            tool_args.get("query", ""),
+            tool_args.get("top_k", 5),
         )
-    elif func_name == "search_kb_text":
-        return search_kb_text(kb_ids, args.get("query", ""))
-    elif func_name == "flag_issue":
+    elif tool_name == "search_kb_text":
+        return search_kb_text(kb_ids, tool_args.get("query", ""))
+    elif tool_name == "flag_issue":
         action = AgentAction(
             thought="",
             action="flag_issue",
-            issue_type=args.get("issue_type"),
-            issue_severity=args.get("severity"),
-            issue_description=args.get("description"),
-            standard_name=args.get("standard_name"),
-            standard_clause=args.get("standard_clause"),
-            standard_requirement=args.get("standard_requirement"),
-            cited_excerpt=args.get("cited_excerpt"),
-            document_position=args.get("document_position"),
-            issue_suggestion=args.get("suggestion"),
-            standard_doc_id=args.get("standard_doc_id"),
-            standard_page_number=args.get("standard_page_number"),
-            standard_chunk_text=args.get("standard_chunk_text"),
+            issue_type=tool_args.get("issue_type"),
+            issue_severity=tool_args.get("severity"),
+            issue_description=tool_args.get("description"),
+            standard_name=tool_args.get("standard_name"),
+            standard_clause=tool_args.get("standard_clause"),
+            standard_requirement=tool_args.get("standard_requirement"),
+            cited_excerpt=tool_args.get("cited_excerpt"),
+            document_position=tool_args.get("document_position"),
+            issue_suggestion=tool_args.get("suggestion"),
+            standard_doc_id=tool_args.get("standard_doc_id"),
+            standard_page_number=tool_args.get("standard_page_number"),
+            standard_chunk_text=tool_args.get("standard_chunk_text"),
         )
         return _tool_flag_issue(action, issues)
     return (
-        f"未知工具: {func_name}。"
+        f"未知工具: {tool_name}。"
         f"可用的工具有：read_chapter、search_kb、search_kb_text、flag_issue。"
         f"请从上述工具中选择正确的工具重新调用。"
     )
 
 
-def _run_native_tool_calling(
-    parsed_content: str,
-    structure: DocumentStructure | None,
-    kb_ids: list[str],
-    doc_name: str,
-    task_id: str,
-    doc_id: str,
-    event_callback: Callable[[dict], None] | None = None,
-) -> AuditResult:
-    """使用 DeepSeek 原生 function calling + thinking 模式执行审核。
+def _dict_to_chat_message(d: dict) -> ChatMessage:
+    """将统一 loop 的消息 dict 转回 LlamaIndex ChatMessage（供 structured adapter）。"""
+    role_map = {
+        "system": MessageRole.SYSTEM,
+        "user": MessageRole.USER,
+        "assistant": MessageRole.ASSISTANT,
+        "tool": MessageRole.USER,
+    }
+    role = role_map.get(d.get("role", "user"), MessageRole.USER)
+    content = d.get("content", "")
+    if d.get("role") == "tool":
+        content = f"[工具结果]\n{content}"
+    return ChatMessage(role=role, content=content)
 
-    相比 structured_llm 路径的优势：
-    - 原生工具调用，LLM 输出更稳定
-    - thinking 模式启用，审核判断更准确
-    - 支持一次请求内连续调用多个工具
-    """
-    _emit = _make_emitter(task_id, event_callback)
 
-    _emit({"type": "start", "message": "Agentic 审核开始 (DeepSeek thinking 模式)"})
+class NativeLLMStep:
+    """原生 function calling adapter：OpenAI tools + thinking 模式。"""
 
-    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+    def __init__(self) -> None:
+        self.client = make_deepseek_client()
+        self.model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
-    # 原生 OpenAI SDK client；代理绕过集中在 core.settings.make_deepseek_client
-    client = make_deepseek_client()
-
-    issues: list[AuditIssue] = []
-    issue_count_before = 0
-    # 构建知识库概况
-    kb_summary = _get_kb_docs_summary(kb_ids)
-
-    # 按文档长度构建初始消息
-    DOC_FULL_THRESHOLD = 30000  # 短文档阈值（字符数）
-    structure_text = _tool_get_structure(structure, doc_name)
-    if len(parsed_content) <= DOC_FULL_THRESHOLD:
-        user_content = (
-            f"{kb_summary}\n\n"
-            f"请审核文档《{doc_name}》。\n\n"
-            f"文档结构：\n{structure_text}\n\n"
-            f"=== 文档全文 ===\n{parsed_content}"
+    def step(
+        self, messages: list[dict], emit: Callable[[dict], None],
+    ) -> Final | ToolCalls:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            tools=_TOOLS_SPEC,
+            extra_body={"thinking": {"type": "enabled"}},
         )
-    else:
-        user_content = (
-            f"{kb_summary}\n\n"
-            f"请审核文档《{doc_name}》。\n\n"
-            f"文档结构：\n{structure_text}\n\n"
-            f"=== 文档开头（共{len(parsed_content)}字）===\n"
-            f"{parsed_content[:8000]}\n"
-            f"\n（文档较长，如需查看更多内容请使用 read_chapter 工具）"
-        )
-
-    messages: list[dict] = [
-        {"role": "system", "content": NATIVE_SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
-    ]
-
-    raw_analysis = ""
-    max_iterations = 100
-    finished = False  # True = agent 自行结束；False = 异常/超限
-
-    for iteration in range(max_iterations):
-        # 检查任务是否被取消
-        cancelled = _check_cancelled(task_id, _emit, iteration, len(issues))
-        if cancelled is not None:
-            raw_analysis = cancelled
-            break
-
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=_TOOLS_SPEC,
-                extra_body={"thinking": {"type": "enabled"}},
-            )
-        except Exception as e:
-            _emit({"type": "error", "message": f"LLM 调用失败: {e}"})
-            _logger.warning("native tool calling: chat.completions failed: %s", e)
-            raw_analysis = f"LLM 调用失败第 {iteration} 轮: {e}"
-            break
-
         msg = response.choices[0].message
 
-        # 发送 reasoning 事件
         if msg.reasoning_content:
-            rc = msg.reasoning_content
-            _emit({"type": "reasoning", "content": rc[:2000]})
+            emit({"type": "reasoning", "content": msg.reasoning_content[:2000]})
 
-        # 追加 assistant 消息
         assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
         if msg.reasoning_content:
             assistant_msg["reasoning_content"] = msg.reasoning_content
@@ -1024,30 +941,163 @@ def _run_native_tool_calling(
             ]
         messages.append(assistant_msg)
 
-        # 没有工具调用 → 模型给出了最终回答
         if not msg.tool_calls:
-            raw_analysis = msg.content or "审核完成"
-            finished = True
-            _emit({"type": "complete", "summary": raw_analysis, "issues_count": len(issues)})
-            _logger.info(
-                "native agentic audit finished, %d issues found",
-                len(issues),
-            )
+            return Final(answer=msg.content or "")
+
+        return ToolCalls(calls=[
+            {
+                "name": tc.function.name,
+                "args": _safe_json_parse(tc.function.arguments),
+                "id": tc.id,
+            }
+            for tc in msg.tool_calls
+        ])
+
+
+class StructuredLLMStep:
+    """structured_llm adapter：LlamaIndex as_structured_llm → AgentAction。"""
+
+    def __init__(self, llm, structured_llm) -> None:
+        self.llm = llm
+        self.structured_llm = structured_llm
+
+    def step(
+        self, messages: list[dict], emit: Callable[[dict], None],
+    ) -> Final | ToolCalls:
+        chat_messages = [_dict_to_chat_message(m) for m in messages]
+
+        try:
+            response = self.structured_llm.chat(chat_messages)
+            action: AgentAction = response.raw
+        except Exception:
+            _deg_record("agentic_audit", "structured_llm_failed",
+                        "structured_llm.chat failed, trying fallback parse")
+            try:
+                resp = self.llm.chat(chat_messages)
+                action = _parse_action_fallback(resp.message.content or "")
+            except Exception:
+                action = None
+
+            if action is None:
+                raise RuntimeError("structured_llm parse failed after fallback")
+
+        emit({"type": "reasoning", "content": action.thought})
+
+        messages.append({"role": "assistant", "content": action.thought})
+
+        if action.action == "finish":
+            return Final(answer=action.final_summary or "审核完成")
+
+        args = _agent_action_to_args(action)
+        return ToolCalls(calls=[{"name": action.action, "args": args, "id": ""}])
+
+
+def _safe_json_parse(s: str) -> dict:
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        return {}
+
+
+def _agent_action_to_args(action: AgentAction) -> dict:
+    """将 AgentAction 字段映射为统一的 tool_calls args dict。"""
+    if action.action == "read_chapter":
+        return {"chapter_index": action.chapter_index}
+    elif action.action == "search_kb":
+        return {"query": action.search_query, "top_k": action.search_top_k}
+    elif action.action == "search_kb_text":
+        return {"query": action.search_query}
+    elif action.action == "flag_issue":
+        return {
+            "issue_type": action.issue_type,
+            "severity": action.issue_severity,
+            "description": action.issue_description,
+            "standard_name": action.standard_name,
+            "standard_clause": action.standard_clause,
+            "standard_requirement": action.standard_requirement,
+            "cited_excerpt": action.cited_excerpt,
+            "document_position": action.document_position,
+            "suggestion": action.issue_suggestion,
+            "standard_doc_id": action.standard_doc_id,
+            "standard_page_number": action.standard_page_number,
+            "standard_chunk_text": action.standard_chunk_text,
+        }
+    return {}
+
+
+def run_agent_loop(
+    llm_step,
+    initial_messages: list[dict],
+    parsed_content: str,
+    structure: DocumentStructure | None,
+    kb_ids: list[str],
+    doc_name: str,
+    task_id: str,
+    doc_id: str,
+    event_callback: Callable[[dict], None] | None = None,
+    max_turns: int = MAX_TURNS,
+    start_event_msg: str = "Agentic 审核开始",
+    model_provider: str = "",
+    model_name: str = "",
+) -> AuditResult:
+    """统一 agent loop：迭代、cancel、工具分发、trace、后处理。
+
+    llm_step 是实现 LLMStep 协议的对象：step(messages, emit) -> StepResult。
+    native 与 structured 各提供一个 adapter，loop 主体对两者无分支。
+    """
+    _emit = _make_emitter(task_id, event_callback)
+    _emit({"type": "start", "message": start_event_msg})
+
+    issues: list[AuditIssue] = []
+    issue_count_before = 0
+    messages = initial_messages
+
+    raw_analysis = ""
+    consecutive_failures = 0
+    finished = False
+
+    for turn in range(max_turns):
+        cancelled = _check_cancelled(task_id, _emit, turn, len(issues))
+        if cancelled is not None:
+            raw_analysis = cancelled
             break
 
-        # 执行工具
-        for tc in msg.tool_calls:
-            func_name = tc.function.name
-            try:
-                func_args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                func_args = {}
+        try:
+            result = llm_step.step(messages, _emit)
+        except Exception as e:
+            consecutive_failures += 1
+            _logger.warning("agent loop turn %d step failed: %s", turn, e)
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                _deg_record("agentic_audit", "too_many_failures",
+                            f"Turn {turn}: {consecutive_failures} consecutive step failures, aborting")
+                raw_analysis = (
+                    f"审核在 {turn} 轮后因连续失败中止，"
+                    f"已记录 {len(issues)} 个问题。"
+                )
+                _emit({"type": "error", "message": raw_analysis})
+                break
+            continue
+
+        consecutive_failures = 0
+
+        if isinstance(result, Final):
+            raw_analysis = result.answer or "审核完成"
+            finished = True
+            _emit({"type": "complete", "summary": raw_analysis, "issues_count": len(issues)})
+            _logger.info("agent loop finished, %d issues found", len(issues))
+            break
+
+        # result is ToolCalls
+        for tc in result.calls:
+            func_name = tc.get("name", "")
+            func_args = tc.get("args", {})
+            tc_id = tc.get("id", "")
 
             _emit({"type": "tool_call", "tool": func_name, "args": func_args})
-            _logger.debug("native tool call: %s(%s)", func_name, func_args)
+            _logger.debug("agent tool call: %s(%s)", func_name, func_args)
 
             try:
-                tool_result = _execute_native_tool(
+                tool_result = _dispatch_tool(
                     func_name, func_args,
                     parsed_content, structure, kb_ids, doc_name, issues,
                 )
@@ -1055,9 +1105,6 @@ def _run_native_tool_calling(
                 tool_result = f"工具执行失败: {e}"
                 _emit({"type": "error", "message": f"{func_name} 执行失败: {e}"})
 
-            _emit({"type": "tool_result", "tool": func_name, "content": tool_result})
-
-            # 检测 flag_issue 产生的新问题
             if func_name == "flag_issue" and len(issues) > issue_count_before:
                 new_issue = issues[-1]
                 _emit({
@@ -1075,22 +1122,25 @@ def _run_native_tool_calling(
                     },
                 })
                 issue_count_before = len(issues)
+            else:
+                _emit({"type": "tool_result", "tool": func_name, "content": tool_result})
 
             messages.append({
                 "role": "tool",
-                "tool_call_id": tc.id,
+                "tool_call_id": tc_id,
                 "content": tool_result,
             })
     else:
-        _deg_record("agentic_audit", "native_max_iterations",
-                     f"Reached {max_iterations} tool calls, stopping with {len(issues)} issues")
+        _deg_record("agentic_audit", "max_turns_exhausted",
+                     f"Reached {max_turns} turns, stopping with {len(issues)} issues")
         raw_analysis = (
-            f"审核在 {max_iterations} 次工具调用后强制终止，"
+            f"审核在 {max_turns} 轮后强制终止，"
             f"已完成 {len(issues)} 个问题的记录。"
         )
         _emit({"type": "complete", "summary": raw_analysis, "issues_count": len(issues)})
 
-    # 持久化完整对话跟踪
+    provider = model_provider or os.environ.get("LLM_PROVIDER", "unknown")
+    mname = model_name or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
     save_trace(
         _TRACE_DIR / doc_id / "tasks" / "traces" / f"{task_id}_trace.json",
         messages,
@@ -1098,17 +1148,15 @@ def _run_native_tool_calling(
             "task_id": task_id,
             "doc_id": doc_id,
             "doc_name": doc_name,
-            "provider": "deepseek",
-            "model": model or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
+            "provider": provider,
+            "model": mname,
             "finished": finished,
-            "total_iterations": iteration + 1,
+            "total_iterations": turn + 1,
             "issues_count": len(issues),
         },
     )
 
-    # 后处理：将 issue 中引用的标准关联到知识库文档
     link_standards(issues, kb_ids)
-
     return _build_result(task_id, doc_id, doc_name, issues, raw_analysis)
 
 
@@ -1116,177 +1164,50 @@ def _run_native_tool_calling(
 # 主入口
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _run_structured_llm_loop(
+
+def _build_native_initial_messages(
     parsed_content: str,
     structure: DocumentStructure | None,
     kb_ids: list[str],
     doc_name: str,
-    task_id: str,
-    doc_id: str,
-    event_callback: Callable[[dict], None] | None = None,
-) -> AuditResult:
-    """使用 structured_llm + AgentAction 模型执行审核（降级路径）。
-
-    通过 as_structured_llm 让 LLM 输出 AgentAction JSON 来表达工具调用意图。
-    适用非 DeepSeek provider（MiniMax、OpenAI 等）或 DeepSeek 原生路径失败时。
-    """
-    _emit = _make_emitter(task_id, event_callback)
-
-    _emit({"type": "start", "message": "Agentic 审核开始 (structured_llm 模式)"})
-
-    llm = get_llm()
-    try:
-        structured_llm = llm.as_structured_llm(output_cls=AgentAction)
-    except Exception as e:
-        _emit({"type": "error", "message": f"structured_llm 初始化失败: {e}"})
-        _logger.warning("as_structured_llm failed: %s, agentic audit unavailable", e)
-        return _build_result(
-            task_id, doc_id, doc_name, [],
-            f"Agentic 审核不可用（structured_llm 初始化失败: {e}）",
+) -> list[dict]:
+    kb_summary = _get_kb_docs_summary(kb_ids)
+    DOC_FULL_THRESHOLD = 30000
+    structure_text = _tool_get_structure(structure, doc_name)
+    if len(parsed_content) <= DOC_FULL_THRESHOLD:
+        user_content = (
+            f"{kb_summary}\n\n"
+            f"请审核文档《{doc_name}》。\n\n"
+            f"文档结构：\n{structure_text}\n\n"
+            f"=== 文档全文 ===\n{parsed_content}"
         )
-
-    issues: list[AuditIssue] = []
-    issue_count_before = 0
-    messages = [
-        _build_system_msg(),
-        _build_init_msg(doc_name, structure, parsed_content, kb_ids),
+    else:
+        user_content = (
+            f"{kb_summary}\n\n"
+            f"请审核文档《{doc_name}》。\n\n"
+            f"文档结构：\n{structure_text}\n\n"
+            f"=== 文档开头（共{len(parsed_content)}字）===\n"
+            f"{parsed_content[:8000]}\n"
+            f"\n（文档较长，如需查看更多内容请使用 read_chapter 工具）"
+        )
+    return [
+        {"role": "system", "content": NATIVE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
     ]
 
-    raw_analysis = ""
-    consecutive_failures = 0
-    finished = False
 
-    for turn in range(MAX_TURNS):
-        # 检查任务是否被取消
-        cancelled = _check_cancelled(task_id, _emit, turn, len(issues))
-        if cancelled is not None:
-            raw_analysis = cancelled
-            break
-
-        try:
-            response = structured_llm.chat(messages)
-            action: AgentAction = response.raw
-        except Exception:
-            _deg_record("agentic_audit", "structured_llm_failed",
-                        f"Turn {turn}: structured_llm failed, trying fallback parse")
-            try:
-                resp = llm.chat(messages)
-                action = _parse_action_fallback(resp.message.content or "")
-            except Exception:
-                action = None
-
-            if action is None:
-                consecutive_failures += 1
-                _logger.warning(
-                    "agentic audit turn %d: failed to parse action, "
-                    "consecutive failures=%d", turn, consecutive_failures,
-                )
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    _deg_record("agentic_audit", "too_many_failures",
-                                f"Turn {turn}: {consecutive_failures} consecutive parse failures, aborting")
-                    raw_analysis = (
-                        f"Agentic 审核在 {turn} 轮后因连续解析失败中止，"
-                        f"已记录 {len(issues)} 个问题。"
-                    )
-                    _emit({"type": "error", "message": raw_analysis})
-                    break
-                continue
-            else:
-                consecutive_failures = 0
-
-        consecutive_failures = 0
-
-        # 发送 thought 事件
-        _emit({"type": "reasoning", "content": action.thought})
-
-        messages.append(ChatMessage(
-            role=MessageRole.ASSISTANT,
-            content=action.thought,
-        ))
-
-        if action.action == "finish":
-            raw_analysis = action.final_summary or "审核完成（Agent 未提供总结）"
-            finished = True
-            _emit({"type": "complete", "summary": raw_analysis, "issues_count": len(issues)})
-            _logger.info(
-                "agentic audit finished after %d turns, %d issues found",
-                turn + 1, len(issues),
-            )
-            break
-
-        # 执行工具前发送 tool_call 事件
-        if action.action != "flag_issue":
-            tool_name = action.action
-            tool_args = {}
-            if tool_name == "read_chapter":
-                tool_args = {"chapter_index": action.chapter_index}
-            elif tool_name == "search_kb_text":
-                tool_args = {"query": action.search_query}
-            elif tool_name == "search_kb":
-                tool_args = {"query": action.search_query, "top_k": action.search_top_k}
-            _emit({"type": "tool_call", "tool": tool_name, "args": tool_args})
-
-        tool_result = _execute_tool(
-            action, parsed_content, structure, kb_ids, doc_name, issues,
-        )
-        messages.append(_build_tool_result_msg(tool_result))
-
-        # 发送 tool_result 或 issue_found 事件
-        if action.action == "flag_issue":
-            if len(issues) > issue_count_before:
-                new_issue = issues[-1]
-                _emit({
-                    "type": "issue_found",
-                    "issue": {
-                        "id": new_issue.id,
-                        "type": new_issue.type,
-                        "severity": new_issue.severity,
-                        "description": new_issue.description[:300],
-                        "standard_name": new_issue.standard_reference.standard_name if new_issue.standard_reference else None,
-                        "standard_clause": new_issue.standard_reference.clause if new_issue.standard_reference else None,
-                        "standard_doc_id": new_issue.standard_reference.doc_id if new_issue.standard_reference else None,
-                        "standard_page_number": new_issue.standard_reference.page_number if new_issue.standard_reference else None,
-                        "standard_chunk_text": new_issue.standard_reference.chunk_text if new_issue.standard_reference else None,
-                    },
-                })
-                issue_count_before = len(issues)
-        else:
-            _emit({"type": "tool_result", "tool": action.action, "content": tool_result})
-
-    else:
-        _deg_record("agentic_audit", "max_turns_exhausted",
-                     f"Reached {MAX_TURNS} turns, stopping with {len(issues)} issues")
-        raw_analysis = (
-            f"审核在 {MAX_TURNS} 轮后强制终止，已完成 {len(issues)} 个问题的记录。"
-        )
-        _emit({"type": "complete", "summary": raw_analysis, "issues_count": len(issues)})
-
-    # 持久化完整对话跟踪（序列化 ChatMessage 为 dict）
-    serializable_messages = []
-    for m in messages:
-        sm = {"role": str(m.role), "content": m.content or ""}
-        if hasattr(m, "additional_kwargs") and m.additional_kwargs:
-            sm["additional_kwargs"] = m.additional_kwargs
-        serializable_messages.append(sm)
-    save_trace(
-        _TRACE_DIR / doc_id / "tasks" / "traces" / f"{task_id}_trace.json",
-        serializable_messages,
-        metadata={
-            "task_id": task_id,
-            "doc_id": doc_id,
-            "doc_name": doc_name,
-            "provider": os.environ.get("LLM_PROVIDER", "unknown"),
-            "model": os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
-            "finished": finished,
-            "total_iterations": turn + 1,
-            "issues_count": len(issues),
-        },
-    )
-
-    # 后处理：将 issue 中引用的标准关联到知识库文档
-    link_standards(issues, kb_ids)
-
-    return _build_result(task_id, doc_id, doc_name, issues, raw_analysis)
+def _build_structured_initial_messages(
+    doc_name: str,
+    structure: DocumentStructure | None,
+    parsed_content: str,
+    kb_ids: list[str],
+) -> list[dict]:
+    sys_msg = _build_system_msg()
+    init_msg = _build_init_msg(doc_name, structure, parsed_content, kb_ids)
+    return [
+        {"role": "system", "content": sys_msg.content},
+        {"role": "user", "content": init_msg.content},
+    ]
 
 
 def run_agentic_audit(
@@ -1303,18 +1224,31 @@ def run_agentic_audit(
     DeepSeek provider → 原生 function calling + thinking 模式（更稳定、更准确）。
     其他 provider   → structured_llm + AgentAction JSON（降级路径）。
 
-    Args:
-        event_callback: 流式事件回调，接收 {"type": ..., ...} 字典。
+    内部通过统一 run_agent_loop 执行，native / structured 各有 LLMStep adapter。
     """
     provider = os.environ.get("LLM_PROVIDER", "").lower()
 
     if provider == "deepseek":
         _logger.info("Using DeepSeek native function calling path")
         try:
-            return _run_native_tool_calling(
-                parsed_content, structure, kb_ids,
-                doc_name, task_id, doc_id,
+            initial_messages = _build_native_initial_messages(
+                parsed_content, structure, kb_ids, doc_name,
+            )
+            native_step = NativeLLMStep()
+            return run_agent_loop(
+                llm_step=native_step,
+                initial_messages=initial_messages,
+                parsed_content=parsed_content,
+                structure=structure,
+                kb_ids=kb_ids,
+                doc_name=doc_name,
+                task_id=task_id,
+                doc_id=doc_id,
                 event_callback=event_callback,
+                max_turns=100,
+                start_event_msg="Agentic 审核开始 (DeepSeek thinking 模式)",
+                model_provider="deepseek",
+                model_name=native_step.model,
             )
         except Exception as e:
             _logger.warning(
@@ -1328,8 +1262,34 @@ def run_agentic_audit(
             _deg_record("agentic_audit", "native_failed_fallback",
                         f"Native path failed: {e}, falling back to structured_llm")
 
-    return _run_structured_llm_loop(
-        parsed_content, structure, kb_ids,
-        doc_name, task_id, doc_id,
+    # structured_llm 路径（默认 / 降级）
+    llm = get_llm()
+    try:
+        structured_llm = llm.as_structured_llm(output_cls=AgentAction)
+    except Exception as e:
+        _logger.warning("as_structured_llm failed: %s, agentic audit unavailable", e)
+        _emit = _make_emitter(task_id, event_callback)
+        _emit({"type": "error", "message": f"structured_llm 初始化失败: {e}"})
+        return _build_result(
+            task_id, doc_id, doc_name, [],
+            f"Agentic 审核不可用（structured_llm 初始化失败: {e}）",
+        )
+
+    initial_messages = _build_structured_initial_messages(
+        doc_name, structure, parsed_content, kb_ids,
+    )
+    structured_step = StructuredLLMStep(llm, structured_llm)
+    return run_agent_loop(
+        llm_step=structured_step,
+        initial_messages=initial_messages,
+        parsed_content=parsed_content,
+        structure=structure,
+        kb_ids=kb_ids,
+        doc_name=doc_name,
+        task_id=task_id,
+        doc_id=doc_id,
         event_callback=event_callback,
+        start_event_msg="Agentic 审核开始 (structured_llm 模式)",
+        model_provider=os.environ.get("LLM_PROVIDER", "unknown"),
+        model_name=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
     )
