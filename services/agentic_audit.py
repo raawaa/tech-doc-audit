@@ -16,7 +16,6 @@ Agent 自主调用工具逐章审核文档：
 import json
 import os
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -25,6 +24,7 @@ from llama_index.core.llms import ChatMessage, MessageRole
 from core.logger import get_logger
 from core.settings import get_llm, make_deepseek_client
 from services.agent_tools import search_kb, search_kb_text
+from services.agent_trace import save_trace
 from core.degradation import record as _deg_record
 from models.audit_document import DocumentStructure
 from models.audit_task import (
@@ -544,74 +544,6 @@ def _build_result(
     )
 
 
-def _save_trace(
-    task_id: str,
-    doc_id: str,
-    doc_name: str,
-    issues_count: int,
-    total_iterations: int,
-    messages: list[dict],
-    *,
-    provider: str = "deepseek",
-    model: str = "",
-    finished: bool = True,
-) -> Path | None:
-    """持久化 agentic 审核的完整对话跟踪记录。
-
-    保存到 data/audits/{doc_id}/tasks/{task_id}_trace.json，包含完整的
-    消息历史（系统提示、用户消息、每轮 tool_calls 及其结果、reasoning），
-    便于事后诊断 agent 行为、验证工具描述效果、分析 LLM 决策质量。
-    """
-    try:
-        trace_dir = _TRACE_DIR / doc_id / "tasks" / "traces"
-        trace_dir.mkdir(parents=True, exist_ok=True)
-        trace_path = trace_dir / f"{task_id}_trace.json"
-
-        # 序列化消息：去重过大的内容避免文件膨胀
-        serializable_messages = []
-        for m in messages:
-            sm = dict(m)
-            # content 可能为 None（assistant 只有 tool_calls 时）
-            if sm.get("content") and len(str(sm["content"])) > 10000:
-                sm["content"] = str(sm["content"])[:10000] + (
-                    f"\n…[content truncated from "
-                    f"{len(str(m['content']))} chars]"
-                )
-            # tool_calls 中的 arguments 也可能很大
-            if "tool_calls" in sm:
-                for tc in sm["tool_calls"]:
-                    if "function" in tc and "arguments" in tc["function"]:
-                        args_str = tc["function"]["arguments"]
-                        if isinstance(args_str, str) and len(args_str) > 5000:
-                            tc["function"]["arguments"] = (
-                                args_str[:5000] + "…[truncated]"
-                            )
-            serializable_messages.append(sm)
-
-        trace = {
-            "task_id": task_id,
-            "doc_id": doc_id,
-            "doc_name": doc_name,
-            "provider": provider,
-            "model": model or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "finished": finished,
-            "total_iterations": total_iterations,
-            "issues_count": issues_count,
-            "messages": serializable_messages,
-        }
-
-        with open(trace_path, "w", encoding="utf-8") as f:
-            json.dump(trace, f, ensure_ascii=False, indent=2)
-
-        _logger.info("agentic trace saved: %s (%d messages, %.1f KB)",
-                      trace_path, len(messages), trace_path.stat().st_size / 1024)
-        return trace_path
-    except Exception as e:
-        _logger.warning("failed to save agentic trace: %s", e)
-        return None
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # 原生 Function Calling 路径（DeepSeek thinking 模式）
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1125,14 +1057,19 @@ def _run_native_tool_calling(
         _emit({"type": "complete", "summary": raw_analysis, "issues_count": len(issues)})
 
     # 持久化完整对话跟踪
-    _save_trace(
-        task_id, doc_id, doc_name,
-        issues_count=len(issues),
-        total_iterations=iteration + 1,
-        messages=messages,
-        provider="deepseek",
-        model=model,
-        finished=finished,
+    save_trace(
+        _TRACE_DIR / doc_id / "tasks" / "traces" / f"{task_id}_trace.json",
+        messages,
+        metadata={
+            "task_id": task_id,
+            "doc_id": doc_id,
+            "doc_name": doc_name,
+            "provider": "deepseek",
+            "model": model or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
+            "finished": finished,
+            "total_iterations": iteration + 1,
+            "issues_count": len(issues),
+        },
     )
 
     # 后处理：将 issue 中引用的标准关联到知识库文档
@@ -1314,13 +1251,19 @@ def _run_structured_llm_loop(
         if hasattr(m, "additional_kwargs") and m.additional_kwargs:
             sm["additional_kwargs"] = m.additional_kwargs
         serializable_messages.append(sm)
-    _save_trace(
-        task_id, doc_id, doc_name,
-        issues_count=len(issues),
-        total_iterations=turn + 1,
-        messages=serializable_messages,
-        provider=os.environ.get("LLM_PROVIDER", "unknown"),
-        finished=finished,
+    save_trace(
+        _TRACE_DIR / doc_id / "tasks" / "traces" / f"{task_id}_trace.json",
+        serializable_messages,
+        metadata={
+            "task_id": task_id,
+            "doc_id": doc_id,
+            "doc_name": doc_name,
+            "provider": os.environ.get("LLM_PROVIDER", "unknown"),
+            "model": os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
+            "finished": finished,
+            "total_iterations": turn + 1,
+            "issues_count": len(issues),
+        },
     )
 
     # 后处理：将 issue 中引用的标准关联到知识库文档
