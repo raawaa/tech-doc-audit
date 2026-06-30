@@ -14,7 +14,7 @@ class KnowledgeBase(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     document_ids: list[str] = Field(default_factory=list)
-    index_status: Literal["none", "building", "ready", "failed"] = "none"
+    index_status: Literal["none", "building", "searchable", "failed"] = "none"
     index_progress: Optional[float] = None
     index_current_doc: str = ""
 
@@ -31,4 +31,7 @@ class KnowledgeBase(BaseModel):
         for key in ("created_at", "updated_at"):
             if isinstance(data.get(key), str):
                 data[key] = datetime.fromisoformat(data[key])
+        # 元数据迁移：旧 'ready' 终态 → 'searchable'（ADR-0003）
+        if data.get("index_status") == "ready":
+            data["index_status"] = "searchable"
         return cls(**data)
