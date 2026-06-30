@@ -21,6 +21,17 @@ def _result(**kw):
     return base
 
 
+def _vec_search_stub(return_value):
+    """构造一个接受 vec_search 全部位置+关键字参数的 mock lambda。
+
+    agent_tools.search_kb 现在透传 sync_rebuild_for_audit 给 vec_search，
+    测试用 lambda 必须同样接受，否则会被报"unexpected keyword argument"。
+    """
+    def _stub(kb_ids, query, top_k=5, **kwargs):
+        return return_value
+    return _stub
+
+
 # ── search_kb ────────────────────────────────────────────────────────────────
 
 def test_search_kb_empty_query_or_kb():
@@ -31,7 +42,7 @@ def test_search_kb_empty_query_or_kb():
 def test_search_kb_formats_results(monkeypatch):
     monkeypatch.setattr(
         vector_search, "vec_search",
-        lambda kb_ids, query, top_k=5: [_result(relevance=0.82, content="条款内容X")],
+        _vec_search_stub([_result(relevance=0.82, content="条款内容X")]),
     )
     out = search_kb(["kb1"], "质保期")
     assert "知识库搜索结果" in out
@@ -44,7 +55,7 @@ def test_search_kb_source_diversity_warning(monkeypatch):
     # 两条结果来自同一 doc_id → 触发来源单一性警告（QA 采用 audit 版本后的行为变更）
     monkeypatch.setattr(
         vector_search, "vec_search",
-        lambda kb_ids, query, top_k=5: [_result(doc_id="doc_a"), _result(doc_id="doc_a")],
+        _vec_search_stub([_result(doc_id="doc_a"), _result(doc_id="doc_a")]),
     )
     out = search_kb(["kb1"], "q")
     assert "来源单一性警告" in out
@@ -53,14 +64,14 @@ def test_search_kb_source_diversity_warning(monkeypatch):
 def test_search_kb_multi_doc_no_warning(monkeypatch):
     monkeypatch.setattr(
         vector_search, "vec_search",
-        lambda kb_ids, query, top_k=5: [_result(doc_id="doc_a"), _result(doc_id="doc_b")],
+        _vec_search_stub([_result(doc_id="doc_a"), _result(doc_id="doc_b")]),
     )
     out = search_kb(["kb1"], "q")
     assert "来源单一性警告" not in out
 
 
 def test_search_kb_no_results(monkeypatch):
-    monkeypatch.setattr(vector_search, "vec_search", lambda kb_ids, query, top_k=5: [])
+    monkeypatch.setattr(vector_search, "vec_search", _vec_search_stub([]))
     out = search_kb(["kb1"], "q")
     assert "未找到" in out
 

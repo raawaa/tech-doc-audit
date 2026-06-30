@@ -11,15 +11,32 @@ from core.logger import get_logger
 _logger = get_logger(__name__)
 
 
-def search_kb(kb_ids: list[str], query: str, top_k: int = 5) -> str:
-    """搜索知识库，返回格式化的标准条款。"""
+def search_kb(
+    kb_ids: list[str],
+    query: str,
+    top_k: int = 5,
+    sync_rebuild_for_audit: bool = False,
+) -> str:
+    """搜索知识库，返回格式化的标准条款。
+
+    Args:
+        sync_rebuild_for_audit: 审核路径置 True（同步重建，宁可长时也要保证向量质量）；
+                                 QA 路径默认 False（异步降级，避免阻塞 HTTP 线程）。
+                                 经 ``vec_search`` 透传到 ``_ensure_kb_index``，
+                                 落实 ADR-0002 §决策 3 的"问答 / 审核请求
+                                 是否允许触发同步重建"的语义开关。
+    """
     if not query or not kb_ids:
         return "（未提供搜索关键词或知识库）"
 
     from services.vector_search import vec_search
 
     try:
-        results = vec_search(kb_ids, query, top_k=top_k)
+        results = vec_search(
+            kb_ids, query,
+            top_k=top_k,
+            sync_rebuild_for_audit=sync_rebuild_for_audit,
+        )
     except Exception as e:
         _logger.warning("search_kb failed for query '%s': %s", query, e)
         error_msg = str(e)

@@ -26,9 +26,6 @@ const colorMap: Record<string, string> = {
   searchable: 'bg-emerald-50 text-emerald-700',
   // 终态：doc embedding_status = 'embedded'（per ADR-0003）
   embedded: 'bg-emerald-50 text-emerald-700',
-  // 已弃用但保留旧映射以防旧 JSON 兼容
-  ready: 'bg-emerald-50 text-emerald-700',
-  indexed_legacy: 'bg-indigo-50 text-indigo-700',
   // category
   national: 'bg-purple-50 text-purple-700',
   industry: 'bg-blue-50 text-blue-700',
@@ -61,8 +58,6 @@ const labelMap: Record<string, string> = {
   indexing: '索引中',
   searchable: '可检索',
   embedded: '已向量化',
-  ready: '已就绪',
-  indexed_legacy: '已索引',
   national: '国家标准',
   industry: '行业标准',
   enterprise: '企业标准',

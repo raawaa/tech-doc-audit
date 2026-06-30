@@ -144,6 +144,7 @@ _QA_TOOLS_SPEC = [
 def _execute_tool(func_name: str, args: dict, kb_ids: list[str]) -> str:
     """工具分发。"""
     if func_name == "search_kb":
+        # QA 路径：异步降级，不阻塞 HTTP 线程（ADR-0002 §决策 3）
         return search_kb(kb_ids, args.get("query", ""), args.get("top_k", 5))
     elif func_name == "search_kb_text":
         return search_kb_text(kb_ids, args.get("query", ""))

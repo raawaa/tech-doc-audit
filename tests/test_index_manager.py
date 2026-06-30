@@ -307,7 +307,7 @@ def test_async_md_index_builds_faiss():
 
     现有 async 测试（test_import_document_async 等）用假 PDF，提取为空文本，
     索引线程因 ``len(text) < 20`` 提前返回、不建索引。本用例补上真实内容的
-    异步索引路径，验证 index_status → ready 且 FAISS 索引确实建立。
+    异步索引路径，验证 embedding_status → embedded 且 FAISS 索引确实建立。
     """
     import time
     import services.kb_service as kb_svc

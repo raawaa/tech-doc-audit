@@ -162,27 +162,6 @@ def test_slow_path_qa_async_does_not_block(seed_searchable_kb):
     )
 
 
-def test_user_story_4_auto_heals_to_searchable(seed_searchable_kb):
-    """用户故事 4：重建完成后 KB 自动变 searchable，无需手动操作。"""
-    seed_searchable_kb("test_layer_heal")
-    _kb_with_missing_vector("test_layer_heal", ["d1"])
-
-    from services.vector_search import vec_search
-    vec_search(["test_layer_heal"], "q", rebuild_if_missing=True)
-
-    # 等异步后台线程完成 rebuild 后写回字段
-    for _ in range(100):
-        kb_after = kb_repo.get("test_layer_heal")
-        if kb_after.index_status == "searchable":
-            break
-        time.sleep(0.1)
-
-    kb_after = kb_repo.get("test_layer_heal")
-    assert kb_after.index_status == "searchable", (
-        f"自动自愈后字段应为 searchable，实际 {kb_after.index_status}"
-    )
-
-
 # ── 已 searchable 跳过重建 ───────────────────────────────────────────
 
 

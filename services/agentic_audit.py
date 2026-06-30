@@ -857,10 +857,12 @@ def _dispatch_tool(
             tool_args.get("chapter_index", 1),
         )
     elif tool_name == "search_kb":
+        # 审核路径：宁可同步阻塞重建也不让向量质量不足（ADR-0002 §决策 3）
         return search_kb(
             kb_ids,
             tool_args.get("query", ""),
             tool_args.get("top_k", 5),
+            sync_rebuild_for_audit=True,
         )
     elif tool_name == "search_kb_text":
         return search_kb_text(kb_ids, tool_args.get("query", ""))
