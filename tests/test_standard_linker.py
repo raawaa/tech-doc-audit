@@ -28,10 +28,13 @@ def _ext(id, numbers=None, names=None):
     return (id, ExtractedStandard(numbers=numbers or [], names=names or []))
 
 
-def _fake_repo(doc_ids):
-    """_doc_repo 替身：list_docs 返回带 .id 的伪 doc。"""
+def _fake_repo(doc_ids, names=None):
+    """_doc_repo 替身：list_docs 返回带 .id/.name 的伪 doc。names 为 {doc_id: 标题}。"""
     return types.SimpleNamespace(
-        list_docs=lambda kb_id: [types.SimpleNamespace(id=d) for d in doc_ids]
+        list_docs=lambda kb_id: [
+            types.SimpleNamespace(id=d, name=(names or {}).get(d))
+            for d in doc_ids
+        ]
     )
 
 
@@ -188,6 +191,45 @@ def test_standard_name_backfill_without_doc_link(monkeypatch):
     assert sr.doc_id is None
     assert sr.standard_name == "CJJ 101-2016"
     assert sr.standard_id == "CJJ 101-2016"
+
+
+def test_name_corrected_when_doc_hit_mismatches_prefilled_name(monkeypatch):
+    """#3 回归：best_hit 命中正确 KB 文档时，issue 上错误预填的 standard_name
+    必须被校正为反映命中文档，而非原样保留。
+
+    复现用户症状：issue 预填 standard_name="JG_T578-2021 装配式建筑用墙板技术要求"
+    （agent 抄了被审核文档里的错名），但命中的真实文档是 GB 50034-2013
+    建筑照明设计标准。前端用 standard_doc_id 拼链接（指向 GB 50034，正确）、
+    用 standard_name 做显示文本，二者不一致 → 显示名错。
+    """
+    issue = _issue(
+        1,
+        standard_name="JG_T578-2021 装配式建筑用墙板技术要求",
+        standard_id="JG_T578-2021",
+    )
+    monkeypatch.setattr(
+        standard_linker, "_doc_repo",
+        _fake_repo(["gb50034_doc"], names={"gb50034_doc": "GB 50034-2013 建筑照明设计标准"}),
+    )
+    monkeypatch.setattr(
+        standard_linker, "search_doc_by_text",
+        lambda n, k: [{"doc_id": "gb50034_doc"}],
+    )
+    monkeypatch.setattr(
+        standard_linker, "vec_search",
+        lambda kb_ids, q, top_k=5: [{
+            "doc_id": "gb50034_doc", "page_number": 0,
+            "content": "GB 50034-2013 建筑照明设计标准 引用标准名录",
+        }],
+    )
+    standard_linker.link_standards(
+        [issue], ["kb1"],
+        extractor=lambda pending: dict([_ext(1, ["GB 50034-2013"], ["建筑照明设计标准"])]),
+    )
+    sr = issue.standard_reference
+    assert sr.doc_id == "gb50034_doc"
+    assert sr.standard_name == "GB 50034-2013 建筑照明设计标准"
+    assert sr.standard_id == "GB 50034-2013 建筑照明设计标准"
 
 
 def test_empty_inputs_no_op():
