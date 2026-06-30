@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "postinstall": "node scripts/copy-pdfjs-assets.mjs"
+    "postinstall": "node scripts/copy-pdfjs-assets.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@ai-sdk/react": "^3.0.209",
@@ -22,6 +25,7 @@
     "react-markdown": "^10.1.0",
     "react-pdf": "^10.4.1",
     "react-router-dom": "^6.22.0",
+    "react-virtuoso": "^4.18.10",
     "remark-gfm": "^4.0.1",
     "sonner": "^2.0.7",
     "tailwind-merge": "^3.6.0"
@@ -34,6 +38,7 @@
     "postcss": "^8.4.0",
     "tailwindcss": "^3.4.0",
     "typescript": "^5.3.0",
-    "vite": "^5.1.0"
+    "vite": "^5.1.0",
+    "vitest": "^4.1.9"
   }
 }
