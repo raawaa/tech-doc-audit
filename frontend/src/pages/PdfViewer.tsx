@@ -2,14 +2,24 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { Loader2 } from 'lucide-react'
 import { Document, Page, pdfjs } from 'react-pdf'
+import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
 import * as pdfjsLib from 'pdfjs-dist'
+import { computePageMatches, paintHighlight, type HighlightMatch } from '../lib/highlight'
 
 // 设置 worker — react-pdf 和 pdfjs-dist 共用同一个 worker
 const WORKER_SRC = '/pdfjs/pdf.worker.min.mjs'
 pdfjs.GlobalWorkerOptions.workerSrc = WORKER_SRC
 pdfjsLib.GlobalWorkerOptions.workerSrc = WORKER_SRC
+
+/**
+ * 渲染缩放 = react-pdf <Page> 的 scale(默认 1) × devicePixelRatio。
+ * react-pdf 把 canvas 内部分辨率设为 `磅 × scale × devicePixelRatio`，
+ * 故高亮坐标换算需用此值（见 lib/highlight.ts）。
+ */
+const RENDER_SCALE =
+  typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
 
 interface DocMeta {
   id: string
@@ -30,12 +40,19 @@ export function PdfViewer() {
   const [error, setError] = useState('')
   const [numPages, setNumPages] = useState(0)
   const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null)
-  const [allPagesRendered, setAllPagesRendered] = useState(false)
-  const pageRefs = useRef<Map<number, HTMLCanvasElement>>(new Map())
-  const scrollContainerRef = useRef<HTMLDivElement>(null)
-  const [renderedPages, setRenderedPages] = useState(0)
-  void renderedPages
-  const highlightAppliedRef = useRef('')
+
+  // —— 绘制层状态（命令式，不触发重渲）——
+  // 当前已挂载页的 canvas（Virtuoso 只挂载视口内的页）
+  const pageCanvasRefs = useRef<Map<number, HTMLCanvasElement>>(new Map())
+  // 已画过高亮的页（避免同一画布重复绘制；卸载时清除以便重挂后重画）
+  const paintedPages = useRef<Set<number>>(new Set())
+
+  // —— 匹配层状态 ——
+  // { 页号 → 磅坐标命中[] }，匹配层异步增量写入
+  const matchesByPage = useRef<Map<number, HighlightMatch[]>>(new Map())
+
+  const virtuosoRef = useRef<VirtuosoHandle>(null)
+  const didInitialScrollRef = useRef(false)
 
   const apiBase = import.meta.env.VITE_API_BASE_URL || ''
   const pdfUrl = meta?.file_type === 'pdf' ? `${apiBase}/api/v1/kb-documents/${docId}/file` : null
@@ -70,37 +87,88 @@ export function PdfViewer() {
     setNumPages(total)
   }
 
-  // 追踪页面渲染完成
-  const handlePageRenderSuccess = useCallback((_pageNumber: number) => {
-    setRenderedPages(prev => {
-      const next = prev + 1
-      // 当所有页面渲染完成时标记
-      if (next >= numPages) {
-        // 使用 setTimeout 确保状态更新完成
-        setTimeout(() => setAllPagesRendered(true), 100)
-      }
-      return next
-    })
-  }, [numPages])
-
-  // 重置渲染计数器（PDF 文档变化时）
+  // —— URL `page` 参数独占定位：numPages 就绪后立即滚动，不等匹配层 ——
   useEffect(() => {
-    setRenderedPages(0)
-    setAllPagesRendered(false)
-    pageRefs.current.clear()
-    highlightAppliedRef.current = ''
-  }, [numPages])
+    if (numPages <= 0 || didInitialScrollRef.current) return
+    didInitialScrollRef.current = true
+    const idx = Math.min(Math.max(targetPage - 1, 0), numPages - 1)
+    //下一帧再滚，确保 Virtuoso 已挂载
+    requestAnimationFrame(() => virtuosoRef.current?.scrollToIndex(idx))
+  }, [numPages, targetPage])
 
-  // 页码跳转（PDF 模式）
-  const handleJumpToPage = (page: number) => {
-    if (!scrollContainerRef.current) return
-    const clamped = Math.min(Math.max(page, 1), numPages)
-    const pageEl = scrollContainerRef.current.querySelector(
-      `[data-page-number="${clamped}"]`
-    )
-    if (pageEl) {
-      pageEl.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  // 匹配层：异步遍历各页文本，增量写入 matchesByPage 并对"已挂载但未画"的页补画。
+  // 不再依赖"所有页渲染完"闸门；不再自动滚动到首个匹配页。
+  useEffect(() => {
+    if (!pdfDoc || !highlight || numPages <= 0) return
+    const searchTerms = highlight.split(/\s+/).filter(t => t.length > 1)
+    if (searchTerms.length === 0) return
+
+    // 重置该次搜索的匹配与绘制标记
+    matchesByPage.current = new Map()
+    paintedPages.current = new Set()
+
+    let cancelled = false
+    const doc = pdfDoc
+
+    async function searchAndHighlight() {
+      for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+        if (cancelled) return
+        try {
+          const page = await doc.getPage(pageNum)
+          if (cancelled) return
+          const textContent = await page.getTextContent()
+          if (cancelled) return
+          const matches = computePageMatches(
+            textContent.items as Array<{ str: string; transform: number[] }>,
+            searchTerms,
+            RENDER_SCALE,
+          )
+          if (matches.length > 0) {
+            matchesByPage.current.set(pageNum, matches)
+            // 补画：若该页 canvas 已挂载且尚未画，立即画
+            const canvas = pageCanvasRefs.current.get(pageNum)
+            if (canvas && !paintedPages.current.has(pageNum)) {
+              paintHighlight(canvas, pageNum, matches)
+              paintedPages.current.add(pageNum)
+            }
+          }
+        } catch {
+          // 跳过读取失败的页面
+        }
+      }
     }
+
+    searchAndHighlight()
+    return () => { cancelled = true }
+  }, [pdfDoc, highlight, numPages])
+
+  // 绘制层：某页渲染完成时，若已有匹配则画高亮（覆盖首屏渲染与离屏页重挂两种路径）
+  const handlePageRenderSuccess = useCallback((pageNumber: number) => {
+    const matches = matchesByPage.current.get(pageNumber)
+    if (!matches || paintedPages.current.has(pageNumber)) return
+    const canvas = pageCanvasRefs.current.get(pageNumber)
+    if (!canvas) return
+    paintHighlight(canvas, pageNumber, matches)
+    paintedPages.current.add(pageNumber)
+  }, [])
+
+  // canvas 注入：注册/注销当前挂载页的 canvas。
+  // 注意：不要在此绘制——react-pdf 尚未画完，会被覆盖。绘制统一在 onRenderSuccess。
+  const registerCanvas = useCallback((pageNumber: number) => (ref: HTMLCanvasElement | null) => {
+    if (ref) {
+      pageCanvasRefs.current.set(pageNumber, ref)
+    } else {
+      pageCanvasRefs.current.delete(pageNumber)
+      // 卸载后清除绘制标记，使该页重新挂载时能被重画
+      paintedPages.current.delete(pageNumber)
+    }
+  }, [])
+
+  // 页码跳转（PDF 模式）：交给 Virtuoso 定位
+  const handleJumpToPage = (page: number) => {
+    if (numPages <= 0) return
+    const clamped = Math.min(Math.max(page, 1), numPages)
+    virtuosoRef.current?.scrollToIndex(clamped - 1)
   }
 
   // 文本降级模式（DOCX/MD）
@@ -116,75 +184,6 @@ export function PdfViewer() {
       .then(d => { setTextContent(d.text); setTextTotalPages(d.total_pages) })
       .catch(e => setError(e.message))
   }, [meta, docId, targetPage])
-
-  // 高亮搜索与自动定位
-  useEffect(() => {
-    if (!pdfDoc || !highlight || !allPagesRendered) return
-    if (highlight === highlightAppliedRef.current) return
-    highlightAppliedRef.current = highlight
-
-    const doc = pdfDoc
-    const searchTerms = highlight.split(/\s+/).filter(t => t.length > 1)
-    if (searchTerms.length === 0) return
-
-    let cancelled = false
-    let firstHighlightedPage: number | null = null
-
-    // 逐页搜索文本
-    async function searchAndHighlight() {
-      for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-        if (cancelled) return
-        try {
-          const page = await doc.getPage(pageNum)
-          const textContent = await page.getTextContent()
-
-          let pageHasMatch = false
-          const canvas = pageRefs.current.get(pageNum)
-          if (!canvas) continue
-
-          const ctx = canvas.getContext('2d')
-          if (!ctx) continue
-
-          for (const item of textContent.items) {
-            const textItem = item as { str: string; transform: number[] }
-            const str = textItem.str || ''
-            for (const term of searchTerms) {
-              if (str.includes(term)) {
-                pageHasMatch = true
-                const tx = textItem.transform
-                const scale = 1.5
-                const x = tx[4] * scale
-                const y = canvas.height - tx[5] * scale
-                const w = (str.length * (tx[0] || 8)) * scale * 0.6
-                const h = 14
-                ctx.fillStyle = 'rgba(255, 255, 0, 0.4)'
-                ctx.fillRect(x - 1, y - h, w + 2, h + 4)
-              }
-            }
-          }
-
-          if (pageHasMatch && firstHighlightedPage === null) {
-            firstHighlightedPage = pageNum
-          }
-        } catch {
-          // 跳过渲染失败的页面
-        }
-      }
-
-      // 自动滚动到第一个有高亮的页面
-      if (firstHighlightedPage !== null && scrollContainerRef.current) {
-        const pageEl = scrollContainerRef.current.querySelector(
-          `[data-page-number="${firstHighlightedPage}"]`
-        )
-        if (pageEl) {
-          pageEl.scrollIntoView({ behavior: 'smooth', block: 'center' })
-        }
-      }
-    }
-
-    searchAndHighlight()
-    return () => { cancelled = true }
-  }, [pdfDoc, highlight, numPages, allPagesRendered])
 
   if (loading) return <div className="flex justify-center py-20"><Loader2 className="w-6 h-6 animate-spin text-slate-400" /></div>
   if (error) return <div className="text-center py-20 text-red-500">{error}</div>
@@ -235,59 +234,63 @@ export function PdfViewer() {
       </div>
 
       {/* Content */}
-      <div
-        ref={scrollContainerRef}
-        className="flex-1 overflow-auto"
-        style={{ height: 'calc(100vh - 57px)' }}
-      >
-        {meta.file_type === 'pdf' ? (
-          <div className="flex flex-col items-center py-6 gap-4">
-            {pdfUrl && (
-              <Document
-                file={pdfUrl}
-                onLoadSuccess={handleDocumentLoadSuccess}
-                loading={
-                  <div className="flex justify-center py-20">
-                    <Loader2 className="w-6 h-6 animate-spin text-slate-400" />
-                  </div>
-                }
-                error={
-                  <div className="text-center py-20 text-red-500">
-                    PDF 加载失败，请刷新重试
-                  </div>
-                }
-              >
-                {Array.from(new Array(numPages), (_, index) => (
-                  <div key={`page_${index + 1}`} data-page-number={index + 1}>
-                    <Page
-                      pageNumber={index + 1}
-                      canvasRef={(ref: HTMLCanvasElement) => {
-                        if (ref) {
-                          pageRefs.current.set(index + 1, ref)
-                        }
-                      }}
-                      onRenderSuccess={() => handlePageRenderSuccess(index + 1)}
-                      renderTextLayer={false}
-                      className="bg-white shadow-lg rounded"
-                    />
-                  </div>
-                ))}
-              </Document>
+      {meta.file_type === 'pdf' ? (
+        <div style={{ height: 'calc(100vh - 57px)' }}>
+          {pdfUrl && (
+            <Document
+              file={pdfUrl}
+              onLoadSuccess={handleDocumentLoadSuccess}
+              loading={
+                <div className="flex justify-center py-20">
+                  <Loader2 className="w-6 h-6 animate-spin text-slate-400" />
+                </div>
+              }
+              error={
+                <div className="text-center py-20 text-red-500">
+                  PDF 加载失败，请刷新重试
+                </div>
+              }
+            >
+              <Virtuoso
+                ref={virtuosoRef}
+                totalCount={numPages}
+                defaultItemHeight={1100}
+                increaseViewportBy={{ top: 800, bottom: 800 }}
+                style={{ height: '100%' }}
+                itemContent={index => {
+                  const pageNumber = index + 1
+                  return (
+                    <div
+                      key={`page_${pageNumber}`}
+                      data-page-number={pageNumber}
+                      className="flex justify-center py-2"
+                    >
+                      <Page
+                        pageNumber={pageNumber}
+                        canvasRef={registerCanvas(pageNumber)}
+                        onRenderSuccess={() => handlePageRenderSuccess(pageNumber)}
+                        renderTextLayer={false}
+                        className="bg-white shadow-lg rounded"
+                      />
+                    </div>
+                  )
+                }}
+              />
+            </Document>
+          )}
+        </div>
+      ) : (
+        <div className="flex justify-center py-6">
+          <div className="bg-white shadow-lg rounded p-8 max-w-3xl w-full">
+            <pre className="text-sm text-slate-700 whitespace-pre-wrap font-sans leading-relaxed">
+              {textContent || '（该页无文本内容）'}
+            </pre>
+            {textTotalPages > 0 && (
+              <p className="text-xs text-slate-400 mt-4">第 {targetPage} / {textTotalPages} 页</p>
             )}
           </div>
-        ) : (
-          <div className="flex justify-center py-6">
-            <div className="bg-white shadow-lg rounded p-8 max-w-3xl w-full">
-              <pre className="text-sm text-slate-700 whitespace-pre-wrap font-sans leading-relaxed">
-                {textContent || '（该页无文本内容）'}
-              </pre>
-              {textTotalPages > 0 && (
-                <p className="text-xs text-slate-400 mt-4">第 {targetPage} / {textTotalPages} 页</p>
-              )}
-            </div>
-          </div>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   )
 }
