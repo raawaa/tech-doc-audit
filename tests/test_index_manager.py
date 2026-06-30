@@ -39,9 +39,34 @@ def _text_doc(text: str, doc_id: str = "doc_001") -> tuple[str, str, str]:
     return (doc_id, text, f"doc_{doc_id}.txt")
 
 
-def test_index_and_search():
+@pytest.fixture
+def seed_searchable_kb():
+    """为本文件中调用底层 index_document / search 的测试提供 KB 元数据上下文。
+
+    ADR-0002 单真相后，``search()`` 直接读 ``kb.index_status``——
+    之前测试因为 dual-source 而无需建元数据即可搜，现必须显式 seed 一个 KB + 标记 searchable。
+    生产路径走 doc_service 自然会维护这个状态；此处手工 mirror 即可。
+    """
+    seeded: list[str] = []
+
+    def _seed(kb_id: str):
+        import storage.kb_repo as _kb_repo
+        from models.knowledge_base import KnowledgeBase
+        kb = KnowledgeBase(id=kb_id, name="seed", category="national")
+        _kb_repo.update(kb)
+        kb = _kb_repo.get(kb_id)
+        kb.index_status = "searchable"
+        kb.document_ids = []
+        _kb_repo.update(kb)
+        seeded.append(kb_id)
+        return kb_id
+
+    yield _seed
+
+
+def test_index_and_search(seed_searchable_kb):
     """测试索引文档后能正确搜索到。"""
-    kb_id = "test_kb_index_search"
+    kb_id = seed_searchable_kb("test_kb_index_search")
 
     # 索引一篇真实的文档（内容 >=20 字符，否则 index_document 提前返回）
     index_document(
@@ -49,6 +74,13 @@ def test_index_and_search():
         "人工智能技术在工程招标文件中应用研究分析报告",
         source_name="ai_paper.txt",
     )
+
+    # 同步把 KB 切回 searchable 模拟 rebuild_kb_index 的内置契约。
+    # 底层 index_document 不动 kb 元数据（按设计），此处手工 mirror。
+    import storage.kb_repo as _kb_repo
+    kb = _kb_repo.get(kb_id)
+    kb.index_status = "searchable"
+    _kb_repo.update(kb)
 
     # 搜索
     results = search([kb_id], "人工智能", top_k=5)
@@ -61,9 +93,9 @@ def test_index_and_search():
     assert result.get("content") is not None
 
 
-def test_index_empty_text():
+def test_index_empty_text(seed_searchable_kb):
     """测试空文本不应创建索引节点。"""
-    kb_id = "test_kb_empty"
+    kb_id = seed_searchable_kb("test_kb_empty")
 
     index_document(kb_id, "doc_empty", "", source_name="empty.txt")
     index_document(kb_id, "doc_short", "short", source_name="short.txt")
@@ -73,9 +105,9 @@ def test_index_empty_text():
     assert len(results) == 0
 
 
-def test_batch_index():
+def test_batch_index(seed_searchable_kb):
     """测试批量索引文档。"""
-    kb_id = "test_kb_batch"
+    kb_id = seed_searchable_kb("test_kb_batch")
 
     docs = [
         _text_doc("网络安全等级保护基本要求 GB/T 22239-2019 最新版本", "doc_001"),
@@ -94,18 +126,29 @@ def test_batch_index():
     assert len(progress_log) == 3
     assert progress_log[-1] == (3, 3, "doc_doc_003.txt")
 
+    # 镜像 rebuild_kb_index 的内置契约：批量成功 → KB searchable
+    import storage.kb_repo as _kb_repo
+    kb = _kb_repo.get(kb_id)
+    kb.index_status = "searchable"
+    _kb_repo.update(kb)
+
     # 搜索验证所有文档均可检索
     results = search([kb_id], "安全", top_k=10)
     assert len(results) >= 2, "应搜索到至少 2 条涉及安全的内容"
 
 
-def test_remove_document():
+def test_remove_document(seed_searchable_kb):
     """测试删除文档（快速路径 + 降级路径）。"""
-    kb_id = "test_kb_remove"
+    kb_id = seed_searchable_kb("test_kb_remove")
 
     index_document(kb_id, "doc_001", "建设工程质量管理条例内容分析与解读规范文件", source_name="quality.txt")
     index_document(kb_id, "doc_002", "建设工程安全生产管理条例全文规定与实施细则", source_name="safety.txt")
     index_document(kb_id, "doc_003", "招标投标法实施条例详细解读版本全文内容整理", source_name="bid.txt")
+
+    import storage.kb_repo as _kb_repo
+    kb = _kb_repo.get(kb_id)
+    kb.index_status = "searchable"
+    _kb_repo.update(kb)
 
     # 确认删除前能搜索到（用包含查询词的较长 query，提升语义匹配率）
     results_before = search([kb_id], "招标投标法条例解读", top_k=5)
@@ -148,11 +191,19 @@ def test_rebuild_kb_index():
     assert doc_001.id in kb.document_ids
     assert doc_002.id in kb.document_ids
 
-    # 先索引一篇，使索引文件建立
+    # 先索引一篇，使 FAISS 文件建立
     index_document(kb.id, doc_001.id, "建筑工程设计文件编制深度规定内容与标准要求")
 
-    # 确认索引文件已建立
-    assert get_kb_index_built(kb.id)
+    # 中间检查：FAISS 文件落盘了（ADR-0002 下"已建"含义需以字段为准，
+    # index_document 不动 kb 元数据；rebuild_kb_index 才会写字段）
+    from core.index_manager import _vectors_dir
+    vectors_dir = _vectors_dir(kb.id)
+    assert (vectors_dir / "default__vector_store.json").exists(), (
+        "index_document 应已落盘 FAISS 文件"
+    )
+    # 此时字段仍 none（没经过 rebuild）— 直接确认底层真相写盘即可
+    kb_mid = kb_repo.get(kb.id)
+    assert kb_mid.index_status == "none"
 
     # 重建索引
     progress = []
@@ -165,6 +216,13 @@ def test_rebuild_kb_index():
     # 验证回调被调用（至少两篇文档）
     assert len(progress) >= 1
 
+    # 内置契约（ADR-0002 §决策 2）：rebuild 后字段 searchable
+    kb_post = kb_repo.get(kb.id)
+    assert kb_post.index_status == "searchable", (
+        f"rebuild 后 kb.index_status 应为 searchable，实际 {kb_post.index_status}"
+    )
+    assert get_kb_index_built(kb.id) is True
+
     # 重建后仍可搜索
     results = search([kb.id], "建筑工程设计内容", top_k=5)
     assert len(results) >= 1
@@ -176,23 +234,28 @@ def test_search_empty_kb():
     assert results == []
 
 
-def test_index_same_doc_twice():
+def test_index_same_doc_twice(seed_searchable_kb):
     """测试重复索引同一文档不报错。"""
-    kb_id = "test_kb_duplicate"
+    kb_id = seed_searchable_kb("test_kb_duplicate")
 
     index_document(kb_id, "doc_001", "重复索引测试文档内容验证是否可以多次添加", source_name="dup.txt")
     index_document(kb_id, "doc_001", "重复索引测试文档内容验证是否可以多次添加", source_name="dup.txt")
+
+    import storage.kb_repo as _kb_repo
+    kb = _kb_repo.get(kb_id)
+    kb.index_status = "searchable"
+    _kb_repo.update(kb)
 
     # 不应报错，搜索结果应正常
     results = search([kb_id], "重复", top_k=5)
     assert len(results) >= 1
 
 
-def test_index_markdown_with_headings():
+def test_index_markdown_with_headings(seed_searchable_kb):
     """测试带 ## 标题的 Markdown 内容触发 MarkdownNodeParser 分块路径。"""
     from core.index_manager import _has_markdown_headings
 
-    kb_id = "test_kb_md_headings"
+    kb_id = seed_searchable_kb("test_kb_md_headings")
 
     md_text = """# 技术标准
 
@@ -221,6 +284,11 @@ def test_index_markdown_with_headings():
     assert _has_markdown_headings(md_text), "应检测到 Markdown 标题"
 
     index_document(kb_id, "doc_md", md_text, source_name="standard.md")
+
+    import storage.kb_repo as _kb_repo
+    kb = _kb_repo.get(kb_id)
+    kb.index_status = "searchable"
+    _kb_repo.update(kb)
 
     # 搜索总则章节内容
     r1 = search([kb_id], "技术标准", top_k=5)
@@ -313,12 +381,17 @@ def test_save_and_cleanup_doc_vectors():
     assert not nodes_file.exists(), "_nodes.json 文件应已删除"
 
 
-def test_rebuild_from_vectors():
+def test_rebuild_from_vectors(seed_searchable_kb):
     """从已保存的 .npy 向量文件重建索引后可搜索。"""
     from core.index_manager import _rebuild_from_vectors, _vectors_dir, clear_cache, _save_doc_vectors, _cleanup_doc_vectors
+    import storage.kb_repo as _kb_repo
 
     # 用 llm mocked? 不，先正常 index 生成缓存
-    kb_id = "test_kb_rebuild_from_vec"
+    kb_id = seed_searchable_kb("test_kb_rebuild_from_vec")
+    # 文档进入 KB
+    _kb_repo_cached = _kb_repo.get(kb_id)
+    _kb_repo_cached.document_ids = ["doc_vec_rebuild"]
+    _kb_repo.update(_kb_repo_cached)
 
     index_document(
         kb_id, "doc_vec_rebuild",
@@ -344,6 +417,12 @@ def test_rebuild_from_vectors():
     assert len(progress) >= 1
     assert progress[-1][1] == 1  # total = 1
 
+    # 字段镜像（_rebuild_from_vectors 不是顶层 rebuild 入口，
+    # 单独调用不会写 searchable；rebuild_kb_index 才会这样写）
+    kb = _kb_repo.get(kb_id)
+    kb.index_status = "searchable"
+    _kb_repo.update(kb)
+
     # 验证搜索可用
     results = search([kb_id], "向量缓存重建", top_k=5)
     assert len(results) >= 1, "从向量缓存重建后应能搜索到结果"
@@ -352,17 +431,12 @@ def test_rebuild_from_vectors():
     _cleanup_doc_vectors(kb_id, "doc_vec_rebuild")
 
 
-def test_remove_document_fallback_path(monkeypatch):
+def test_remove_document_fallback_path(monkeypatch, seed_searchable_kb):
     """强制 delete_ref_doc 抛异常 → fallback 到 _rebuild_from_vectors 路径。"""
     from core.index_manager import _vectors_dir
     import storage.kb_repo as kb_repo
-    from models.knowledge_base import KnowledgeBase
 
-    kb_id = "test_kb_remove_fallback"
-
-    # 创建 KB 元数据（remove_document fallback 依赖 kb.document_ids）
-    kb = KnowledgeBase(id=kb_id, name="fallback测试", category="national")
-    kb_repo.update(kb)
+    kb_id = seed_searchable_kb("test_kb_remove_fallback")
 
     index_document(kb_id, "doc_fb_1", "建设工程质量管理条例内容分析与解读规范文件全文", source_name="fb1.txt")
     index_document(kb_id, "doc_fb_2", "建设工程安全生产管理条例全文规定与实施细则", source_name="fb2.txt")
@@ -372,7 +446,7 @@ def test_remove_document_fallback_path(monkeypatch):
     kb.document_ids = ["doc_fb_1", "doc_fb_2"]
     kb_repo.update(kb)
 
-    # 验证索引已建立
+    # 验证索引已建立（走字段）
     assert get_kb_index_built(kb_id)
 
     # 强制 delete_ref_doc 抛异常，触发 fallback 路径
@@ -388,6 +462,10 @@ def test_remove_document_fallback_path(monkeypatch):
 
     # 恢复后验证：doc_fb_1 仍然可搜索
     monkeypatch.setattr(get_kb_index(kb_id), "delete_ref_doc", original_delete)
+    # rebuild 路径手工镜像 searchable（fallback 走过 _rebuild_from_vectors）
+    kb = kb_repo.get(kb_id)
+    kb.index_status = "searchable"
+    kb_repo.update(kb)
     results = search([kb_id], "建设工程质量", top_k=5)
     assert len(results) >= 1, "fallback 重建后应仍能搜索到剩余文档"
 
@@ -436,6 +514,12 @@ def test_rebuild_kb_index_mixed_vectors():
 
     # 两个文档都应被处理（progress 应包含两者）
     assert len(progress) >= 2, f"应处理 2 篇文档，实际 {len(progress)} 篇"
+
+    # rebuild_kb_index 锁内应写 kb.index_status='searchable'（内置契约）
+    kb_after = kb_repo.get(kb.id)
+    assert kb_after.index_status == "searchable", (
+        f"rebuild 后字段应为 searchable，实际 {kb_after.index_status}"
+    )
 
     # 重建后两者都应可搜索
     results_a = search([kb.id], "建筑工程设计", top_k=5)

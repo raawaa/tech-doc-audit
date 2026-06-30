@@ -560,6 +560,15 @@ def rebuild_kb_index(kb_id: str, progress_callback=None):
     优先从已保存的 .npy 向量重建（纯 CPU，秒级），
     向量缺失时降级到重新提取文本 + embedding（需要 GPU）。
 
+    内置契约（ADR-0002 §决策 2）：在 per-KB 锁内、根据本函数结果写回
+    ``kb.index_status``：
+    - 至少有一篇文档被成功索引 → 'searchable'（同时清 progress / current_doc）
+    - 重建过程抛异常 → 'failed'（保留 current_doc 为错误信息）
+    - KB 不存在 → 静默返回
+
+    不依赖任何调用方记得写字段——这是为何把"写回字段"内置在重建函数里，
+    而不是分散在 reindex 按钮 / auto-rebuild / 批量导入等调用方。
+
     Args:
         kb_id: 知识库 ID。
         progress_callback: 可选回调 (current_index, total, doc_name) → None，
@@ -573,60 +582,100 @@ def rebuild_kb_index(kb_id: str, progress_callback=None):
         if not kb:
             return
 
-        vectors_dir = _vectors_dir(kb_id)
-        doc_ids = kb.document_ids
+        # 内置契约：开锁前先标记 building，让 UI/其他线程看见的中间态。
+        # 这一写也在锁内，免与并发 _ensure_kb_index 交错。
+        kb.index_status = "building"
+        kb.index_progress = 0.0
+        kb.index_current_doc = ""
+        kb_repo.update(kb)
 
-        # 区分有/无向量缓存的文档
-        with_vectors = []
-        without_vectors = []
-        for doc_id in doc_ids:
-            if (vectors_dir / f"{doc_id}.npy").exists():
-                with_vectors.append(doc_id)
-            else:
-                without_vectors.append(doc_id)
+        try:
+            vectors_dir = _vectors_dir(kb_id)
+            doc_ids = kb.document_ids
 
-        # 阶段 1：从向量缓存快速重建（无需 GPU）
-        if with_vectors:
-            _logger.info("rebuilding kb %s from %d cached vectors (fast path)", kb_id, len(with_vectors))
-            # 删除旧的 llama-index 持久化文件（_rebuild_from_vectors 成功后会 _persist 写回新的）
-            old_store = vectors_dir / "default__vector_store.json"
-            if old_store.exists():
-                old_store.unlink()
-            for pattern in ["docstore.json", "index_store.json", "graph_store.json"]:
-                p = vectors_dir / pattern
-                if p.exists():
-                    p.unlink()
+            # 区分有/无向量缓存的文档
+            with_vectors = []
+            without_vectors = []
+            for doc_id in doc_ids:
+                if (vectors_dir / f"{doc_id}.npy").exists():
+                    with_vectors.append(doc_id)
+                else:
+                    without_vectors.append(doc_id)
 
-            _rebuild_from_vectors(kb_id, with_vectors, progress_callback=progress_callback)
+            # 阶段 1：从向量缓存快速重建（无需 GPU）
+            if with_vectors:
+                _logger.info("rebuilding kb %s from %d cached vectors (fast path)", kb_id, len(with_vectors))
+                # 删除旧的 llama-index 持久化文件（_rebuild_from_vectors 成功后会 _persist 写回新的）
+                old_store = vectors_dir / "default__vector_store.json"
+                if old_store.exists():
+                    old_store.unlink()
+                for pattern in ["docstore.json", "index_store.json", "graph_store.json"]:
+                    p = vectors_dir / pattern
+                    if p.exists():
+                        p.unlink()
 
-        # 阶段 2：重新提取文本 + embedding（向量缓存缺失的文档）
-        if without_vectors:
-            _logger.info("rebuilding kb %s: %d docs need re-embedding (slow path)", kb_id, len(without_vectors))
-            from storage.doc_repo import get_doc
-            total = len(without_vectors)
-            for i, doc_id in enumerate(without_vectors, 1):
-                doc = get_doc(kb_id, doc_id)
-                doc_name = doc.original_name if doc and doc.original_name else doc_id
-                if progress_callback:
-                    progress_callback(i, total, doc_name)
-                if doc and doc.file_path and Path(doc.file_path).exists():
-                    try:
-                        text = _extract_text(doc.file_path)
-                        if text:
-                            index_document(kb_id, doc_id, text)
-                            # index_document 内部已调用 _persist + _save_doc_vectors
-                    except Exception as e:
-                        _logger.warning("  [skip] %s: %s", doc_id, e)
+                _rebuild_from_vectors(kb_id, with_vectors, progress_callback=progress_callback)
 
-        if not with_vectors and not without_vectors:
-            # 无文档，清理
-            if vectors_dir.exists():
-                shutil.rmtree(str(vectors_dir))
+            # 阶段 2：重新提取文本 + embedding（向量缓存缺失的文档）
+            if without_vectors:
+                _logger.info("rebuilding kb %s: %d docs need re-embedding (slow path)", kb_id, len(without_vectors))
+                from storage.doc_repo import get_doc
+                total = len(without_vectors)
+                for i, doc_id in enumerate(without_vectors, 1):
+                    doc = get_doc(kb_id, doc_id)
+                    doc_name = doc.original_name if doc and doc.original_name else doc_id
+                    if progress_callback:
+                        progress_callback(i, total, doc_name)
+                    if doc and doc.file_path and Path(doc.file_path).exists():
+                        try:
+                            text = _extract_text(doc.file_path)
+                            if text:
+                                index_document(kb_id, doc_id, text)
+                                # index_document 内部已调用 _persist + _save_doc_vectors
+                        except Exception as e:
+                            _logger.warning("  [skip] %s: %s", doc_id, e)
+
+            if not with_vectors and not without_vectors:
+                # 无文档，清理 + 仍标 searchable（空库也是合法"无文档"状态）
+                if vectors_dir.exists():
+                    shutil.rmtree(str(vectors_dir))
+                kb.index_status = "searchable"
+                kb.index_progress = 1.0
+                kb_repo.update(kb)
+                return
+
+            # 内置契约：重建成功 → 字段 searchable（无需调用方再写）
+            kb.index_status = "searchable"
+            kb.index_progress = 1.0
+            kb.index_current_doc = ""
+            kb_repo.update(kb)
+        except Exception as e:
+            # 内置契约：失败 → 字段 failed（保留错误信息在 current_doc）
+            kb = kb_repo.get(kb_id)
+            if kb is not None:
+                kb.index_status = "failed"
+                kb.index_current_doc = f"错误: {e}"
+                kb_repo.update(kb)
+            raise
 
 
 def get_kb_index_built(kb_id: str) -> bool:
-    """检查 KB 是否已有索引（default__vector_store.json 文件存在）。"""
-    return (_vectors_dir(kb_id) / "default__vector_store.json").exists()
+    """检查 KB 是否可被向量检索。
+
+    ADR-0002 单真相：本函数只读 KB 元数据中的 ``kb.index_status`` 字段。
+    旧的依据 ``default__vector_store.json`` 文件是否存在的判定已弃用——
+    FAISS 文件（含 .npy 文档向量缓存）仅为可从字段与文档重生的缓存，
+    不再是状态真相。
+
+    取值映射：
+    - ``searchable`` → True（可向量检索）
+    - ``building`` / ``none`` / ``failed`` → False（自愈路径触发条件）
+
+    删除同名函数旧签名是为了避免静默回退到文件判定——任何路径失效都立刻报错。
+    """
+    import storage.kb_repo as _kb_repo
+    kb = _kb_repo.get(kb_id)
+    return kb is not None and kb.index_status == "searchable"
 
 
 # ── 搜索 ────────────────────────────────────────────────────────────────────────

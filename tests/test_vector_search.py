@@ -68,12 +68,18 @@ def test_format_kb_results_custom_prefix():
 # ── 向量主路径往返（fake embedder，无 bge-m3）──────────────────────────────────
 
 
-def test_index_and_vec_search_round_trip(tmp_path):
+def test_index_and_vec_search_round_trip(tmp_path, seed_searchable_kb):
     """index_document → vec_search 往返：建索引后能搜到（结构断言，不依赖语义）。"""
     f = tmp_path / "std.md"
     f.write_text("# 技术标准\n\n本标准规定质保期不少于24个月，验收应符合 GB/T 20145 的要求。")
 
-    kb_id = "vs_kb_roundtrip"
+    kb_id = seed_searchable_kb("vs_kb_roundtrip")
+    # 把 doc 关联到 KB 上（重建时按 document_ids 处理；不写不进 KB 会丢失）
+    import storage.kb_repo as _kb_repo
+    kb = _kb_repo.get(kb_id)
+    kb.document_ids = ["d1"]
+    _kb_repo.update(kb)
+
     index_document(kb_id, "d1", str(f), source_name="技术标准.md")
 
     results = vec_search([kb_id], "质保期", top_k=5)
@@ -84,11 +90,16 @@ def test_index_and_vec_search_round_trip(tmp_path):
     assert r.get("content") is not None
 
 
-def test_search_wrapper_delegates_to_vec_search(tmp_path):
+def test_search_wrapper_delegates_to_vec_search(tmp_path, seed_searchable_kb):
     """search() 是 vec_search 的兼容包装。"""
     f = tmp_path / "d.md"
     f.write_text("网络安全等级保护基本要求 GB/T 22239 全文内容规定。")
-    kb_id = "vs_kb_wrapper"
+    kb_id = seed_searchable_kb("vs_kb_wrapper")
+    import storage.kb_repo as _kb_repo
+    kb = _kb_repo.get(kb_id)
+    kb.document_ids = ["d1"]
+    _kb_repo.update(kb)
+
     index_document(kb_id, "d1", str(f), source_name="d.md")
 
     results = search([kb_id], "安全", max_results=5)

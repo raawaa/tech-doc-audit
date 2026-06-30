@@ -146,3 +146,34 @@ def fake_models(monkeypatch):
     finally:
         _LISettings.embed_model = prev_embed
         _LISettings.llm = prev_llm
+
+
+# ── 知识库元数据播种：让直接调用 index_document / search 的测试也能跑 ──────
+
+
+@pytest.fixture
+def seed_searchable_kb():
+    """创建 KB 元数据并标记 index_status='searchable'。
+
+    ADR-0002 后，``core.index_manager.search()`` / ``get_kb_index_built()``
+    直接读 ``kb.index_status``。生产路径经 doc_svc 自然维护这个状态，
+    单元测试若绕过 doc_svc 直接调底层 ``index_document``，需要手工 seed。
+    """
+    seeded: list[str] = []
+
+    def _seed(kb_id: str):
+        kb = KnowledgeBase(id=kb_id, name="seed", category="national")
+        kb_repo.update(kb)
+        kb = kb_repo.get(kb_id)
+        kb.index_status = "searchable"
+        kb.document_ids = []
+        kb_repo.update(kb)
+        seeded.append(kb_id)
+        return kb_id
+
+    yield _seed
+
+
+# 在 conftest 模块级导入，避免顶级 import 顺序问题
+from models.knowledge_base import KnowledgeBase
+import storage.kb_repo as kb_repo
