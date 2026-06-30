@@ -130,6 +130,7 @@ export interface QASource {
   doc_id: string
   doc_source: string
   content_snippet: string
+  page_number?: number | null
   relevance: number
 }
 

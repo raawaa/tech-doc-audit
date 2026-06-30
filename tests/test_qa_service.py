@@ -151,3 +151,31 @@ def test_chat_stream_yields_progress_then_tokens(monkeypatch):
     token_events = [e for e in events if e["type"] == "token"]
     assert [e["text"] for e in token_events] == ["你", "好"]  # 空 delta 被过滤
     assert types[-1] == "done"
+
+
+# ── 来源字段（page_number 透传）──────────────────────────────────────────────
+
+
+def _fake_node(metadata: dict, text: str = "条款内容", score: float = 0.7):
+    node = MagicMock()
+    node.metadata = metadata
+    node.node.text = text
+    node.score = score
+    return node
+
+
+def test_sources_from_nodes_includes_page_number():
+    """chunk metadata 的 page_number(0-based) 应透传到 sources。"""
+    node = _fake_node({"kb_id": "kb1", "doc_id": "doc1", "source": "某标准", "page_number": 3})
+    sources = qa_service._sources_from_nodes([node])
+    assert len(sources) == 1
+    assert sources[0]["page_number"] == 3
+    assert sources[0]["doc_id"] == "doc1"
+    assert sources[0]["doc_source"] == "某标准"
+
+
+def test_sources_from_nodes_page_number_none_when_absent():
+    """metadata 无 page_number 时，sources 中 page_number 为 None。"""
+    node = _fake_node({"kb_id": "kb1", "doc_id": "doc1", "source": "某标准"})
+    sources = qa_service._sources_from_nodes([node])
+    assert sources[0]["page_number"] is None

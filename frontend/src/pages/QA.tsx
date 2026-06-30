@@ -8,6 +8,7 @@ import { Card, CardBody } from '../components/Card'
 import { Markdown } from '../components/Markdown'
 
 import type { QASource } from '../api/types'
+import { buildQASourcePreviewUrl } from '../lib/qaSource'
 
 /** 从 AI SDK v6 的 UIMessage 中提取文本内容 */
 function getMessageText(msg: { parts?: Array<{ type: string; text?: string }>; content?: string }): string {
@@ -194,15 +195,29 @@ export function QA() {
                           </button>
                           {expandedSources.has(msg.id) && (
                             <div className="mt-2 space-y-2">
-                              {sourcesMap.get(msg.id)!.map((s, j) => (
+                              {sourcesMap.get(msg.id)!.map((s, j) => {
+                                const previewUrl = buildQASourcePreviewUrl(s)
+                                return (
                                 <div key={j} className="text-xs text-slate-500 bg-white/80 rounded p-2 border border-slate-200/60">
                                   <div className="flex items-center gap-2 mb-1">
                                     <span className="font-medium text-slate-600">{s.doc_source}</span>
                                     <span className="text-slate-400">{(s.relevance * 100).toFixed(0)}%</span>
+                                    {previewUrl && (
+                                      <a
+                                        href={previewUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="ml-auto text-blue-600 hover:underline inline-flex items-center gap-0.5"
+                                        title="在新标签页预览来源"
+                                      >
+                                        📄 预览
+                                      </a>
+                                    )}
                                   </div>
                                   <p className="line-clamp-2">{s.content_snippet}</p>
                                 </div>
-                              ))}
+                                )
+                              })}
                             </div>
                           )}
                         </div>

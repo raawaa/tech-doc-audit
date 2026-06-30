@@ -29,6 +29,7 @@ class QASource(BaseModel):
     doc_id: str
     doc_source: str
     content_snippet: str
+    page_number: Optional[int] = None
     relevance: float
 
 
@@ -68,8 +69,12 @@ def ask_question(req: QARequest):
             return QAResponse(
                 answer=result["answer"],
                 sources=[QASource(
-                    kb_id="", doc_id="", doc_source=s.get("doc_source", "未知来源"),
-                    content_snippet="", relevance=1.0,
+                    kb_id=s.get("kb_id", ""),
+                    doc_id=s.get("doc_id", ""),
+                    doc_source=s.get("doc_source", "未知来源"),
+                    content_snippet=s.get("content_snippet", ""),
+                    page_number=s.get("page_number"),
+                    relevance=s.get("relevance", 1.0),
                 ) for s in result["sources"]] if result["sources"] else [],
             )
         else:
@@ -274,8 +279,12 @@ def chat_stream(req: ChatRequest):
                 yield _sse("data-sources", {
                     "type": "data-sources",
                     "data": {"sources": [
-                        {"kb_id": "", "doc_id": "", "doc_source": s.get("doc_source", "未知来源"),
-                         "content_snippet": "", "relevance": 1.0}
+                        {"kb_id": s.get("kb_id", ""),
+                         "doc_id": s.get("doc_id", ""),
+                         "doc_source": s.get("doc_source", "未知来源"),
+                         "content_snippet": s.get("content_snippet", ""),
+                         "page_number": s.get("page_number"),
+                         "relevance": s.get("relevance", 1.0)}
                         for s in result["sources"]
                     ]},
                 })

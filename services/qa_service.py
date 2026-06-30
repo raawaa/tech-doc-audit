@@ -108,6 +108,7 @@ def ask(kb_ids: list[str], question: str, top_k: int = 5) -> dict[str, Any]:
             "doc_id": n.metadata.get("doc_id", ""),
             "doc_source": n.metadata.get("source", ""),
             "content_snippet": n.node.text[:300],
+            "page_number": n.metadata.get("page_number"),
             "relevance": round(n.score or 0, 4),
         }
         for n in response.source_nodes
@@ -200,6 +201,7 @@ def _sources_from_nodes(source_nodes) -> list[dict]:
             "doc_id": n.metadata.get("doc_id", ""),
             "doc_source": n.metadata.get("source", ""),
             "content_snippet": n.node.text[:300],
+            "page_number": n.metadata.get("page_number"),
             "relevance": round(n.score or 0, 4),
         }
         for n in source_nodes
