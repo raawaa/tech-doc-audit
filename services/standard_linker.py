@@ -131,6 +131,7 @@ def _search_and_link_standards(
     issues: list[AuditIssue],
     kb_ids: list[str],
     extracted: dict[int, ExtractedStandard],
+    doc_name_by_id: dict[str, str],
 ) -> None:
     """搜索知识库并回填 standard_doc_id 等字段（原地修改 issues）。
 
@@ -145,6 +146,8 @@ def _search_and_link_standards(
         issues: 待处理的 issue 列表（原地修改）
         kb_ids: 审核任务关联的知识库 ID 列表
         extracted: extract_standards_deepseek() 的返回值
+        doc_name_by_id: {doc_id: 文档标题}，命中真实文档时用于校正 standard_name，
+            避免审核阶段填入的名称与命中的 doc_id 不一致（#3）。
     """
     if not issues or not kb_ids:
         return
@@ -227,11 +230,14 @@ def _search_and_link_standards(
             raw_page = best_hit.get("page_number")
             sr.page_number = raw_page + 1 if raw_page is not None else None
             sr.chunk_text = best_hit.get("chunk_text")
+            doc_name = doc_name_by_id.get(best_hit["doc_id"])
+            if doc_name:
+                sr.standard_name = doc_name
+                sr.standard_id = doc_name
             _logger.info(
                 "_search_and_link_standards: linked issue #%d to doc %s",
                 issue.id, best_hit["doc_id"],
             )
-        # 无论是否搜到 KB 文档，只要 LLM 提取出了标准编号且 standard_name 为空，就补上
         if not sr.standard_name and standard_numbers:
             sr.standard_name = standard_numbers[0]
             sr.standard_id = standard_numbers[0]
@@ -264,10 +270,14 @@ def link_standards(
 
     # 收集 KB 中所有有效的 doc_id（用于验证 LLM 填入的 doc_id 是否真实存在）
     valid_doc_ids: set[str] = set()
+    doc_name_by_id: dict[str, str] = {}
     for kb_id in kb_ids:
         try:
             for doc in _doc_repo.list_docs(kb_id):
                 valid_doc_ids.add(doc.id)
+                name = getattr(doc, "name", None)
+                if name:
+                    doc_name_by_id[doc.id] = name
         except Exception:
             pass
 
@@ -302,6 +312,6 @@ def link_standards(
         return
 
     try:
-        _search_and_link_standards(pending, kb_ids, extracted)
+        _search_and_link_standards(pending, kb_ids, extracted, doc_name_by_id)
     except Exception as e:
         _logger.warning("link_standards: search failed: %s", e)
