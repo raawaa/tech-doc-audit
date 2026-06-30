@@ -168,9 +168,12 @@ def reindex_kb(kb_id: str):
 
     def _on_progress(current: int, total: int, doc_name: str):
         """每索引完一篇文档的回调，更新 KB 状态供前端轮询。"""
-        kb.index_progress = current / total if total else 0
-        kb.index_current_doc = doc_name
-        kb_svc.update_kb(kb)
+        fresh = kb_svc.get_kb(kb_id)
+        if fresh is None:
+            return  # KB 已删，不写陈旧对象
+        fresh.index_progress = current / total if total else 0
+        fresh.index_current_doc = doc_name
+        kb_svc.update_kb(fresh)
 
     def _run():
         """后台执行重建。"""
@@ -194,18 +197,25 @@ def reindex_kb(kb_id: str):
                 doc_repo._save_doc_meta(doc)
 
             # KB 检索状态由 rebuild_kb_index 在锁内按内置契约写回（ADR-0002）。
-            # 此处仅清理进度 / 当前文档名，不重复写 index_status。
-            kb.index_progress = 1.0
-            kb.index_current_doc = ""
+            # 这里再次按 fetch-fresh 模式只更新进度字段，避免把 status 写回陈旧值
+            # （rebuild_kb_index 持锁内独立 fetch+update；handler 自己也是 fetch+update，
+            #  互不踩各自锁，无需担心 TOCTOU）。
+            fresh = kb_svc.get_kb(kb_id)
+            if fresh is not None:
+                fresh.index_progress = 1.0
+                fresh.index_current_doc = ""
+                kb_svc.update_kb(fresh)
         except Exception as e:
-            kb.index_status = "failed"
-            kb.index_current_doc = f"错误: {e}"
-            # 将仍在 pending_index 的文档标记为 failed
+            # 失败路径写 failed（rebuild_kb_index 也会自己写 failed；这里再保险一次）
+            fresh = kb_svc.get_kb(kb_id)
+            if fresh is not None:
+                fresh.index_status = "failed"
+                fresh.index_current_doc = f"错误: {e}"
+                kb_svc.update_kb(fresh)
             for doc in all_docs:
                 if doc.embedding_status == "pending_index":
                     doc.embedding_status = "failed"
                     doc_repo._save_doc_meta(doc)
-        kb_svc.update_kb(kb)
 
     import threading
     thread = threading.Thread(target=_run, daemon=True)

@@ -17,10 +17,18 @@ const colorMap: Record<string, string> = {
   high: 'bg-red-50 text-red-700',
   medium: 'bg-amber-50 text-amber-700',
   low: 'bg-emerald-50 text-emerald-700',
-  // index status
+  // KB index_status (per-doc embedding_status reuses these 终态色系)
   none: 'bg-slate-100 text-slate-500',
   building: 'bg-blue-50 text-blue-700',
+  pending_index: 'bg-slate-100 text-slate-600',
+  indexing: 'bg-indigo-50 text-indigo-700',
+  // 终态：KB index_status = 'searchable'（per ADR-0003）
+  searchable: 'bg-emerald-50 text-emerald-700',
+  // 终态：doc embedding_status = 'embedded'（per ADR-0003）
+  embedded: 'bg-emerald-50 text-emerald-700',
+  // 已弃用但保留旧映射以防旧 JSON 兼容
   ready: 'bg-emerald-50 text-emerald-700',
+  indexed_legacy: 'bg-indigo-50 text-indigo-700',
   // category
   national: 'bg-purple-50 text-purple-700',
   industry: 'bg-blue-50 text-blue-700',
@@ -47,9 +55,14 @@ const labelMap: Record<string, string> = {
   high: '高',
   medium: '中',
   low: '低',
-  none: '未建立',
+  none: '未建索引',
   building: '构建中',
-  ready: '就绪',
+  pending_index: '待索引',
+  indexing: '索引中',
+  searchable: '可检索',
+  embedded: '已向量化',
+  ready: '已就绪',
+  indexed_legacy: '已索引',
   national: '国家标准',
   industry: '行业标准',
   enterprise: '企业标准',

@@ -1,11 +1,14 @@
 // ── 知识库 ──
+// KB 索引状态字段 per ADR-0003：
+//   none / building / searchable / failed
+// 终态词已分裂：KB 用 'searchable'（不是 'ready'）；doc 用 'embedded'。
 export interface KnowledgeBase {
   id: string
   name: string
   description: string
   category: 'national' | 'industry' | 'enterprise'
   document_count: number
-  index_status: 'none' | 'building' | 'ready' | 'failed'
+  index_status: 'none' | 'building' | 'searchable' | 'failed'
   index_progress: number
   index_current_doc: string
   created_at: string
@@ -18,7 +21,7 @@ export interface KBDocument {
   original_name: string
   file_type: string
   page_count: number | null
-  index_status: string
+  embedding_status: 'none' | 'pending_index' | 'indexing' | 'embedded' | 'failed'
 }
 
 // ── 待审核文档 ──

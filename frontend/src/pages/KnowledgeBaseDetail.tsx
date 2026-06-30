@@ -28,9 +28,9 @@ export function KnowledgeBaseDetail() {
     // 当 KB 正在构建 或 有文档处于 pending_index / indexing 状态时持续轮询
     refetchInterval: (query) => {
       if (kb?.index_status === 'building') return 2000
-      // KB 已 ready 但还有文档卡在中间状态
+      // KB 已 searchable 但仍有文档卡在 pending_index / indexing（部分文档还在向量化）
       const docs = query.state.data
-      if (docs && docs.some((d: any) => d.index_status === 'pending_index' || d.index_status === 'indexing')) {
+      if (docs && docs.some((d: any) => d.embedding_status === 'pending_index' || d.embedding_status === 'indexing')) {
         return 2000
       }
       return false
@@ -166,7 +166,7 @@ export function KnowledgeBaseDetail() {
                     </td>
                     <td className="px-5 py-3 text-sm text-slate-500">{d.file_type?.toUpperCase()}</td>
                     <td className="px-5 py-3 text-sm text-slate-500">{d.page_count ?? '-'}</td>
-                    <td className="px-5 py-3"><Badge value={d.index_status} /></td>
+                    <td className="px-5 py-3"><Badge value={d.embedding_status} /></td>
                     <td className="px-5 py-3 text-right">
                       <button className="btn-ghost btn-sm !text-red-500 hover:!text-red-600" onClick={() => deleteDoc.mutate(d.id)}>
                         <Trash2 className="w-3.5 h-3.5" />
