@@ -20,14 +20,21 @@ app = FastAPI(
 
 # ── 启动恢复：上次中断残留的状态清除 ────────────────────────────
 # 如果服务器在后台索引进行时重启/崩溃，index_status 会永远卡在
-# "building"（daemon 线程被强制终止，无法执行 set to "ready"）。
-# 这里在启动时自动恢复 ― 将 stuck 状态的 KB/Doc 重置为 "none"。
+# "building"（daemon 线程被强制终止，无法执行 set to "searchable"）。
+# 这里在启动时自动恢复 ― 将 stuck 状态的 KB/Doc 重置为 none/embedded。
 import storage.kb_repo as kb_repo
 import storage.doc_repo as doc_repo
 
 
 def recover_stuck_indexes():
-    """恢复因崩溃卡住的 KB 和文档索引状态（可独立调用，便于测试）。"""
+    """恢复因崩溃卡住的 KB 和文档索引状态（可独立调用，便于测试）。
+
+    字段分裂后的语义（ADR-0003）：
+    - KB.index_status="building" → "none"（下次访问会重新评估是否可重建）
+    - Doc.embedding_status="pending_index" → "none"（尚未开始写向量就崩了）
+    - Doc.embedding_status="indexing" → "pending_index"（写到一半崩了，重排队）
+    - 已 "embedded" 的文档与 "searchable"/"failed" 的 KB 不动
+    """
     stuck_kbs = [kb for kb in kb_repo.list_all() if kb.index_status == "building"]
     for kb in stuck_kbs:
         kb.index_status = "none"
@@ -42,18 +49,18 @@ def recover_stuck_indexes():
         all_docs = doc_repo.list_docs(kb_dir.name)
 
         # pending_index: 还没来得及开始索引就崩溃了
-        stuck_docs = [d for d in all_docs if d.index_status == "pending_index"]
+        stuck_docs = [d for d in all_docs if d.embedding_status == "pending_index"]
         for doc in stuck_docs:
-            doc.index_status = "none"
+            doc.embedding_status = "none"
             doc_repo._save_doc_meta(doc)
-            print(f"[startup] 恢复卡住的文档: {doc.original_name} ({doc.id}) → index_status=none")
+            print(f"[startup] 恢复卡住的文档: {doc.original_name} ({doc.id}) → embedding_status=none")
 
         # indexing: 索引进行到一半崩溃了，重置为 pending_index 等待重新索引
-        indexing_docs = [d for d in all_docs if d.index_status == "indexing"]
+        indexing_docs = [d for d in all_docs if d.embedding_status == "indexing"]
         for doc in indexing_docs:
-            doc.index_status = "pending_index"
+            doc.embedding_status = "pending_index"
             doc_repo._save_doc_meta(doc)
-            print(f"[startup] 恢复卡住的文档: {doc.original_name} ({doc.id}) → index_status=pending_index")
+            print(f"[startup] 恢复卡住的文档: {doc.original_name} ({doc.id}) → embedding_status=pending_index")
 
 
 recover_stuck_indexes()

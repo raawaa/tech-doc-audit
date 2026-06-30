@@ -66,7 +66,7 @@ class KBDocumentResponse(BaseModel):
     original_name: str
     file_type: str
     page_count: int | None
-    index_status: str
+    embedding_status: str
 
     @classmethod
     def from_doc(cls, doc):
@@ -76,7 +76,7 @@ class KBDocumentResponse(BaseModel):
             original_name=doc.original_name,
             file_type=doc.file_type,
             page_count=doc.page_count,
-            index_status=doc.index_status,
+            embedding_status=doc.embedding_status,
         )
 
 
@@ -163,7 +163,7 @@ def reindex_kb(kb_id: str):
     # 将所有关联文档的状态重置为 pending_index，表示正在等待重建
     all_docs = doc_repo.list_docs(kb_id)
     for doc in all_docs:
-        doc.index_status = "pending_index"
+        doc.embedding_status = "pending_index"
         doc_repo._save_doc_meta(doc)
 
     def _on_progress(current: int, total: int, doc_name: str):
@@ -178,22 +178,23 @@ def reindex_kb(kb_id: str):
         try:
             vs.rebuild_kb_index(kb_id, progress_callback=_on_progress)
 
-            # 重建完成后，检查实际索引结果并更新各文档状态
+            # 重建完成后，检查实际索引结果并更新各文档的向量化状态
             # （rebuild_kb_index 内部可能因节点不匹配等原因跳过某些文档，
             #   所以需要核实 FAISS 索引中实际包含哪些文档）
             indexed_doc_ids = _get_actually_indexed_doc_ids(kb_id)
             for doc in all_docs:
                 if doc.id in indexed_doc_ids:
-                    doc.index_status = "ready"
+                    doc.embedding_status = "embedded"
                 else:
-                    doc.index_status = "failed"
+                    doc.embedding_status = "failed"
                     _logger.warning(
                         "reindex: doc %s (%s) not found in FAISS index after rebuild, marked as failed",
                         doc.id, doc.original_name,
                     )
                 doc_repo._save_doc_meta(doc)
 
-            kb.index_status = "ready"
+            # KB 检索状态由 rebuild_kb_index 在锁内按内置契约写回（ADR-0002）。
+            # 此处仅清理进度 / 当前文档名，不重复写 index_status。
             kb.index_progress = 1.0
             kb.index_current_doc = ""
         except Exception as e:
@@ -201,8 +202,8 @@ def reindex_kb(kb_id: str):
             kb.index_current_doc = f"错误: {e}"
             # 将仍在 pending_index 的文档标记为 failed
             for doc in all_docs:
-                if doc.index_status == "pending_index":
-                    doc.index_status = "failed"
+                if doc.embedding_status == "pending_index":
+                    doc.embedding_status = "failed"
                     doc_repo._save_doc_meta(doc)
         kb_svc.update_kb(kb)
 

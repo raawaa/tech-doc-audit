@@ -85,9 +85,6 @@ def import_document(
     doc = doc_repo.save_doc(kb_id, original_name, content, file_type)
     doc.content_hash = file_hash
 
-    doc.index_status = "ready"
-    doc_repo._save_doc_meta(doc)
-
     # 提取 PDF 页数和逐页文本
     if file_type == "pdf":
         try:
@@ -113,7 +110,7 @@ def import_document(
         _page_texts = doc.metadata.get("page_texts")
         if async_index:
             # 异步：后台线程索引，不阻塞 API 响应
-            doc.index_status = "pending_index"
+            doc.embedding_status = "pending_index"
             doc_repo._save_doc_meta(doc)
             thread = threading.Thread(
                 target=_index_single_doc_async,
@@ -122,11 +119,18 @@ def import_document(
             )
             thread.start()
         else:
-            # 同步：等待索引完成（CLI 等场景）
+            # 同步：等待索引完成（CLI 等场景）。
+            # 提早置 embedding_status="indexing"，失败回退 "failed"（见 ADR-0003 §决策 5）：
+            # 此前的同步路径先写成 "ready" 又不撤销，会出现"未向量化但状态已 ready"的主动误导。
+            doc.embedding_status = "indexing"
+            doc_repo._save_doc_meta(doc)
             try:
                 _index_vec(kb_id, doc.id, doc.file_path, page_texts=_page_texts)
+                doc.embedding_status = "embedded"
             except Exception as e:
                 _logger.warning("vector indexing failed for doc %s: %s", doc.id, e)
+                doc.embedding_status = "failed"
+            doc_repo._save_doc_meta(doc)
 
     return doc
 
@@ -136,10 +140,12 @@ def _index_single_doc_async(kb_id: str, doc: KBDocument):
     import storage.kb_repo as kb_repo
 
     # 标记为 indexing（崩溃后可识别）
-    doc.index_status = "indexing"
+    doc.embedding_status = "indexing"
     doc_repo._save_doc_meta(doc)
 
-    # 获取最新 kb 并标记 building（原子 get→modify→update）
+    # 获取最新 kb 并标记 building（原子 get→modify→update）。
+    # 注：最终 searchable 由调用方（rebuild_kb_index）按内置契约写回；
+    # 此处只在单文档场景下做兜底——一个 KB 一篇文档且导入即完成时需把 KB→searchable。
     with _get_lock(kb_id):
         kb = kb_repo.get(kb_id)
         if not kb:
@@ -152,17 +158,17 @@ def _index_single_doc_async(kb_id: str, doc: KBDocument):
     try:
         page_texts = doc.metadata.get("page_texts")
         _index_vec(kb_id, doc.id, doc.file_path, page_texts=page_texts)
-        doc.index_status = "ready"
+        doc.embedding_status = "embedded"
     except Exception as e:
         _logger.warning("async indexing failed for doc %s: %s", doc.id, e)
-        doc.index_status = "failed"
+        doc.embedding_status = "failed"
 
-    # 原子地更新文档和 KB 状态（同一锁内，防止前端看到 doc ready 而 KB 还在 building）
+    # 原子地更新文档和 KB 状态（同一锁内，防止前端看到 doc embedded 而 KB 还在 building）
     with _get_lock(kb_id):
         doc_repo._save_doc_meta(doc)
         kb = kb_repo.get(kb_id)
         if kb:
-            kb.index_status = "ready"
+            kb.index_status = "searchable"
             kb.index_progress = 1.0
             kb.index_current_doc = ""
             kb_repo.update(kb)
@@ -207,7 +213,7 @@ def batch_import_documents(
 
         doc = doc_repo.save_doc(kb_id, original_name, content, file_type)
         doc.content_hash = file_hash
-        doc.index_status = "pending_index"
+        doc.embedding_status = "pending_index"
 
         # 提取 PDF 页数（与 import_document 路径保持一致）
         if file_type == "pdf":
@@ -260,12 +266,12 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
         doc_map = {doc.id: doc for doc in docs}
         for doc in docs:
             # 断点续传：跳过已索引完成的文档
-            if doc.index_status == "ready":
+            if doc.embedding_status == "embedded":
                 _logger.info("文档 %s 已索引，跳过", doc.id)
                 continue
 
             # 标记为 indexing（崩溃后可识别并重置）
-            doc.index_status = "indexing"
+            doc.embedding_status = "indexing"
             doc_repo._save_doc_meta(doc)
 
             if doc.file_path and os.path.exists(doc.file_path):
@@ -276,15 +282,15 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
                         texts.append((doc.id, text, doc.original_name, page_texts))
                     else:
                         _logger.warning("文档 %s 文本提取为空，跳过索引", doc.id)
-                        doc_map[doc.id].index_status = "failed"
+                        doc_map[doc.id].embedding_status = "failed"
                         doc_repo._save_doc_meta(doc_map[doc.id])
                 except Exception as e:
                     _logger.warning("读取文档 %s 失败: %s", doc.id, e)
-                    doc_map[doc.id].index_status = "failed"
+                    doc_map[doc.id].embedding_status = "failed"
                     doc_repo._save_doc_meta(doc_map[doc.id])
 
         if not texts:
-            kb.index_status = "ready"
+            kb.index_status = "searchable"
             kb_repo.update(kb)
             return
 
@@ -296,7 +302,7 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
     indexed_ids = set()
 
     def _on_progress(current: int, total: int, doc_name: str):
-        # 锁内更新 KB 进度 + 文档状态，防止前端看到 doc ready 而 KB 还在 building
+        # 锁内更新 KB 进度 + 文档状态，防止前端看到 doc embedded 而 KB 还在 building
         with _get_lock(kb_id):
             inner_kb = kb_repo.get(kb_id)
             if not inner_kb:
@@ -306,7 +312,7 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
             kb_repo.update(inner_kb)
             doc_id = texts[current - 1][0]
             if doc_id in doc_map:
-                doc_map[doc_id].index_status = "ready"
+                doc_map[doc_id].embedding_status = "embedded"
                 doc_repo._save_doc_meta(doc_map[doc_id])
                 indexed_ids.add(doc_id)
 
@@ -314,10 +320,11 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
         from core.index_manager import index_documents_batch
         index_documents_batch(kb_id, texts, progress_callback=_on_progress)
         # 锁内 read-modify-write 原子更新完成状态；KB 已删则跳过（不写回陈旧对象）
+        # 批量路径此处直接 searchable 而非依赖 rebuild_kb_index（因为我们没调用它）
         with _get_lock(kb_id):
             kb = kb_repo.get(kb_id)
             if kb is not None:
-                kb.index_status = "ready"
+                kb.index_status = "searchable"
                 kb.index_progress = 1.0
                 kb.index_current_doc = ""
                 kb_repo.update(kb)

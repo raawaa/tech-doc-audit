@@ -52,7 +52,7 @@ def test_full_workflow():
         md_doc = doc_svc.import_document(kb.id, "技术标准.md", content)
         assert md_doc.id is not None
         assert md_doc.file_type == "md"
-        assert md_doc.index_status == "ready"
+        assert md_doc.embedding_status == "embedded"
         print(f"✓ MD 文档导入知识库成功: {md_doc.id}")
 
     # 4. 上传待审核文档

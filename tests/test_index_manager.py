@@ -253,13 +253,15 @@ def test_async_md_index_builds_faiss():
     ).encode()
     doc = doc_svc.import_document(kb.id, "技术规范.md", content, async_index=True)
 
-    # 等待后台索引线程完成（pending_index → indexing → ready）
+    # 等待后台索引线程完成（pending_index → indexing → embedded）
     for _ in range(100):
-        if doc.index_status not in ("pending_index", "indexing"):
+        if doc.embedding_status not in ("pending_index", "indexing"):
             break
         time.sleep(0.1)
 
-    assert doc.index_status == "ready", f"expected ready, got {doc.index_status}"
+    assert doc.embedding_status == "embedded", (
+        f"expected embedded, got {doc.embedding_status}"
+    )
     assert get_kb_index_built(kb.id), "FAISS 索引应已建立"
 
     kb = kb_repo.get(kb.id)
@@ -409,13 +411,13 @@ def test_rebuild_kb_index_mixed_vectors():
         kb.id, "doc_a.md",
         "# 设计说明\n\n## 第一章 总则\n\n建筑工程设计文件编制深度规定内容与标准要求。\n\n## 第二章 要求\n\n各项设计应符合国家标准。".encode(),
     )
-    assert doc_a.index_status == "ready"
+    assert doc_a.embedding_status == "embedded"
 
     # doc_B：模拟 bulk_import 场景（只保存文件，不建索引，无向量缓存）
     content_b = "# 施工规范\n\n## 第一章 总则\n\n建筑施工组织设计规范标准要求与实施指南内容。\n\n## 第二章 验收\n\n施工质量应符合设计文件要求。".encode()
     doc_b = doc_repo.save_doc(kb.id, "doc_b.md", content_b, "md")
     doc_b.content_hash = __import__('hashlib').sha256(content_b).hexdigest()
-    doc_b.index_status = "none"
+    doc_b.embedding_status = "none"
     doc_repo._save_doc_meta(doc_b)
     # 追加到 KB document_ids
     kb = kb_repo.get(kb.id)

@@ -95,7 +95,7 @@ def doc_list(kb_id: str = typer.Option(..., "--kb-id", help="知识库 ID")):
     typer.echo(f"{'ID':<30} {'名称':<25} {'类型':<6} {'索引状态':<10}")
     typer.echo("-" * 80)
     for d in docs:
-        typer.echo(f"{d.id:<30} {d.name:<25} {d.file_type:<6} {d.index_status:<10}")
+        typer.echo(f"{d.id:<30} {d.name:<25} {d.file_type:<6} {d.embedding_status:<10}")
 
 
 @doc_app.command("delete")
@@ -159,7 +159,7 @@ def index_status(kb_id: str = typer.Option(..., "--kb-id", help="知识库 ID"))
     docs = doc_repo.list_docs(kb_id)
     typer.echo(f"文档数: {len(docs)}")
     for d in docs:
-        typer.echo(f"  - {d.name}: {d.index_status}")
+        typer.echo(f"  - {d.name}: 向量化 {d.embedding_status}")
 
 
 # ===== 待审核文档管理 =====

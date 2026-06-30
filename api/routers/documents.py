@@ -27,7 +27,7 @@ async def upload_document(
             "name": doc.name,
             "file_type": doc.file_type,
             "page_count": doc.page_count,
-            "index_status": doc.index_status,
+            "embedding_status": doc.embedding_status,
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -63,7 +63,7 @@ async def batch_upload_documents(
                     "document_id": d.id,
                     "name": d.name,
                     "file_type": d.file_type,
-                    "index_status": d.index_status,
+                    "embedding_status": d.embedding_status,
                 }
                 for d in docs
             ],

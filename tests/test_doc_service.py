@@ -41,7 +41,7 @@ def test_import_document_async():
     doc = doc_svc.import_document(kb.id, "test.pdf", content, async_index=True)
 
     # async 导入返回时可能仍在 pending_index，也可能已被后台线程标记为 indexing
-    assert doc.index_status in ("pending_index", "indexing")
+    assert doc.embedding_status in ("pending_index", "indexing")
 
     # 等待后台线程完成（fake PDF 空文本 → 快速返回）
     import storage.doc_repo as _dr
@@ -51,19 +51,21 @@ def test_import_document_async():
         except Exception:
             time.sleep(0.1)
             continue
-        if doc and doc.index_status in ("ready", "failed"):
+        if doc and doc.embedding_status in ("embedded", "failed"):
             break
         time.sleep(0.1)
 
-    assert doc.index_status in ("ready", "failed"), f"expected ready/failed, got {doc.index_status}"
+    assert doc.embedding_status in ("embedded", "failed"), (
+        f"expected embedded/failed, got {doc.embedding_status}"
+    )
 
     # 验证 document_ids 包含该文档
     kb = kb_repo.get(kb.id)
     assert kb is not None
     assert doc.id in kb.document_ids
 
-    # 验证 KB 状态恢复 ready
-    assert kb.index_status == "ready"
+    # 验证 KB 状态恢复 searchable
+    assert kb.index_status == "searchable"
 
 
 def test_import_document_async_multiple():
@@ -78,9 +80,9 @@ def test_import_document_async_multiple():
         doc = doc_svc.import_document(kb.id, f"test_{i}.pdf", content, async_index=True)
         docs.append(doc)
 
-    # 等待所有后台线程完成（状态变为 ready 或 failed）
+    # 等待所有后台线程完成（状态变为 embedded 或 failed）
     for _ in range(100):
-        not_done = [d for d in docs if d.index_status not in ("ready", "failed")]
+        not_done = [d for d in docs if d.embedding_status not in ("embedded", "failed")]
         if not not_done:
             break
         time.sleep(0.1)
@@ -91,7 +93,7 @@ def test_import_document_async_multiple():
     for doc in docs:
         assert doc.id in kb.document_ids, f"doc {doc.id} not in document_ids"
 
-    assert kb.index_status == "ready"
+    assert kb.index_status == "searchable"
 
 
 def test_batch_import_documents_async():
@@ -118,7 +120,10 @@ def test_batch_import_documents_async():
         except Exception:
             time.sleep(0.1)
             continue
-        if fresh_docs and all(d and d.index_status not in ("pending_index", "building", "indexing") for d in fresh_docs):
+        if fresh_docs and all(
+            d and d.embedding_status not in ("pending_index", "indexing")
+            for d in fresh_docs
+        ):
             break
         time.sleep(0.5)
 
@@ -128,14 +133,17 @@ def test_batch_import_documents_async():
     for doc in docs:
         assert doc.id in kb.document_ids, f"doc {doc.id} not in document_ids"
 
-    assert kb.index_status == "ready"
+    assert kb.index_status == "searchable"
 
 
 # ── Markdown 文档导入 ────────────────────────────────────────────────────────
 
 
 def test_import_markdown_document():
-    """测试导入 .md 文件（同步索引，含 ## 标题触发 MarkdownNodeParser）。"""
+    """测试导入 .md 文件（同步索引，含 ## 标题触发 MarkdownNodeParser）。
+
+    同步路径：embedding_status → embedded（不再用已废弃的 ready）。
+    """
     kb = kb_svc.create_kb(name="测试MD导入", category="national")
 
     content = "# 设计说明\n\n## 第一章 总则\n\n这是总则内容。\n\n## 第二章 要求\n\n这是具体要求内容。".encode()
@@ -144,7 +152,7 @@ def test_import_markdown_document():
     assert doc.name == "设计说明.md"
     assert doc.file_type == "md"
     assert doc.kb_id == kb.id
-    assert doc.index_status == "ready"
+    assert doc.embedding_status == "embedded"
 
 
 def test_import_markdown_document_async():
@@ -156,21 +164,23 @@ def test_import_markdown_document_async():
     content = "# 施工规范\n\n## 第一章 总则\n\n施工规范测试内容。\n\n## 第二章 要求\n\n具体要求内容。".encode()
     doc = doc_svc.import_document(kb.id, "施工规范.md", content, async_index=True)
 
-    assert doc.index_status in ("pending_index", "indexing")
+    assert doc.embedding_status in ("pending_index", "indexing")
 
     # 等待后台线程完成（MD 提取快速返回）
     for _ in range(50):
-        if doc.index_status not in ("pending_index", "indexing"):
+        if doc.embedding_status not in ("pending_index", "indexing"):
             break
         time.sleep(0.1)
 
-    assert doc.index_status in ("ready", "failed"), f"expected ready/failed, got {doc.index_status}"
+    assert doc.embedding_status in ("embedded", "failed"), (
+        f"expected embedded/failed, got {doc.embedding_status}"
+    )
 
-    # 验证 KB 状态恢复 ready
+    # 验证 KB 状态恢复 searchable
     kb = kb_repo.get(kb.id)
     assert kb is not None
     assert doc.id in kb.document_ids
-    assert kb.index_status == "ready"
+    assert kb.index_status == "searchable"
 
 
 def test_batch_import_markdown_documents():
@@ -193,8 +203,8 @@ def test_batch_import_markdown_documents():
     assert len(kb.document_ids) == 2
     for doc in docs:
         assert doc.id in kb.document_ids, f"doc {doc.id} not in document_ids"
-    assert doc.index_status == "ready"
-    assert kb.index_status == "ready"
+    assert doc.embedding_status == "embedded"
+    assert kb.index_status == "searchable"
 
 
 # ── 删除 / 异常 ──────────────────────────────────────────────────────────────

@@ -52,7 +52,7 @@ def bulk_import(kb_id: str, pdf_dir: str):
             doc = doc_repo.save_doc(kb_id, fpath.name, content, "pdf")
             doc.content_hash = hashlib.sha256(content).hexdigest()
             # 标记为未建索引状态
-            doc.index_status = "none"
+            doc.embedding_status = "none"
             doc_repo._save_doc_meta(doc)
             # 更新 KB document_ids
             if doc.id not in kb.document_ids:
