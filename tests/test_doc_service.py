@@ -93,6 +93,13 @@ def test_import_document_async_multiple():
     for doc in docs:
         assert doc.id in kb.document_ids, f"doc {doc.id} not in document_ids"
 
+    # 异步路径在每篇 doc 索引完成时都会把 KB 写 searchable，但并发调度下
+    # 最后一个线程可能把自己的状态写完后整体可见——轮询直到 searchable
+    for _ in range(100):
+        kb = kb_repo.get(kb.id)
+        if kb.index_status == "searchable":
+            break
+        time.sleep(0.1)
     assert kb.index_status == "searchable"
 
 

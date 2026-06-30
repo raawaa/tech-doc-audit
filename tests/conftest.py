@@ -174,6 +174,28 @@ def seed_searchable_kb():
     yield _seed
 
 
+@pytest.fixture(autouse=True)
+def _wait_for_async_rebuild_threads():
+    """测试结束后等 _ensure_kb_index 启动的后台 rebuild 线程全部完成。
+
+    原因：_ensure_kb_index 慢路异步分支以 daemon 线程触发 rebuild；
+    pytest 测试 body 结束后 cleanup 立刻跑 rmtree，若线程还在写
+    kb.json 就会撞见 JSONDecodeError / 文件被删导致异常。
+    """
+    yield
+    # 把 core.index_manager 中落盘过的后台线程 join 完
+    import threading
+    main_thread = threading.current_thread()
+    for t in threading.enumerate():
+        if t is main_thread or not t.is_alive() or not t.daemon:
+            continue
+        # daemon 线程通常是 QA 异步降级触发的 rebuild
+        try:
+            t.join(timeout=5)
+        except Exception:
+            pass
+
+
 # 在 conftest 模块级导入，避免顶级 import 顺序问题
 from models.knowledge_base import KnowledgeBase
 import storage.kb_repo as kb_repo

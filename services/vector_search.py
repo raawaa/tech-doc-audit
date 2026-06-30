@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import storage.kb_repo as kb_repo
@@ -143,27 +144,84 @@ def _text_search(paths: list[str], keywords: list[str], max_results: int = 5) ->
 # ── 向量搜索 ─────────────────────────────────────────────────────────────
 
 
-def _ensure_kb_index(kb_id: str):
-    """确保 KB 索引存在，必要时重建（线程安全）。"""
+def _all_docs_have_vectors(kb_id: str) -> bool:
+    """检查该 KB 关联的所有文档是否都有 .npy 向量缓存（fast path 判定）。"""
+    import storage.kb_repo as _kb_repo
+    from core.index_manager import _vectors_dir as _kb_vectors_dir
+
+    kb = _kb_repo.get(kb_id)
+    if kb is None or not kb.document_ids:
+        return False
+    vectors_dir = _kb_vectors_dir(kb_id)
+    return all((vectors_dir / f"{did}.npy").exists() for did in kb.document_ids)
+
+
+def _ensure_kb_index(kb_id: str, sync_rebuild_for_audit: bool = False) -> bool:
+    """确保 KB 索引可检索（按 ADR-0002 §3 分层）。
+
+    快路（fast path）：所有文档 .npy 缓存齐全 → 同步重建（秒级、纯 CPU）
+    慢路（slow path）：有文档缺向量（需 GPU 重算） → 按调用方意图：
+      - ``sync_rebuild_for_audit=True``（审核路径）：同步阻塞重建
+      - ``sync_rebuild_for_audit=False``（问答默认）：后台异步重建，
+        当前调用立即返回 False，让调用方走文本降级 / 轮询
+
+    Returns:
+        True if ``kb.index_status`` 可被当前调用视作 'searchable'；
+        False 表示仍在 'building' 或重建失败，调用方应降级或等待。
+
+    重建写回字段由 ``rebuild_kb_index``（被 _rebuild_store 指向）
+    按内置契约完成（ADR-0002 §决策 2），本函数不重复写。
+    """
     if get_kb_index_built(kb_id):
-        return
-    # 在 per-KB 锁内二次检查，避免多个线程同时触发冗余重建
+        return True
+
+    # 在 per-KB 锁内二次检查 + 触发重建
     with _get_index_lock(kb_id):
-        if not get_kb_index_built(kb_id):
-            _rebuild_store(kb_id)
+        if get_kb_index_built(kb_id):
+            return True  # 双检：另一线程可能刚完成
+
+        from core.index_manager import rebuild_kb_index as _rebuild
+
+        if _all_docs_have_vectors(kb_id):
+            # 快路：秒级同步重建
+            _rebuild(kb_id)
+            return get_kb_index_built(kb_id)
+
+        # 慢路：缺向量。按调用方意图决定同步 / 异步
+        if sync_rebuild_for_audit:
+            _rebuild(kb_id)  # 同步：宁可请求挂几分钟也不让审核缺向量
+            return get_kb_index_built(kb_id)
+
+        # 异步：QA 默认。当前请求立即返回 False，让 QA 走文本降级
+        thread = threading.Thread(
+            target=_rebuild,
+            args=(kb_id,),
+            daemon=True,
+        )
+        thread.start()
+        return False
 
 
-def vec_search(kb_ids: list[str], query: str, top_k: int = 5, rebuild_if_missing: bool = True) -> list[dict]:
+def vec_search(
+    kb_ids: list[str],
+    query: str,
+    top_k: int = 5,
+    rebuild_if_missing: bool = True,
+    sync_rebuild_for_audit: bool = False,
+) -> list[dict]:
     """向量搜索主干 — 内部调用 LlamaIndex VectorStoreIndex。
 
-    rebuild_if_missing: 索引文件不存在时是否自动重建。QA 请求应设为 False
-                        以避免同步重建阻塞 HTTP 线程。
+    Args:
+        rebuild_if_missing: 索引不在 'searchable' 状态时是否自动重建。
+                            False 时直接返回空（用于 QA 走文本降级）。
+        sync_rebuild_for_audit: True 时慢路也阻塞同步（审核质量优先）；
+                                 False 时慢路异步降级（QA 默认，避免阻塞）。
     """
     if not query or not kb_ids:
         return []
     for kb_id in kb_ids:
         if rebuild_if_missing:
-            _ensure_kb_index(kb_id)
+            _ensure_kb_index(kb_id, sync_rebuild_for_audit=sync_rebuild_for_audit)
     return _vec_search(kb_ids, query, top_k)
 
 
