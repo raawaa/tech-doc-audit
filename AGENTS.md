@@ -38,3 +38,17 @@ cd frontend && npm run dev                  # 前端开发
 
 - GTX 1070 Ti 8GB → bge-m3(2.2G) + reranker(2.2G) 紧张，reranker 已改为按需模式
 - 知识库为标准规范，与招标文档领域不完全匹配，审核需依赖 LLM 自洽性检查
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as GitHub issues in `raawaa/tech-doc-audit` (use the `gh` CLI). External PRs are **not** a triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical labels, each named after its role (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout — one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
