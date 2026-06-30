@@ -3,7 +3,8 @@
 让 LLM 返回类型安全的数据，替代手写 JSON + regex 解析。
 """
 
-from typing import Literal, Optional
+from dataclasses import dataclass
+from typing import Literal, Optional, Union
 from pydantic import BaseModel, Field
 
 
@@ -215,3 +216,22 @@ class AgentAction(BaseModel):
             "各严重程度分布、关键发现概述"
         ),
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 统一 agent loop 的 LLMStep adapter 类型（ADR-0001）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Final:
+    """LLMStep 返回：模型自行结束，给出最终回答。"""
+    answer: str
+
+
+@dataclass
+class ToolCalls:
+    """LLMStep 返回：模型请求执行工具调用。"""
+    calls: list[dict]
+
+
+StepResult = Union[Final, ToolCalls]
