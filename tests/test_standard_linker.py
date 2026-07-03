@@ -78,11 +78,19 @@ def test_vector_fallback_path(monkeypatch):
     assert sr.page_number == 6
 
 
-def test_verification_failure_no_false_positive(monkeypatch):
-    """防误报：向量命中但 content 不含编号 → 不回填 doc_id（编号回填仍发生，独立于 best_hit）。"""
+def test_verification_failure_text_fallback_backfills(monkeypatch):
+    """#23 行为变更：文本命中但 vec chunk content 不含编号时，回填 doc_id。
+
+    旧行为是"vec 不验证通过就完全不回填"，但 #23 修复后，文本搜索已确认
+    含编号的文档存在 → 直接从 text_hits 回填。`chunk_text` 设为标准编号
+    自身（`page_number` 为 None 因为 text 搜索不带页码）。
+    """
     issue = _issue(1)
     monkeypatch.setattr(standard_linker, "_doc_repo", _fake_repo([]))
-    monkeypatch.setattr(standard_linker, "search_doc_by_text", lambda n, k: [{"doc_id": "d1"}])
+    monkeypatch.setattr(
+        standard_linker, "search_doc_by_text",
+        lambda n, k: [{"doc_id": "d1", "page_number": None, "content": "..."}],
+    )
     monkeypatch.setattr(
         standard_linker, "vec_search",
         lambda kb_ids, q, top_k=5: [{"doc_id": "d1", "page_number": 1, "content": "完全无关的内容"}],
@@ -91,9 +99,10 @@ def test_verification_failure_no_false_positive(monkeypatch):
         [issue], ["kb1"], extractor=lambda pending: dict([_ext(1, ["GB 50016"])])
     )
     sr = issue.standard_reference
-    assert sr.doc_id is None               # 未误关联
-    assert sr.page_number is None
-    assert sr.standard_name == "GB 50016"  # 编号回填独立于 best_hit
+    assert sr.doc_id == "d1"               # 文本回填生效
+    assert sr.page_number is None          # 文本搜索不带页码
+    assert sr.chunk_text == "GB 50016"     # chunk_text = 编号自身
+    assert sr.standard_name == "GB 50016"  # 编号回填
 
 
 def test_hallucinated_doc_id_cleared_and_relinked(monkeypatch):
@@ -241,3 +250,181 @@ def test_empty_inputs_no_op():
 def pytest_fail(msg):
     """在 lambda 中用作"不应被调用"哨兵。"""
     raise AssertionError(msg)
+
+# ── 文本搜索回填（#23 修复：多 KB 召回稀释下仍能关联） ─────────────────────
+
+def test_text_fallback_when_vec_verification_fails(monkeypatch):
+    """#23 主修复：多 KB 召回稀释场景下，vec 检索的 chunk content 不含标准编号
+    （被不相关 KB 的 chunk 挤出 top_k），但 text search 已确认含编号的文档存在
+    → 必须从 text_hits 回填 doc_id。旧代码因强制 vec 二次验证，doc_id 留 None。
+    """
+    issue = _issue(1)
+    monkeypatch.setattr(standard_linker, "_doc_repo", _fake_repo(["d1"]))
+    monkeypatch.setattr(
+        standard_linker, "search_doc_by_text",
+        lambda n, k: [{"doc_id": "d1", "page_number": None, "content": "本标准 规定..."}],
+    )
+    # vec 搜索：chunk content 不含编号（被稀释出去）
+    monkeypatch.setattr(
+        standard_linker, "vec_search",
+        lambda kb_ids, q, top_k=5: [{"doc_id": "other_doc", "page_number": 0,
+                                     "content": "完全不相关的内容 不含编号"}],
+    )
+    standard_linker.link_standards(
+        [issue], ["kb1"], extractor=lambda pending: dict([_ext(1, ["GB/T 20145-2006"])])
+    )
+    sr = issue.standard_reference
+    assert sr.doc_id == "d1"               # 文本命中即回填
+    assert sr.page_number is None          # 文本搜索不带页码
+    assert sr.chunk_text == "GB/T 20145-2006"  # chunk_text = 标准编号自身
+
+
+def test_text_fallback_disambiguation_by_filename(monkeypatch):
+    """#23: text_hits 命中多文档时，优先选 name 含标准编号的文档。"""
+    issue = _issue(1)
+    monkeypatch.setattr(
+        standard_linker, "_doc_repo",
+        _fake_repo(["list_doc", "std_doc"],
+                    names={"list_doc": "适用标准名录.pdf",
+                           "std_doc": "GB 50034-2013 建筑照明设计标准.pdf"}),
+    )
+    monkeypatch.setattr(
+        standard_linker, "search_doc_by_text",
+        lambda n, k: [{"doc_id": "list_doc", "page_number": None,
+                       "content": "本项目适用以下标准：GB 50034-2013 ..."},
+                      {"doc_id": "std_doc", "page_number": None,
+                       "content": "GB 50034-2013 建筑照明设计标准..."}],
+    )
+    monkeypatch.setattr(standard_linker, "vec_search", lambda kb_ids, q, top_k=5: [])
+    standard_linker.link_standards(
+        [issue], ["kb1"], extractor=lambda pending: dict([_ext(1, ["GB 50034-2013"])])
+    )
+    sr = issue.standard_reference
+    assert sr.doc_id == "std_doc"          # 优先选 name 含编号的文档
+    assert sr.standard_name == "GB 50034-2013 建筑照明设计标准.pdf"  # name 回填
+
+
+def test_text_fallback_disambiguation_by_standard_name(monkeypatch):
+    """#23: text_hits 命中多文档但都无编号在 name → 退到 name 含标准中文名。"""
+    issue = _issue(1)
+    monkeypatch.setattr(
+        standard_linker, "_doc_repo",
+        _fake_repo(["other_doc", "std_doc"],
+                    names={"other_doc": "采购清单.pdf",
+                           "std_doc": "建筑照明设计标准.pdf"}),
+    )
+    monkeypatch.setattr(
+        standard_linker, "search_doc_by_text",
+        lambda n, k: [{"doc_id": "other_doc", "page_number": None, "content": "..."},
+                      {"doc_id": "std_doc", "page_number": None, "content": "..."}],
+    )
+    monkeypatch.setattr(standard_linker, "vec_search", lambda kb_ids, q, top_k=5: [])
+    standard_linker.link_standards(
+        [issue], ["kb1"],
+        extractor=lambda pending: dict([_ext(1, ["GB 50034-2013"], ["建筑照明设计标准"])]),
+    )
+    sr = issue.standard_reference
+    assert sr.doc_id == "std_doc"          # 名字含标准中文名的赢
+
+
+def test_text_fallback_disambiguation_number_beats_chinese_name(monkeypatch):
+    """#23: 优先级交叉验证 — 文档 A 的 name 含标准编号，文档 B 的 name 只含中文名。
+    编号-name 规则必须赢，即使 B 在 text_hits 中排在前面。
+    """
+    issue = _issue(1)
+    monkeypatch.setattr(
+        standard_linker, "_doc_repo",
+        _fake_repo(["chinese_named", "number_named"],
+                    names={"chinese_named": "建筑照明设计标准.pdf",
+                           "number_named": "GB 50034-2013 适用清单.pdf"}),
+    )
+    # 注意：B (chinese_named) 排在前面，诱骗实现误选 B
+    monkeypatch.setattr(
+        standard_linker, "search_doc_by_text",
+        lambda n, k: [{"doc_id": "chinese_named", "page_number": None, "content": "..."},
+                      {"doc_id": "number_named", "page_number": None, "content": "..."}],
+    )
+    monkeypatch.setattr(standard_linker, "vec_search", lambda kb_ids, q, top_k=5: [])
+    standard_linker.link_standards(
+        [issue], ["kb1"],
+        extractor=lambda pending: dict([_ext(1, ["GB 50034-2013"], ["建筑照明设计标准"])]),
+    )
+    sr = issue.standard_reference
+    assert sr.doc_id == "number_named"     # 编号-name 规则赢，即使它排在第二位
+    assert sr.standard_name == "GB 50034-2013 适用清单.pdf"
+
+
+def test_text_fallback_first_when_no_disambiguator(monkeypatch):
+    """#23: 都没编号/名字线索 → 取 text_hits 第一个。"""
+    issue = _issue(1)
+    monkeypatch.setattr(
+        standard_linker, "_doc_repo",
+        _fake_repo(["first_doc", "second_doc"],
+                    names={"first_doc": "A.pdf", "second_doc": "B.pdf"}),
+    )
+    monkeypatch.setattr(
+        standard_linker, "search_doc_by_text",
+        lambda n, k: [{"doc_id": "first_doc", "page_number": None, "content": "..."},
+                      {"doc_id": "second_doc", "page_number": None, "content": "..."}],
+    )
+    monkeypatch.setattr(standard_linker, "vec_search", lambda kb_ids, q, top_k=5: [])
+    standard_linker.link_standards(
+        [issue], ["kb1"], extractor=lambda pending: dict([_ext(1, ["GB 50016"])])
+    )
+    sr = issue.standard_reference
+    assert sr.doc_id == "first_doc"        # 第一个
+
+
+def test_text_fallback_survives_vec_error(monkeypatch):
+    """#23 best-effort: 文本回填路径不能因 vec 抛错而失败。"""
+    issue = _issue(1)
+    monkeypatch.setattr(standard_linker, "_doc_repo", _fake_repo(["d1"]))
+    monkeypatch.setattr(
+        standard_linker, "search_doc_by_text",
+        lambda n, k: [{"doc_id": "d1", "page_number": None, "content": "..."}],
+    )
+    monkeypatch.setattr(
+        standard_linker, "vec_search",
+        lambda kb_ids, q, top_k=5: (_ for _ in ()).throw(RuntimeError("vec down")),
+    )
+    standard_linker.link_standards(  # 不应抛
+        [issue], ["kb1"], extractor=lambda pending: dict([_ext(1, ["GB 50016"])])
+    )
+    # vec 错误后文本回填仍应成功
+    sr = issue.standard_reference
+    assert sr.doc_id == "d1"               # 文本回填仍生效
+    assert sr.standard_name == "GB 50016"
+
+
+def test_text_fallback_no_vec_at_all(monkeypatch):
+    """#23: text 命中、vec 彻底返回空 → 仍然从 text 回填 doc_id。"""
+    issue = _issue(1)
+    monkeypatch.setattr(standard_linker, "_doc_repo", _fake_repo(["d1"]))
+    monkeypatch.setattr(
+        standard_linker, "search_doc_by_text",
+        lambda n, k: [{"doc_id": "d1", "page_number": None, "content": "..."}],
+    )
+    monkeypatch.setattr(standard_linker, "vec_search", lambda kb_ids, q, top_k=5: [])
+    standard_linker.link_standards(
+        [issue], ["kb1"], extractor=lambda pending: dict([_ext(1, ["GB 50016"])])
+    )
+    sr = issue.standard_reference
+    assert sr.doc_id == "d1"
+    assert sr.chunk_text == "GB 50016"
+
+
+def test_text_fallback_chunk_text_uses_first_standard_number(monkeypatch):
+    """#23: chunk_text 等于 standard_numbers[0]（编号自身）。"""
+    issue = _issue(1)
+    monkeypatch.setattr(standard_linker, "_doc_repo", _fake_repo(["d1"]))
+    monkeypatch.setattr(
+        standard_linker, "search_doc_by_text",
+        lambda n, k: [{"doc_id": "d1", "page_number": None, "content": "..."}],
+    )
+    monkeypatch.setattr(standard_linker, "vec_search", lambda kb_ids, q, top_k=5: [])
+    standard_linker.link_standards(
+        [issue], ["kb1"],
+        extractor=lambda pending: dict([_ext(1, ["GB/T 20145-2006", "GB 7000.1-2015"])]),
+    )
+    sr = issue.standard_reference
+    assert sr.chunk_text == "GB/T 20145-2006"  # 取第一个

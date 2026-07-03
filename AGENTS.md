@@ -25,6 +25,7 @@ nohup uvicorn api.main:app --port 8000 > /tmp/backend.log 2>&1 &
 | reranker 按需加载/卸载 | `core/settings.py` run_reranker() | 不再常驻显存，每次加载→推理→del+gc+empty_cache |
 | Agentic Markdown 解析 | `services/agentic_audit.py` _parse_action_fallback() | 支持 ```json 代码块 + 中文 Markdown 混合格式 |
 | 审核去重 | `services/audit_task_service.py` _deduplicate_issues() | 按 cited_excerpt 去重 |
+|标准关联多 KB 召回稀释（#23）|`services/standard_linker.py` `_pick_text_hit()` + 策略1.1|文本回填 `doc_id`；多文档按 name 优先级挑选，详见函数 docstring|
 
 ## 常用命令
 

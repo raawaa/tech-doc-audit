@@ -127,6 +127,42 @@ def extract_standards_deepseek(issues: list[AuditIssue]) -> dict[int, ExtractedS
         return {}
 
 
+def _pick_text_hit(
+    text_hits: list[dict],
+    standard_numbers: list[str],
+    standard_names: list[str],
+    doc_name_by_id: dict[str, str],
+) -> dict | None:
+    """从 text_hits 中挑最可能是标准本身的文档（#23 反稀释）。
+
+    优先级：
+    1. 文档名（KB 标题）含任一标准编号 → 标准文档本体
+    2. 文档名含任一标准中文名 → 标准文档本体
+    3. text_hits 第一个（保底）
+
+    任意步骤抛错均返回 None，由调用方跳过回填（best-effort）。
+    """
+    if not text_hits:
+        return None
+    try:
+        names = {h["doc_id"]: (doc_name_by_id.get(h["doc_id"]) or "") for h in text_hits}
+        # 1) name 含标准编号
+        for h in text_hits:
+            doc_name = names.get(h["doc_id"], "")
+            if any(sn and sn in doc_name for sn in standard_numbers):
+                return h
+        # 2) name 含标准中文名
+        for h in text_hits:
+            doc_name = names.get(h["doc_id"], "")
+            if any(nm and nm in doc_name for nm in standard_names):
+                return h
+        # 3) 第一个
+        return text_hits[0]
+    except Exception as e:
+        _logger.warning("_pick_text_hit failed: %s", e)
+        return None
+
+
 def _search_and_link_standards(
     issues: list[AuditIssue],
     kb_ids: list[str],
@@ -139,8 +175,13 @@ def _search_and_link_standards(
     1. 精确文本搜索（rga）— 标准编号
     2. 向量语义搜索 — 标准编号 + 标准名称
     3. 结果精确验证 — 命中内容的 content 必须包含标准编号
+    4. **文本回填（#23）** — 文本搜索已确认含编号的文档存在，但向量 chunk
+       在多 KB 召回稀释下不含该编号时，直接从 text_hits 关联。优先级：
+       name 含编号 → name 含标准中文名 → text_hits 第一个。
+       chunk_text 设为 standard_numbers[0]，page_number 用 text_hits 的值
+       （非 PDF 时为 None）。任何异常被吞，issue 保持原状。
 
-    结果缓存：同一标准编号只搜一次。
+    结果缓存：同一标准编号只搜一次（无论命中还是回填）。
 
     Args:
         issues: 待处理的 issue 列表（原地修改）
@@ -175,27 +216,54 @@ def _search_and_link_standards(
                 break
 
             text_hits = search_doc_by_text(std_num, kb_ids)
-            if text_hits:
-                # 文本搜索命中了文档，但缺少 page_number
-                # 用向量搜索补充 page_number 和 chunk_text
+            if not text_hits:
+                continue
+
+            # 文本搜索命中了文档；优先用向量搜索补充 page_number 和 chunk_text。
+            # 多 KB 召回稀释场景下 vec chunk 可能不含编号 → 走策略1.1 文本回填。
+            # 策略1 的 vec_search 是次要补全步骤（仅取 page/chunk），其失败应
+            # 降级为 0 结果并继续走文本回填，不影响 best-effort 主流程。
+            try:
                 query = f"{std_num} {standard_names[0]}" if standard_names else std_num
                 vec_hits = vec_search(kb_ids, query, top_k=3)
+            except Exception as e:
+                _logger.warning(
+                    "_search_and_link_standards: vec_search failed (std=%s): %s",
+                    std_num, e,
+                )
+                vec_hits = []
 
-                # 精确验证：vec hits 的 content 必须包含标准编号
-                matched_doc_ids = {h["doc_id"] for h in text_hits}
-                for vh in vec_hits:
-                    if vh["doc_id"] in matched_doc_ids:
-                        content = vh.get("content", "")
-                        if any(sn in content for sn in standard_numbers):
-                            best_hit = {
-                                "doc_id": vh["doc_id"],
-                                "page_number": vh.get("page_number"),
-                                "chunk_text": content[:500],
-                            }
-                            break
+            # 精确验证：vec hits 的 content 必须包含标准编号
+            matched_doc_ids = {h["doc_id"] for h in text_hits}
+            for vh in vec_hits:
+                if vh["doc_id"] in matched_doc_ids:
+                    content = vh.get("content", "")
+                    if any(sn in content for sn in standard_numbers):
+                        best_hit = {
+                            "doc_id": vh["doc_id"],
+                            "page_number": vh.get("page_number"),
+                            "chunk_text": content[:500],
+                        }
+                        break
 
-                _search_cache[std_num] = best_hit
-                break
+            # 策略1.1（#23）：vec 验证未命中 → 直接从 text_hits 回填
+            if best_hit is None:
+                picked = _pick_text_hit(text_hits, standard_numbers, standard_names, doc_name_by_id)
+                if picked is not None and standard_numbers:
+                    best_hit = {
+                        "doc_id": picked["doc_id"],
+                        "page_number": picked.get("page_number"),
+                        "chunk_text": standard_numbers[0],  # 编号自身，用于 PDF 高亮搜索
+                    }
+                    # 留出回填审计线索
+                    _logger.info(
+                        "_search_and_link_standards: text-fallback linked std=%s to doc %s "
+                        "(vec verification failed; multi-KB dilution likely)",
+                        std_num, picked["doc_id"],
+                    )
+
+            _search_cache[std_num] = best_hit
+            break
 
         # ── 策略2: 向量语义搜索（文本搜索无结果时） ──
         if not best_hit and (standard_numbers or standard_names):
