@@ -12,5 +12,7 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: true,
+    // e2e/ belongs to Playwright (see playwright.config.ts), not vitest
+    exclude: ['**/node_modules/**', '**/dist/**', 'e2e/**'],
   },
 })
