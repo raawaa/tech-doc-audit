@@ -238,6 +238,7 @@ export function PdfViewer() {
         <div style={{ height: 'calc(100vh - 57px)' }}>
           {pdfUrl && (
             <Document
+              className="h-full"
               file={pdfUrl}
               onLoadSuccess={handleDocumentLoadSuccess}
               loading={

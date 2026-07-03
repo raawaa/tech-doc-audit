@@ -25,3 +25,9 @@ Thumbs.db
 # PDF.js runtime assets (copied from node_modules at install/build time)
 public/cmaps/
 public/pdfjs/wasm/
+
+# Playwright
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
