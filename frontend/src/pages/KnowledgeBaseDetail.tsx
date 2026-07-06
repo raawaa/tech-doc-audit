@@ -1,11 +1,15 @@
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, Upload, FileText, RefreshCw, Trash2, Loader2 } from 'lucide-react'
+import { ArrowLeft, Upload, FileText, RefreshCw, Trash2, Loader2, RotateCw } from 'lucide-react'
 import { toast } from 'sonner'
+import type { KBDocument } from '../api/types'
 import { kbApi } from '../api/endpoints'
 import { Card, CardHeader, CardBody } from '../components/Card'
 import { Badge } from '../components/Badge'
 import { ProgressBar } from '../components/ProgressBar'
+const INDEXING_STATUSES = ['pending_index', 'indexing'] as const
+const isIndexingDoc = (d: KBDocument): boolean =>
+  (INDEXING_STATUSES as readonly string[]).includes(d.embedding_status)
 
 export function KnowledgeBaseDetail() {
   const { id } = useParams<{ id: string }>()
@@ -29,8 +33,8 @@ export function KnowledgeBaseDetail() {
     refetchInterval: (query) => {
       if (kb?.index_status === 'building') return 2000
       // KB 已 searchable 但仍有文档卡在 pending_index / indexing（部分文档还在向量化）
-      const docs = query.state.data
-      if (docs && docs.some((d: any) => d.embedding_status === 'pending_index' || d.embedding_status === 'indexing')) {
+      const list = query.state.data
+      if (list && list.some(isIndexingDoc)) {
         return 2000
       }
       return false
@@ -80,6 +84,25 @@ export function KnowledgeBaseDetail() {
   const deleteDoc = useMutation({
     mutationFn: (docId: string) => kbApi.documents.delete(id!, docId),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['kb-docs', id] }),
+  })
+
+  const reparseDoc = useMutation({
+    mutationFn: async (docId: string) => {
+      // 二次确认：明示会消耗 OCR 配额
+      const ok = window.confirm('此操作将消耗 OCR 配额（仅当缓存未命中时），确认重新解析？')
+      if (!ok) throw new Error('cancelled')
+      return kbApi.documents.reparse(docId)
+    },
+    onSuccess: () => {
+      toast.success('重新解析已启动', { description: '请观察文档索引状态变化' })
+      qc.invalidateQueries({ queryKey: ['kb-docs', id] })
+      qc.invalidateQueries({ queryKey: ['kb', id] })
+    },
+    onError: (err) => {
+      if ((err as Error).message !== 'cancelled') {
+        toast.error('重新解析失败：' + (err as Error).message)
+      }
+    },
   })
 
   if (isLoading) return <div className="flex justify-center py-20"><Loader2 className="w-6 h-6 animate-spin text-slate-400" /></div>
@@ -152,7 +175,7 @@ export function KnowledgeBaseDetail() {
                   <th className="text-left font-medium px-5 py-3 w-20">类型</th>
                   <th className="text-left font-medium px-5 py-3 w-20">页数</th>
                   <th className="text-left font-medium px-5 py-3 w-24">索引状态</th>
-                  <th className="text-right font-medium px-5 py-3 w-16">操作</th>
+                  <th className="text-right font-medium px-5 py-3 w-32">操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -168,9 +191,25 @@ export function KnowledgeBaseDetail() {
                     <td className="px-5 py-3 text-sm text-slate-500">{d.page_count ?? '-'}</td>
                     <td className="px-5 py-3"><Badge value={d.embedding_status} /></td>
                     <td className="px-5 py-3 text-right">
-                      <button className="btn-ghost btn-sm !text-red-500 hover:!text-red-600" onClick={() => deleteDoc.mutate(d.id)}>
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                      <div className="inline-flex items-center gap-1">
+                        <button
+                          className="btn-ghost btn-sm !text-blue-600 hover:!text-blue-700 disabled:!text-slate-300"
+                          title="重新解析（PRD #29 V4）：重新走 PaddleOCR + 重建索引，仅当缓存未命中才消耗 OCR 配额"
+                          onClick={() => reparseDoc.mutate(d.id)}
+                          disabled={
+                            isIndexingDoc(d)
+                            || (reparseDoc.isPending && reparseDoc.variables === d.id)
+                          }
+                        >
+                          <RotateCw className={`w-3.5 h-3.5 ${(isIndexingDoc(d) || (reparseDoc.isPending && reparseDoc.variables === d.id)) ? 'animate-spin' : ''}`} />
+                        </button>
+                        <button
+                          className="btn-ghost btn-sm !text-red-500 hover:!text-red-600"
+                          onClick={() => deleteDoc.mutate(d.id)}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}

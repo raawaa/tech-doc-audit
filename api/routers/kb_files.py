@@ -1,4 +1,4 @@
-"""KB 文档文件服务 — PDF 预览、文本降级、元数据查询。"""
+"""KB 文档文件服务 — PDF 预览、文本降级、元数据查询、重新解析。"""
 
 import os
 import mimetypes
@@ -12,6 +12,7 @@ import storage.doc_repo as doc_repo
 from storage import validate_id
 
 router = APIRouter(prefix="/api/v1/kb-documents", tags=["kb-documents"])
+
 
 
 @router.get("/{doc_id}")
@@ -107,19 +108,22 @@ def get_document_file(doc_id: str, request: Request):
 
 @router.get("/{doc_id}/page/{page_number}")
 def get_page_text(doc_id: str, page_number: int):
-    """获取文档指定页码的文本内容（非 PDF 格式的降级预览）。
+    """获取文档指定页码的文本内容（V6：从 pages/{doc_id}.json 读取）。
 
     page_number 为 0-based 页码。
     """
+    from core.pages_store import load_pages as _load_pages
     doc = doc_repo.find_doc_by_id(doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="文档不存在")
 
-    page_texts = doc.metadata.get("page_texts")
-    if not page_texts:
-        raise HTTPException(status_code=404, detail="该文档无逐页文本数据")
+    pages_doc = _load_pages(doc.kb_id, doc_id)
+    if not pages_doc:
+        raise HTTPException(status_code=404, detail="该文档无按页文本数据（请触发重新解析）")
 
-    if page_number < 0 or page_number >= len(page_texts):
+    by_page = pages_doc.get("by_page") or []
+    page_texts = [entry.get("text", "") for entry in by_page]
+    if not page_texts or page_number < 0 or page_number >= len(page_texts):
         raise HTTPException(
             status_code=404,
             detail=f"页码 {page_number} 超出范围 (0-{len(page_texts) - 1})",
@@ -130,3 +134,27 @@ def get_page_text(doc_id: str, page_number: int):
         "text": page_texts[page_number],
         "total_pages": len(page_texts),
     }
+
+
+@router.post("/{doc_id}/reparse", status_code=202)
+def reparse_kb_document(doc_id: str):
+    """对单篇 KB 文档触发重新解析（PRD #29 / V4）。
+
+    流程：``parse_document`` → ``pages_store.save_pages`` → 重建向量索引。
+    - 立即返回 202 + ``{status: pending_index, doc_id}``。
+    - 后端 KB 级锁内起后台线程；前端轮询 ``GET /kb-documents/{doc_id}`` 看 ``embedding_status``。
+    - 状态机：``pending_index`` → ``indexing`` → ``embedded``，失败回 ``failed``。
+    - V6：``GET /kb-documents/{doc_id}/page/{N}`` 已从 ``pages_store`` 读，reparse 后
+      即可拿到正确页号。
+    """
+    try:
+        from services.reparse_service import reparse_document as _reparse
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"reparse service unavailable: {e}")
+
+    try:
+        result = _reparse(doc_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return result

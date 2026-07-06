@@ -29,3 +29,14 @@
 - **知识库检索索引 (KB Search Index)** — 一个知识库内全部文档向量合并而成的检索服务可用性。它就绪表示该库此刻可被向量检索。终态称"**可检索 (searchable)**"。
   _Avoid_: "就绪""ready"——必须与文档向量化层的终态严格区分。
 - **两者关系** — 文档向量化是知识库检索索引的**构成材料**（前置条件），不是同一回事：全部文档已向量化 ≠ 该库可检索，仍需合并建索引。类比："砖都烧好了 ≠ 墙砌好了"。
+
+## KB 文档解析流水线（PRD #29）
+
+- **KB 文档解析 (Parse)** — 单份 KB 文档进入流水线被结构化解析的全过程，入口 `core.parse_document.parse_document(path) -> ParseResult`。一次解析产出 `{by_page, full_text, layout}` 三类结果，被向量索引、按页文本存储、文本搜索等下游共用——避免历史上双解析器（`extract_text` + `extract_text_by_page`）导致的不一致。
+  _Avoid_: 在新代码里再开一个"按页路径 vs 全文路径"分支——那等于回到 V1 之前的不一致状态。
+- **ParseResult** — 文档解析的结构化结果（dataclass 集合），含 `by_page: list[PageText]`、`full_text: str`、`layout: list[PageLayout]`。JSON 序列化由 `to_dict()` / `from_dict()` 处理。所有结构化中间产物（缓存 / pages_store / reparse_service）共用此格式。
+  _Avoid_: 在新代码里用 `dict` 自己构造"页面列表"——绕开 dataclass 会让 bbox 归一化 / layout polygon 等不变式难以维护。
+- **按页文本 (Pages / `pages/{doc_id}.json`)** — KB 文档**按物理页组织的文本与版面**数据，持久化在 ``data/kbs/{kb_id}/pages/{doc_id}.json``。覆盖三类消费方：① `kb_files.py:/{doc_id}/page/{N}` 按页文本 API；② `vector_search.search_doc_by_text` 精确文本搜索（mem grep，无 rg/rga 外部依赖）；③ `reparse_service` 全量重建流程的输入。schema 含 `by_page`、`full_text`、`layout`，并附 `file_hash` / `model_version` / `parsed_at` 元字段。
+  _Avoid_: 把按页文本写在 `doc.metadata["page_texts"]` ——metadata 字段会随布局/坐标增长而膨胀，且无 schema。把 layout / bbox 数据也存在 `metadata` 里——一并放在 `pages_store` 下保持关注点分离。
+- **重新解析 (Reparse)** — 对单篇 KB 文档触发的一次性重建流程，入口 `POST /api/v1/kb-documents/{doc_id}/reparse`。流程：`parse_document` → `pages_store.save_pages` → 重建向量索引 → 更新 `embedding_status`。状态机：``pending_index`` → ``indexing`` → ``embedded``，失败回 ``failed``。故意**不**自动迁移存量 KB 文档——OCR 配额由用户决定是否消耗，详见 `docs/adr/0004-kb-document-parse-pipeline.md`（取舍 1）。
+  _Avoid_: 在代码里写"导入时自动全量 reparse 现有文档"——这是 ADR-0004 明确拒绝的取舍，会无声消耗 OCR 配额。

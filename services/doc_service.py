@@ -84,30 +84,32 @@ def import_document(
 
     doc = doc_repo.save_doc(kb_id, original_name, content, file_type)
     doc.content_hash = file_hash
-
-    # 提取 PDF 页数和逐页文本
+    # 立刻落盘 content_hash —— 让下一次去重查询能看到，即使后续 parse / 索引崩溃。
+    # 否则同一字节内容两次上传会被当成两个不同文档，浪费 OCR 配额。
+    doc_repo._save_doc_meta(doc)
+    # 解析 PDF 一次：parse_document + save_pages（V6 唯一入口）
     if file_type == "pdf":
         try:
             import tempfile
-            from core.text_extraction import extract_text_by_page
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
                 tmp.write(content)
                 tmp_path = tmp.name
+            import pdfplumber
             with pdfplumber.open(tmp_path) as pdf:
                 doc.page_count = len(pdf.pages)
-            # 提取逐页文本并存储到 metadata（page_texts[0] = 第1页文本）
-            page_texts = extract_text_by_page(tmp_path)
-            doc.metadata["page_texts"] = [text for _, text in page_texts]
+            from core.parse_document import parse_document
+            from core.pages_store import save_pages
+            parse_result = parse_document(tmp_path)
+            save_pages(
+                kb_id, doc.id, parse_result.to_dict(),
+                file_hash=doc.content_hash,
+            )
             os.unlink(tmp_path)
         except Exception as e:
-            _logger.warning("failed to extract page data for %s: %s", doc.id, e)
-
+            _logger.warning("failed to parse + store pages for %s: %s", doc.id, e)
     # 更新知识库 document_ids（原子 get→modify→update，防与异步线程交错）
     _append_doc_ids_atomic(kb_id, [doc.id])
-
-    # 向量索引
     if doc.file_path:
-        _page_texts = doc.metadata.get("page_texts")
         if async_index:
             # 异步：后台线程索引，不阻塞 API 响应
             doc.embedding_status = "pending_index"
@@ -125,13 +127,12 @@ def import_document(
             doc.embedding_status = "indexing"
             doc_repo._save_doc_meta(doc)
             try:
-                _index_vec(kb_id, doc.id, doc.file_path, page_texts=_page_texts)
+                _index_vec(kb_id, doc.id, doc.file_path)
                 doc.embedding_status = "embedded"
             except Exception as e:
                 _logger.warning("vector indexing failed for doc %s: %s", doc.id, e)
                 doc.embedding_status = "failed"
             doc_repo._save_doc_meta(doc)
-
     return doc
 
 
@@ -156,8 +157,7 @@ def _index_single_doc_async(kb_id: str, doc: KBDocument):
         kb_repo.update(kb)
 
     try:
-        page_texts = doc.metadata.get("page_texts")
-        _index_vec(kb_id, doc.id, doc.file_path, page_texts=page_texts)
+        _index_vec(kb_id, doc.id, doc.file_path)
         doc.embedding_status = "embedded"
     except Exception as e:
         _logger.warning("async indexing failed for doc %s: %s", doc.id, e)
@@ -214,22 +214,25 @@ def batch_import_documents(
         doc = doc_repo.save_doc(kb_id, original_name, content, file_type)
         doc.content_hash = file_hash
         doc.embedding_status = "pending_index"
-
-        # 提取 PDF 页数（与 import_document 路径保持一致）
+        # 解析 PDF 一次：parse_document + save_pages（V6 唯一入口）
         if file_type == "pdf":
             try:
                 import tempfile
-                from core.text_extraction import extract_text_by_page
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
                     tmp.write(content)
                     tmp_path = tmp.name
                 with pdfplumber.open(tmp_path) as pdf:
                     doc.page_count = len(pdf.pages)
-                page_texts = extract_text_by_page(tmp_path)
-                doc.metadata["page_texts"] = [text for _, text in page_texts]
+                from core.parse_document import parse_document
+                from core.pages_store import save_pages
+                parse_result = parse_document(tmp_path)
+                save_pages(
+                    kb_id, doc.id, parse_result.to_dict(),
+                    file_hash=doc.content_hash,
+                )
                 os.unlink(tmp_path)
             except Exception as e:
-                _logger.warning("batch import: failed to extract page data for %s: %s", doc.id, e)
+                _logger.warning("batch import: failed to parse + store pages for %s: %s", doc.id, e)
 
         doc_repo._save_doc_meta(doc)
         docs.append(doc)
@@ -252,16 +255,13 @@ def batch_import_documents(
 
 def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
     """后台批量索引文档（由 batch_import_documents 调用）。"""
-    import storage.kb_repo as kb_repo
-
-    # 获取最新 kb 并标记 building（原子周期）
     with _get_lock(kb_id):
         kb = kb_repo.get(kb_id)
         if not kb:
             return
 
-        # 收集需要索引的文档（使用 _extract_text 提取纯文本，支持 PDF/DOCX 等二进制格式）
-        from core.text_extraction import extract_text as _extract_text
+        # 收集需要索引的文档（V6：用 parse_document 走唯一入口）
+        from core.parse_document import parse_document
         texts = []
         doc_map = {doc.id: doc for doc in docs}
         for doc in docs:
@@ -276,10 +276,10 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
 
             if doc.file_path and os.path.exists(doc.file_path):
                 try:
-                    text = _extract_text(doc.file_path)
+                    parse_result = parse_document(doc.file_path)
+                    text = parse_result.full_text
                     if text and len(text) >= 20:
-                        page_texts = doc.metadata.get("page_texts")
-                        texts.append((doc.id, text, doc.original_name, page_texts))
+                        texts.append((doc.id, text, doc.original_name, parse_result.by_page))
                     else:
                         _logger.warning("文档 %s 文本提取为空，跳过索引", doc.id)
                         doc_map[doc.id].embedding_status = "failed"
@@ -298,7 +298,6 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
         kb.index_progress = 0.0
         kb.index_current_doc = texts[0][2] if texts else "准备中…"
         kb_repo.update(kb)
-
     indexed_ids = set()
 
     def _on_progress(current: int, total: int, doc_name: str):
@@ -345,4 +344,7 @@ def delete_document(kb_id: str, doc_id: str) -> bool:
         if kb and doc_id in kb.document_ids:
             kb.document_ids.remove(doc_id)
             kb_repo.update(kb)
+    # 清理 pages/{doc_id}.json（V6：pages_store 自身的契约要求）
+    from core.pages_store import delete_pages as _delete_pages
+    _delete_pages(kb_id, doc_id)
     return doc_repo.delete_doc(kb_id, doc_id)

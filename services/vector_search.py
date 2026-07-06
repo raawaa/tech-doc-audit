@@ -3,15 +3,12 @@
 流程：
 1. 文档导入 KB 时自动分块（SentenceSplitter） + embedding（bge-m3）写入 FAISS 索引
 2. 搜索时 embedding query → FAISS ANN 召回
-3. 纯文本关键词搜索保留为最终降级
+3. 纯文本关键词搜索走 ``core.pages_store``（V5 #29）：从 pages/{doc_id}.json 内存 grep 取 page_number
 
 与旧版 numpy 暴力搜索保持相同公开 API，内部改用 LlamaIndex。
 """
 
 import os
-import re
-import shutil
-import subprocess
 import threading
 from pathlib import Path
 
@@ -25,123 +22,88 @@ from core.index_manager import (
     _get_index_lock,
 )
 from core.logger import get_logger
+from core.pages_store import load_pages
 
 _logger = get_logger(__name__)
 
-DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 
-from core.text_extraction import extract_text as _extract_text
+def _pages_search_doc(keyword: str, kb_ids: list[str], *, max_hits: int = 5) -> list[dict]:
+    """遍历所有 KB 的 pages/{doc_id}.json，对每页文本做大小写不敏感的 ``str.find``。
 
+    Args:
+        keyword: 待搜索字符串。
+        kb_ids: 限定 KB 列表；空列表 = 不过滤。
+        max_hits: 返回最多多少条命中（per doc 取首个命中页）。
 
-# ── 文本降级搜索（ripgrep-all）───────────────────────────────────────────
+    Returns:
+        ``[{doc_id, kb_id, page_number, content}]``。
+        - ``page_number`` 是 0-based，命中页；找不到页则 None。
+        - ``content`` 是该页含关键词的段落（截 500 字符）。
+    """
+    if not keyword or not kb_ids:
+        return []
 
+    target_kbs = [kb_id for kb_id in kb_ids if kb_id]
+    if not target_kbs:
+        return []
 
-def _get_kb_search_paths(kb_ids: list[str]) -> list[str]:
-    """返回 KB 文档所在目录列表（降级用）。"""
-    paths = []
-    for kb_id in kb_ids:
+    needle = keyword.lower()
+    hits: list[dict] = []
+
+    for kb_id in target_kbs:
         kb = kb_repo.get(kb_id)
         if not kb:
             continue
-        kb_dir = DATA_DIR / "kbs" / kb_id / "docs"
-        if kb_dir.exists():
-            paths.append(str(kb_dir.resolve()))
-    return paths
-
-
-def _run_rga(keyword: str, paths: list[str]) -> str:
-    """单个关键词的文本搜索。优先 rga（支持 PDF/DOCX），降级到 rg（纯文本）。"""
-    if not keyword or not paths:
-        return ""
-    # 优先 rga（ripgrep-all，支持二进制文件格式）
-    rga_bin = shutil.which("rga")
-    if rga_bin:
-        try:
-            result = subprocess.run(
-                [rga_bin, "-i", "--no-ignore", "--hidden", "-n", "-m", "15", "-C", "2", keyword, *paths],
-                capture_output=True, text=True, timeout=30,
-            )
-            if result.stdout.strip():
-                return result.stdout.strip()
-        except Exception as e:
-            _logger.warning("rga search failed for keyword %s: %s", keyword, e)
-
-    # 降级到 rg（ripgrep，搜索纯文本文件如 .md / .txt）
-    rg_bin = shutil.which("rg")
-    if rg_bin:
-        try:
-            result = subprocess.run(
-                [rg_bin, "-i", "--no-ignore", "-n", "-m", "10", "-C", "3",
-                 "-g", "*.md", "-g", "*.txt", "-g", "*.markdown",
-                 keyword, *paths],
-                capture_output=True, text=True, timeout=15,
-            )
-            return result.stdout.strip()
-        except Exception as e:
-            _logger.warning("rg search failed for keyword %s: %s", keyword, e)
-
-    from core.degradation import record as _deg_record
-    _deg_record("vector_search", "text_search_unavailable",
-                 f"No text search tool (rga/rg) available for keyword: {keyword}")
-    _logger.warning("no text search tool available for keyword: %s", keyword)
-    return ""
+        for doc_id in (kb.document_ids or []):
+            pages = load_pages(kb_id, doc_id)
+            if not pages:
+                continue
+            by_page = pages.get("by_page") or []
+            for entry in by_page:
+                page = entry.get("page")
+                text = (entry.get("text") or "").lower()
+                idx = text.find(needle)
+                if idx == -1:
+                    continue
+                # 取上下文窗口（取原始字符串中含命中处左右 200 字符）
+                raw_text = entry.get("text") or ""
+                lo = max(0, idx - 80)
+                hi = min(len(raw_text), idx + len(keyword) + 200)
+                snippet = raw_text[lo:hi]
+                hits.append({
+                    "doc_id": doc_id,
+                    "kb_id": kb_id,
+                    "page_number": page,  # 0-based
+                    "content": snippet.strip()[:500],
+                })
+                break  # 每个 doc 仅取首个命中页
+            if len(hits) >= max_hits:
+                return hits
+    return hits
 
 
 def _text_search_fallback(kb_ids: list[str], keywords: list[str]) -> str:
-    """向量搜索无结果时的纯文本降级。"""
-    paths = _get_kb_search_paths(kb_ids)
-    if not paths:
-        return ""
-
-    seen = set()
-    hits = []
-    for kw in keywords:
-        snippet = _run_rga(kw, paths)
-        if snippet and snippet not in seen:
-            seen.add(snippet)
-            hits.append(snippet)
-        if len(hits) >= 10:
+    """向量搜索无结果时的纯文本降级（V5：pages/{doc_id}.json grep，不再依赖 rga）。"""
+    hits: list[str] = []
+    seen: set[str] = set()
+    for kw in keywords or []:
+        for entry in _pages_search_doc(kw, kb_ids):
+            chunk = (
+                f"【{entry['kb_id']} / doc={entry['doc_id']} / page={entry['page_number']}】\n"
+                f"{entry['content']}"
+            )
+            if chunk in seen:
+                continue
+            seen.add(chunk)
+            hits.append(chunk)
+            if len(hits) >= 5:
+                break
+        if len(hits) >= 5:
             break
-
     if not hits:
-        # 最终退路：直接从 KB 文档中读取前几个文件的内容片段
-        from core.degradation import record as _deg_record
-        _deg_record("vector_search", "text_search_empty",
-                     "No text search hits, reading raw file snippets as last resort")
-        for root, _, files in os.walk(paths[0]):
-            for f in files[:5]:
-                fpath = os.path.join(root, f)
-                try:
-                    snippet = Path(fpath).read_text(encoding="utf-8", errors="ignore")[:500]
-                    if snippet.strip():
-                        hits.append(f"文件: {f}\n{snippet}")
-                except Exception:
-                    pass
-            break
-
-    content = "\n\n---\n\n".join(hits[:5])
-    if content:
-        return f"【知识库参考依据（关键词搜索）】\n{content}"
-    return ""
-
-
-def _text_search(paths: list[str], keywords: list[str], max_results: int = 5) -> str:
-    """ripgrep-all 纯文本搜索（与旧版 API 兼容）。"""
-    if not keywords:
         return ""
-    seen = set()
-    hits = []
-    for kw in keywords:
-        snippet = _run_rga(kw, paths)
-        if snippet and snippet not in seen:
-            seen.add(snippet)
-            hits.append(snippet)
-        if len(hits) >= max_results:
-            break
-    return "\n\n---\n\n".join(hits[:max_results])
-
-
-# ── 向量搜索 ─────────────────────────────────────────────────────────────
+    body = "\n\n---\n\n".join(hits)
+    return f"【知识库参考依据（关键词搜索）】\n{body}"
 
 
 def _all_docs_have_vectors(kb_id: str) -> bool:
@@ -229,17 +191,22 @@ def vec_search(
 
 
 def index_document(kb_id: str, doc_id: str, file_path: str, source_name: str = "",
-                   page_texts: list[str] | None = None):
-    """对单篇 KB 文档分块 + embedding 并写入 FAISS 索引。
+                   by_page=None):
+    """对单篇 KB 文档分块 + embedding 并写入 FAISS 索引（V6 走 parse_document）。
 
     source_name: 来源标签，为空时自动从文件名提取。
-    page_texts: 逐页文本列表（page_texts[0] = 第1页），用于按页创建 chunk 以保留页码信息。
+    by_page: ``ParseResult.by_page`` 同构（list[PageText]）。若 None，则
+        ``parse_document`` 内部解析以获得 by_page（pages 文件入口路径）。
     """
-    text = _extract_text(file_path)
+    from core.parse_document import parse_document as _parse_document
+
+    parse_result = _parse_document(file_path)
+    text = parse_result.full_text
     if not text or len(text) < 20:
         return
-    source_name = source_name or Path(file_path).stem
-    _index_to_store(kb_id, doc_id, text, source_name, page_texts=page_texts)
+    src = source_name or Path(file_path).stem
+    # V6: by_page 来自 parse_result（pages 文件已落地，kb_files / reparse 共用一份）
+    _index_to_store(kb_id, doc_id, text, src, by_page=by_page if by_page is not None else parse_result.by_page)
 
 
 def remove_document_index(kb_id: str, doc_id: str):
@@ -317,112 +284,13 @@ def get_kb_content(kb_ids: list[str], query: str) -> str:
 
 
 def search_doc_by_text(keyword: str, kb_ids: list[str]) -> list[dict]:
-    """用 rga 精确搜索 KB 文档原文，返回结构化结果。
+    """精确文本搜索 KB 文档原文（V5 #29）。
 
-    适用于搜索标准编号（如 GB/T 20145-2006）等在文档正文中
-    精确出现的字符串。不依赖文件名，搜的是文档内容。
+    适用于搜索标准编号（如 ``GB/T 20145-2006``）等在文档正文中精确出现的字符串。
+    走 ``pages/{doc_id}.json`` 内存 grep：大小写不敏感，命中页即返回 page_number（0-based）。
 
     Returns:
-        [{doc_id, page_number, content}]
-        page_number 为 None 表示无法确定页码（非 PDF 或解析失败）。
+        ``[{doc_id, kb_id, page_number, content}]``。``page_number`` 为 None 表示该 KB
+        没有 pages 文件（旧数据，V6 之前不会发生回填；调用方应按"无法跳转"处理）。
     """
-    if not keyword or not kb_ids:
-        return []
-
-    paths = _get_kb_search_paths(kb_ids)
-    if not paths:
-        return []
-
-    raw = _run_rga(keyword, paths)
-    if not raw:
-        return []
-
-    # 构建 file_path -> (kb_id, doc_id) 映射
-    import storage.doc_repo as doc_repo
-    file_to_doc: dict[str, tuple[str, str]] = {}  # resolved_path -> (kb_id, doc_id)
-    for kb_id in kb_ids:
-        for doc in doc_repo.list_docs(kb_id):
-            fp = str(Path(doc.file_path).resolve())
-            file_to_doc[fp] = (kb_id, doc.id)
-            # 同时注册同目录下的 .txt 提取文件（当 rga 不可用时，rg 只搜到 .txt 也能匹配）
-            txt_fp = str(Path(fp).parent / f'{doc.id}_extracted.txt')
-            file_to_doc[txt_fp] = (kb_id, doc.id)
-
-    # 解析 rga 输出，提取文件路径和匹配行
-    # rga 输出格式 (with -n): /path/to/file:123:text (match), /path/to/file-123-text (context)
-    # 注意：文件路径可能包含 - 字符，不能直接用简单正则从上下文行解析
-    # 改为：用已知文件路径列表来匹配行首
-    # 优先使用匹配行（:分隔符），无匹配行时才用上下文行
-    hits: list[dict] = []
-    # doc_id -> best_content，优先存匹配行的内容
-    doc_best: dict[str, dict] = {}
-
-    # 预计算文件路径映射，用于逐行匹配
-    resolved_fps: set[str] = set(file_to_doc.keys())
-
-    for line in raw.split("\n"):
-        if not line or line == "--":
-            continue
-
-        # 找出匹配哪个已知文件路径
-        matched_fp = None
-        for fp in resolved_fps:
-            if line.startswith(fp):
-                matched_fp = fp
-                break
-
-        if matched_fp is None:
-            continue
-
-        suffix = line[len(matched_fp):]
-        if not suffix:
-            continue
-
-        # 分隔符可以是 :（匹配行）或 -（上下文行）
-        sep = suffix[0]
-        if sep not in (":", "-"):
-            continue
-        rest = suffix[1:]
-
-        # 提取行号和内容
-        # 格式: line_num:text 或 line_num-text
-        line_match = re.match(r"^(\d+)[:\-](.*)", rest)
-        if not line_match:
-            continue
-
-        is_match_line = sep == ":"
-        text = line_match.group(2).strip()
-
-        kb_id, doc_id = file_to_doc[matched_fp]
-
-        # 已有该 doc_id 的条目：仅当当前是匹配行且之前是上下文行时替换
-        if doc_id in doc_best:
-            prev = doc_best[doc_id]
-            if is_match_line and not prev.get("is_match_line"):
-                doc_best[doc_id] = {
-                    "doc_id": doc_id,
-                    "kb_id": kb_id,
-                    "page_number": None,
-                    "content": text[:500],
-                    "is_match_line": True,
-                }
-            continue
-
-        doc_best[doc_id] = {
-            "doc_id": doc_id,
-            "kb_id": kb_id,
-            "page_number": None,
-            "content": text[:500],
-            "is_match_line": is_match_line,
-        }
-
-    # 从 doc_best 转成 hits，只保留对外字段
-    for entry in doc_best.values():
-        hits.append({
-            "doc_id": entry["doc_id"],
-            "kb_id": entry["kb_id"],
-            "page_number": entry["page_number"],
-            "content": entry["content"],
-        })
-
-    return hits[:5]
+    return _pages_search_doc(keyword, kb_ids)

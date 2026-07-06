@@ -37,8 +37,12 @@ export const kbApi = {
     },
     delete: (kbId: string, docId: string) =>
       api.delete(`/knowledge-bases/${kbId}/documents/${docId}`),
+    reparse: (docId: string) =>
+      api.post<{ status: string; doc_id: string }>(
+        `/kb-documents/${docId}/reparse`,
+      ).then(r => r.data),
   },
-}
+ }
 
 // ── 待审核文档 ──
 export const auditDocApi = {

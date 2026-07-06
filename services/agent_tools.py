@@ -102,32 +102,30 @@ def search_kb(
 
 
 def search_kb_text(kb_ids: list[str], query: str) -> str:
-    """纯文本关键词搜索知识库（rga/rg），精确匹配。"""
+    """纯文本关键词搜索知识库（V5：pages/{doc_id}.json 内存 grep）。"""
     if not query or not kb_ids:
         return "（未提供搜索关键词或知识库）"
 
-    from services.vector_search import _get_kb_search_paths, _run_rga
-
-    paths = _get_kb_search_paths(kb_ids)
-    if not paths:
-        return "（知识库无可用文档路径）"
-
     try:
-        result = _run_rga(query, paths)
+        from services.vector_search import search_doc_by_text as _search_doc_by_text
+        hits = _search_doc_by_text(query, kb_ids)
     except Exception as e:
         _logger.warning("search_kb_text failed for query '%s': %s", query, e)
-        error_msg = str(e)
         return (
-            f"（文本搜索失败: {error_msg}。\n"
+            f"（文本搜索失败: {e}。\n"
             f"建议：1) 简化搜索词为更短的关键词；"
             f"2) 如果是概念性要求，改用 search_kb 语义搜索；"
             f"3) 如果持续失败，跳过当前搜索继续审核其他内容）"
         )
 
-    if not result:
+    if not hits:
         return f"（未找到与「{query}」匹配的文本）"
 
-    # 截断
-    if len(result) > 5000:
-        result = result[:5000] + "\n... [截断]"
-    return f"【知识库文本搜索结果（精确匹配: {query}）】\n{result}"
+    parts = []
+    for h in hits[:5]:
+        loc = f"doc={h['doc_id']} / page={h['page_number']}"
+        parts.append(f"【{loc}】\n{h['content']}")
+    body = "\n\n---\n\n".join(parts)
+    if len(body) > 5000:
+        body = body[:5000] + "\n... [截断]"
+    return f"【知识库文本搜索结果（精确匹配: {query}）】\n{body}"

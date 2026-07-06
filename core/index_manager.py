@@ -26,7 +26,8 @@ from llama_index.core.schema import TextNode
 from llama_index.vector_stores.faiss import FaissVectorStore
 
 from core.settings import get_embed_model, get_gpu_inference_lock
-from core.text_extraction import extract_text as _extract_text
+from core.parse_document import PageText
+
 
 DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 
@@ -204,20 +205,61 @@ def _embed_batch_with_retry(embed_model, texts: list[str]) -> list:
 
 # ── 文档索引 ────────────────────────────────────────────────────────────────────
 
+def _chunk_prefix(text: str, max_chars: int = 200) -> str:
+    """用于页号定位的 chunk 前缀。
+
+    取 chunk 首段非空连续字符（前 ``max_chars`` 字），足以在 by_page[*].text 找到匹配；
+    跨页章节的前缀会落在章节首字符所在页。
+    """
+    if not text:
+        return ""
+    return text.strip()[:max_chars]
+
+
+def _inject_page_number(nodes: list, by_page) -> None:
+    """把 chunk 起始文本所在的页号写进 ``node.metadata["page_number"]``。
+
+    - 输入：已经分块好的 nodes；by_page（可选）按页文本列表（page=0-based, text=str）。
+    - 对每个 node，取 ``_chunk_prefix(node.text)`` 在每页文本里 ``find``；
+      首个命中页写入 ``metadata["page_number"]``。
+    - 找不到（页级粒度退化、文本修复后字符变化）→ 写 ``None``，不阻塞。
+    - 没传 by_page 或为空 → 直接写 ``None``。
+    - 纯函数：原地改 metadata。
+    """
+    if not nodes:
+        return
+    pages_text: list[str] = []
+    if by_page:
+        pages_text = [(p.text or "") for p in by_page if p.text is not None]
+
+    for node in nodes:
+        prefix = _chunk_prefix(node.text or "")
+        page_num = None
+        if prefix and pages_text:
+            for i, pt in enumerate(pages_text):
+                if pt.find(prefix) != -1:
+                    page_num = i  # 0-based
+                    break
+        node.metadata["page_number"] = page_num
+
+
 def index_document(kb_id: str, doc_id: str, text: str, source_name: str = "",
-                   page_texts: list[str] | None = None):
-    """对文档文本分块 → embedding → 写入 KB 索引 + 持久化向量。
+                   by_page=None):
+    """对文档文本分块 → embedding → 写入 KB 索引 + 持久化向量（V6 单一入口）。
 
-    优先使用 MarkdownNodeParser 按标题层级切块（适合带 # 标题的文本），
-    降级到 SentenceSplitter 按 token 数切块。
-    embedding 结果同时保存为 .npy 文件，供后续快速重建。
+    V4（PRD #29）chunking 与页码解耦：整篇 ``text`` 走一套分块器
+    （MarkdownNodeParser / SentenceSplitter），事后 ``_inject_page_number`` 把页号
+    写回 ``node.metadata["page_number"]``，跨页章节不被腰斩。
 
-    若提供 page_texts，按页独立创建 Document 再分块，使每个 node
-    继承对应的 page_number metadata（用于 PDF 跳转定位）。
+    Args:
+        by_page: ``ParseResult.by_page`` 同构（list[PageText|str]）。
     """
     if not text or len(text) < 20:
         return
 
+    # 兼容 list[str]：旧 API 残留，pages_store / reparse 全部传 PageText 实例
+    if by_page and not isinstance(by_page[0], PageText):
+        by_page = [PageText(page=i, text=t) for i, t in enumerate(by_page)]
     with _get_index_lock(kb_id):
         embed_model = get_embed_model()
         if embed_model is None:
@@ -225,42 +267,20 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = "",
 
         index = get_kb_index(kb_id)
 
-        all_nodes = []
-
-        if page_texts and len(page_texts) > 0:
-            # 按页创建 Document，每页生成独立 chunks（继承 page_number）
-            for page_num, page_text in enumerate(page_texts):
-                if not page_text or len(page_text.strip()) < 10:
-                    continue
-                doc = Document(
-                    text=page_text,
-                    id_=f"{doc_id}_p{page_num}",
-                    metadata={
-                        "doc_id": doc_id,
-                        "source": source_name or doc_id,
-                        "page_number": page_num,  # 0-based
-                    },
-                )
-                nodes = _split_document(doc)
-                for node in nodes:
-                    node.metadata["page_number"] = page_num
-                _enrich_chunk_metadata(nodes, doc_id, source_name or doc_id)
-                all_nodes.extend(nodes)
-                del doc
-        else:
-            doc = Document(
-                text=text,
-                id_=doc_id,
-                metadata={"doc_id": doc_id, "source": source_name or doc_id},
-            )
-            nodes = _split_document(doc)
-            _enrich_chunk_metadata(nodes, doc_id, source_name or doc_id)
-            all_nodes = nodes
-            del doc
+        # 整篇切 chunk（V4：不再按页硬切）
+        doc = Document(
+            text=text,
+            id_=doc_id,
+            metadata={"doc_id": doc_id, "source": source_name or doc_id},
+        )
+        all_nodes = _split_document(doc)
+        _enrich_chunk_metadata(all_nodes, doc_id, source_name or doc_id)
+        # 事后注入页号
+        _inject_page_number(all_nodes, by_page)
+        del doc
 
         if not all_nodes:
             return
-
         # 预 embedding：拿到向量引用后再插入索引，避免重复推理
         node_texts = [node.text or "" for node in all_nodes]
         with get_gpu_inference_lock():
@@ -313,10 +333,9 @@ def _enrich_chunk_metadata(
         node.metadata.setdefault("doc_id", doc_id)
         node.metadata.setdefault("source", source_name)
 
-
 def index_documents_batch(
     kb_id: str,
-    docs: list,  # [(doc_id, text, source_name, page_texts?), ...] — 兼容 3/4 元组
+    docs: list,  # [(doc_id, text, source_name, by_page?)] — 兼容 3/4 元组
     progress_callback=None,
 ):
     """批量索引文档：分块 → 批量 embedding → 保存向量 → 写入 FAISS。
@@ -324,15 +343,16 @@ def index_documents_batch(
     每篇文档内部的所有 chunk 批量 embedding（利用 embed_batch_size 加速），
     embedding 结果持久化为 .npy 文件供后续快速重建。
 
+    V4（PRD #29）跨页章节不再被腰斩：整篇 ``text`` 走一套分块器，
+    事后 ``_inject_page_number`` 把页号写回 node.metadata。
+
     Args:
         kb_id: 知识库 ID。
         docs: [(doc_id, text, source_name), ...] 或
-              [(doc_id, text, source_name, page_texts), ...] 列表。
+              [(doc_id, text, source_name, by_page), ...] 列表。
+              by_page 是 ``ParseResult.by_page`` 同构（list[PageText]）。
         progress_callback: 可选回调 (current, total, doc_name) → None。
     """
-    if not docs:
-        return
-
     with _get_index_lock(kb_id):
         embed_model = get_embed_model()
         if embed_model is None:
@@ -343,45 +363,27 @@ def index_documents_batch(
 
         for idx, item in enumerate(docs, 1):
             doc_id, text, source_name = item[0], item[1], item[2]
-            page_texts = item[3] if len(item) > 3 else None
-
+            by_page = item[3] if len(item) > 3 else None
+            # 兼容 list[str]：旧 API 残留
+            if by_page and not isinstance(by_page[0], PageText):
+                by_page = [PageText(page=i, text=t) for i, t in enumerate(by_page)]
             if progress_callback:
                 progress_callback(idx, total, source_name or doc_id)
 
             if not text or len(text) < 20:
                 continue
 
-            all_nodes = []
-
-            if page_texts and len(page_texts) > 0:
-                for page_num, page_text in enumerate(page_texts):
-                    if not page_text or len(page_text.strip()) < 10:
-                        continue
-                    doc = Document(
-                        text=page_text,
-                        id_=f"{doc_id}_p{page_num}",
-                        metadata={
-                            "doc_id": doc_id,
-                            "source": source_name or doc_id,
-                            "page_number": page_num,
-                        },
-                    )
-                    nodes = _split_document(doc)
-                    for node in nodes:
-                        node.metadata["page_number"] = page_num
-                    _enrich_chunk_metadata(nodes, doc_id, source_name or doc_id)
-                    all_nodes.extend(nodes)
-                    del doc
-            else:
-                doc = Document(
-                    text=text,
-                    id_=doc_id,
-                    metadata={"doc_id": doc_id, "source": source_name or doc_id},
-                )
-                nodes = _split_document(doc)
-                _enrich_chunk_metadata(nodes, doc_id, source_name or doc_id)
-                all_nodes = nodes
-                del doc
+            # 整篇切 chunk（V4：不再按页硬切）
+            doc = Document(
+                text=text,
+                id_=doc_id,
+                metadata={"doc_id": doc_id, "source": source_name or doc_id},
+            )
+            all_nodes = _split_document(doc)
+            _enrich_chunk_metadata(all_nodes, doc_id, source_name or doc_id)
+            # 事后注入页号（接受页级粒度退化，None 不阻塞）
+            _inject_page_number(all_nodes, by_page)
+            del doc
 
             if not all_nodes:
                 continue
@@ -628,13 +630,16 @@ def rebuild_kb_index(kb_id: str, progress_callback=None):
                         progress_callback(i, total, doc_name)
                     if doc and doc.file_path and Path(doc.file_path).exists():
                         try:
-                            text = _extract_text(doc.file_path)
+                            from core.parse_document import parse_document as _parse_document
+                            parse_result = _parse_document(doc.file_path)
+                            text = parse_result.full_text
                             if text:
-                                index_document(kb_id, doc_id, text)
-                                # index_document 内部已调用 _persist + _save_doc_vectors
+                                index_document(
+                                    kb_id, doc_id, text,
+                                    by_page=parse_result.by_page,
+                                )
                         except Exception as e:
                             _logger.warning("  [skip] %s: %s", doc_id, e)
-
             if not with_vectors and not without_vectors:
                 # 无文档，清理 + 仍标 searchable（空库也是合法"无文档"状态）
                 if vectors_dir.exists():
