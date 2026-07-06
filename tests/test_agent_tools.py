@@ -86,42 +86,46 @@ def test_search_kb_failure_advice(monkeypatch):
     assert "search_kb_text" in out  # 失败建议指向兄弟工具
 
 
-# ── search_kb_text ───────────────────────────────────────────────────────────
+# ── search_kb_text（V5：实际走 pages grep，由 search_doc_by_text 实现）──────────────
+
 
 def test_search_kb_text_formats(monkeypatch):
-    monkeypatch.setattr(vector_search, "_get_kb_search_paths", lambda kb_ids: ["p"])
-    monkeypatch.setattr(vector_search, "_run_rga", lambda query, paths: "命中行A\n命中行B")
+    monkeypatch.setattr(
+        vector_search, "search_doc_by_text",
+        lambda query, kb_ids: [
+            {"doc_id": "d1", "kb_id": "kb1", "page_number": 3, "content": "命中行A"},
+            {"doc_id": "d2", "kb_id": "kb1", "page_number": 7, "content": "命中行B"},
+        ],
+    )
     out = search_kb_text(["kb1"], "GB/T 12345")
     assert "知识库文本搜索结果" in out
     assert "命中行A" in out
+    assert "命中行B" in out
+    assert "page=3" in out
 
 
 def test_search_kb_text_truncates(monkeypatch):
-    monkeypatch.setattr(vector_search, "_get_kb_search_paths", lambda kb_ids: ["p"])
-    monkeypatch.setattr(vector_search, "_run_rga", lambda query, paths: "X" * 6000)
+    long_content = "X" * 6000
+    monkeypatch.setattr(
+        vector_search, "search_doc_by_text",
+        lambda query, kb_ids: [
+            {"doc_id": "d1", "kb_id": "kb1", "page_number": 0, "content": long_content},
+        ],
+    )
     out = search_kb_text(["kb1"], "q")
     assert "截断" in out
 
 
-def test_search_kb_text_no_paths(monkeypatch):
-    monkeypatch.setattr(vector_search, "_get_kb_search_paths", lambda kb_ids: [])
-    out = search_kb_text(["kb1"], "q")
-    assert "无可用文档路径" in out
-
-
 def test_search_kb_text_no_results(monkeypatch):
-    monkeypatch.setattr(vector_search, "_get_kb_search_paths", lambda kb_ids: ["p"])
-    monkeypatch.setattr(vector_search, "_run_rga", lambda query, paths: "")
+    monkeypatch.setattr(vector_search, "search_doc_by_text", lambda *a, **k: [])
     out = search_kb_text(["kb1"], "q")
     assert "未找到" in out
 
 
 def test_search_kb_text_failure_advice(monkeypatch):
-    monkeypatch.setattr(vector_search, "_get_kb_search_paths", lambda kb_ids: ["p"])
-
-    def boom(query, paths):
+    def boom(*a, **k):
         raise RuntimeError("boom")
-    monkeypatch.setattr(vector_search, "_run_rga", boom)
+    monkeypatch.setattr(vector_search, "search_doc_by_text", boom)
     out = search_kb_text(["kb1"], "q")
     assert "文本搜索失败" in out
     assert "建议" in out

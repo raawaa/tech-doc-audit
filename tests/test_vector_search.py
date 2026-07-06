@@ -10,6 +10,7 @@ import shutil
 import pytest
 
 from services import vector_search
+import storage.kb_repo as kb_repo
 from services.vector_search import (
     _format_kb_results,
     index_document,
@@ -167,39 +168,103 @@ def test_search_by_keywords_uses_topic_name_as_query(monkeypatch):
     assert captured["query"] == "质保期主题"
 
 
-# ── search_doc_by_text：rga 输出解析（monkeypatch _run_rga，无需二进制）─────────
+# ── search_doc_by_text（V5 #29 / pages/{doc_id}.json 内存 grep）────────────────
 
 
-def test_search_doc_by_text_parses_match_line(tmp_path, monkeypatch):
-    """rga 匹配行（:分隔）被正确解析为 {doc_id, kb_id, content}。"""
-    import storage.doc_repo as doc_repo
-    import storage.kb_repo as kb_repo
+def _seed_doc_with_pages(kb_id: str, doc_id: str, by_page: list[dict], original_name: str = "test.pdf"):
+    """落一页 KB + doc + pages 文件，模拟已 reparse 的状态。"""
+    import services.kb_service as kb_svc
+    import storage.doc_repo as doc_repo_mod
+    from core.pages_store import save_pages
     from models.knowledge_base import KnowledgeBase
+    import storage.kb_repo
 
-    kb_id = "vs_kb_text"
-    kb_repo.update(KnowledgeBase(id=kb_id, name="t", category="national"))
+    if kb_repo.get(kb_id) is None:
+        kb_repo.update(KnowledgeBase(id=kb_id, name="t", category="national"))
 
-    # 建一篇真实落盘的 doc（search_doc_by_text 用 doc.file_path 做 rga 输出匹配）
-    doc = doc_repo.save_doc(kb_id, "std.md", "GB/T 20145-2006 条文内容".encode(), "md")
-    resolved_fp = str(__import__("pathlib").Path(doc.file_path).resolve())
+    kb_loaded = kb_repo.get(kb_id)
+    if doc_id not in (kb_loaded.document_ids or []):
+        kb_loaded.document_ids = list((kb_loaded.document_ids or [])) + [doc_id]
+        kb_repo.update(kb_loaded)
 
-    # 模拟 rga 输出：匹配行 ":行号:内容"
-    canned = f"{resolved_fp}:12:应符合 GB/T 20145-2006 的光生物安全性要求"
-    monkeypatch.setattr(vector_search, "_run_rga", lambda kw, paths: canned)
+    save_pages(
+        kb_id, doc_id,
+        {"by_page": by_page, "full_text": "\n\n".join(p["text"] for p in by_page), "layout": []},
+    )
+    # 顺手存一个 doc meta 以便 list_docs 正常工作
+    try:
+        doc_repo_mod._doc_meta_file(kb_id, doc_id).parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
-    hits = search_doc_by_text("GB/T 20145", [kb_id])
+
+def test_search_doc_by_text_pages_hit_returns_page_number():
+    """pages 文件命中 → 返回带 page_number（0-based）的结构化命中。"""
+    by_page = [
+        {"page": 0, "text": "封面 + 目录"},
+        {"page": 1, "text": "应符合 GB/T 20145-2006 的光生物安全性要求。"},
+        {"page": 2, "text": "其他内容"},
+    ]
+    _seed_doc_with_pages("vs_t5_a", "doc_a", by_page)
+
+    hits = search_doc_by_text("GB/T 20145", ["vs_t5_a"])
     assert len(hits) == 1
-    assert hits[0]["doc_id"] == doc.id
-    assert hits[0]["kb_id"] == kb_id
+    assert hits[0]["doc_id"] == "doc_a"
+    assert hits[0]["kb_id"] == "vs_t5_a"
+    assert hits[0]["page_number"] == 1, f"应命中第 2 页（0-based=1）"
     assert "GB/T 20145" in hits[0]["content"]
+
+
+def test_search_doc_by_text_pages_case_insensitive():
+    """大小写不敏感：needle 小写也能匹配页面里大写。"""
+    _seed_doc_with_pages("vs_t5_b", "doc_b", [
+        {"page": 0, "text": "GB/T 20145-2006 标准条款"},
+    ])
+
+    hits = search_doc_by_text("gb/t 20145", ["vs_t5_b"])
+    assert len(hits) == 1
+    assert hits[0]["page_number"] == 0
+
+
+def test_search_doc_by_text_pages_no_match_returns_empty():
+    """pages 文件存在但命中不上 → 返回空列表。"""
+    _seed_doc_with_pages("vs_t5_c", "doc_c", [
+        {"page": 0, "text": "完全无关的内容"},
+    ])
+    assert search_doc_by_text("GB/T 99999", ["vs_t5_c"]) == []
+
+
+def test_search_doc_by_text_pages_missing_returns_empty():
+    """KB 不存在 → 无 pages 文件 → 返回空列表（不抛）。"""
+    assert search_doc_by_text("anything", ["no_such_kb"]) == []
+
+
+def test_search_doc_by_text_pages_multi_kb():
+    """跨 KB 搜索：pages 文件分散在多个 KB，每个 doc 取首个命中页。"""
+    _seed_doc_with_pages("vs_t5_x", "doc_x1", [{"page": 0, "text": "alpha 文档"}])
+    _seed_doc_with_pages("vs_t5_x", "doc_x2", [{"page": 0, "text": "GB/T 99999 在这里"}])
+    _seed_doc_with_pages("vs_t5_y", "doc_y1", [{"page": 0, "text": "GB/T 99999 另一处"}])
+
+    hits = search_doc_by_text("GB/T 99999", ["vs_t5_x", "vs_t5_y"])
+    assert len(hits) == 2
+    docs = {h["doc_id"] for h in hits}
+    assert {"doc_x2", "doc_y1"} <= docs
+    assert all(h["page_number"] == 0 for h in hits)
+
+
+def test_search_doc_by_text_pages_each_doc_one_hit():
+    """每个 doc 仅贡献首个命中页（per doc break），保证结果不过载。"""
+    _seed_doc_with_pages("vs_t5_z", "doc_z", [
+        {"page": 0, "text": "首段"},
+        {"page": 1, "text": "GB/T 99999 第一处"},
+        {"page": 2, "text": "GB/T 99999 第二处（不应被取）"},
+    ])
+    hits = search_doc_by_text("GB/T 99999", ["vs_t5_z"])
+    assert len(hits) == 1
+    assert hits[0]["page_number"] == 1
 
 
 def test_search_doc_by_text_empty_inputs():
     assert search_doc_by_text("", ["kb1"]) == []
     assert search_doc_by_text("kw", []) == []
 
-
-def test_search_doc_by_text_no_paths_returns_empty(monkeypatch):
-    """KB 无文档目录 → _get_kb_search_paths 空 → 返回 []。"""
-    monkeypatch.setattr(vector_search, "_run_rga", lambda kw, paths: "should not be called")
-    assert search_doc_by_text("kw", ["nonexistent_kb"]) == []

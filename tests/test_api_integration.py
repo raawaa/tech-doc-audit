@@ -251,5 +251,74 @@ def test_recover_stuck_indexes():
     assert doc_ready_after.embedding_status == "embedded", "embedded 状态的文档不应被改动"
 
 
+# ── V4 POST /reparse ──────────────────────────────────────────────────────────
+
+
+def test_reparse_endpoint_returns_202_and_starts_background():
+    """POST /kb-documents/{doc_id}/reparse → 202 + pending_index；后台任务被调度。
+
+    此测试不真正调 PaddleOCR：monkeypatch ``parse_document`` 让其返回固定结构，
+    验证 endpoint 入参校验 + 异步调度流程（既不依赖网络，也不依赖 bge-m3）。
+    """
+    from unittest.mock import patch
+    from fastapi.testclient import TestClient
+    import services.kb_service as kb_svc
+    import storage.doc_repo as doc_repo_mod
+
+    # 准备 KB + doc
+    kb = kb_svc.create_kb(name="reparse-test", category="national")
+    doc = doc_repo_mod.save_doc(
+        kb.id, "reparse_target.md", b"# placeholder", "md",
+    )
+    doc_repo_mod.get_doc(kb.id, doc.id).content_hash = "sha256-fake"
+
+    called = {"count": 0}
+
+    def fake_parse_document(path):
+        from core.parse_document import ParseResult, PageText
+        called["count"] += 1
+        return ParseResult(
+            by_page=[PageText(page=0, text="# placeholder\n正文内容。")],
+            full_text="# placeholder\n正文内容。",
+            layout=[],
+        )
+
+    client = TestClient(app)
+    # Patch 服务模块里的导入别名；将 patch 生命周期延长覆盖后台线程执行窗口
+    from services import reparse_service as rs_mod
+    with patch.object(rs_mod, "parse_document", side_effect=fake_parse_document):
+        resp = client.post(f"/api/v1/kb-documents/{doc.id}/reparse")
+        assert resp.status_code == 202, resp.text
+        body = resp.json()
+        assert body["status"] == "pending_index"
+        assert body["doc_id"] == doc.id
+
+        # 等后台线程完成（patch 仍在 with 作用域内，parse_document 走 fake）
+        import time as _t
+        deadline = _t.monotonic() + 10.0
+        d = None
+        while _t.monotonic() < deadline:
+            try:
+                d = doc_repo_mod.get_doc(kb.id, doc.id)
+            except Exception:
+                d = None
+            if d and d.embedding_status in ("embedded", "failed"):
+                break
+            _t.sleep(0.1)
+
+    assert called["count"] == 1, "parse_document 应当已被调一次（异步触发）"
+    assert d is not None, "doc 元数据在任务完成后应可读"
+    assert d.embedding_status in ("embedded", "failed"), (
+        f"异步任务应已完成；实际 status={d.embedding_status}"
+    )
+
+
+def test_reparse_endpoint_404_for_unknown_doc():
+    from fastapi.testclient import TestClient
+    client = TestClient(app)
+    resp = client.post("/api/v1/kb-documents/01NONEXISTENT/reparse")
+    assert resp.status_code == 404
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

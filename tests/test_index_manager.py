@@ -17,7 +17,10 @@ from core.index_manager import (
     search,
     get_kb_index_built,
     get_kb_index,
+    _inject_page_number,
+    _chunk_prefix,
 )
+from core.parse_document import PageText
 
 
 @pytest.fixture(autouse=True)
@@ -527,3 +530,165 @@ def test_rebuild_kb_index_mixed_vectors():
 
     results_b = search([kb.id], "施工组织设计", top_k=5)
     assert len(results_b) >= 1, "doc_B 重建后应可搜索"
+
+
+
+# ── V4 chunking 与页码解耦（PRD #29） ────────────────────────────────────────
+
+
+def _fake_node(text: str, metadata: dict | None = None):
+    """构造一个最小 TextNode-like 对象，仅供 ``_inject_page_number`` 测试用。"""
+    from types import SimpleNamespace
+    return SimpleNamespace(text=text, metadata=dict(metadata or {}))
+
+
+def test_chunk_prefix_truncates_and_strips():
+    """``_chunk_prefix`` 取 strip + 前 200 字符。"""
+    assert _chunk_prefix("") == ""
+    assert _chunk_prefix("   ") == ""
+    text = "  " + ("x" * 300) + "  "
+    p = _chunk_prefix(text)
+    assert len(p) == 200
+    assert not p.startswith(" ")
+    assert not p.endswith(" ")
+
+
+def test_inject_page_number_finds_correct_page():
+    """chunk 起始文本前缀落在 by_page[i].text 哪页 → page_number=i。"""
+    nodes = [
+        _fake_node("第一段内容，是一些引导文字"),
+        _fake_node("第二段内容，关于照明标准的要求"),
+        _fake_node("第三段关于节能的内容"),
+    ]
+    by_page = [
+        PageText(page=0, text="封面 + 目录 + 一些引言\n第一段内容，是一些引导文字"),
+        PageText(page=1, text="继续内容\n第二段内容，关于照明标准的要求"),
+        PageText(page=2, text="第三页\n第三段关于节能的内容"),
+    ]
+    _inject_page_number(nodes, by_page)
+
+    assert nodes[0].metadata["page_number"] == 0
+    assert nodes[1].metadata["page_number"] == 1
+    assert nodes[2].metadata["page_number"] == 2
+
+
+def test_inject_page_number_cross_page_chapter_finds_start_page():
+    """跨页章节（"5.2 照明标准值" 在第 2-3 页）作为单个 chunk 存在时，
+    chunk 起始文本所在的页号（第 2 页 / 0-based 即 1）是正确锚点。"""
+    # 跨页章节单 chunk（不会被腰斩）
+    nodes = [
+        _fake_node("5.2 照明标准值\n本节规定了所有室内空间的照度要求。"),
+    ]
+    by_page = [
+        PageText(page=0, text="5.1 一般规定\n前面内容 ..."),
+        PageText(page=1, text="5.2 照明标准值\n本节规定了所有室内空间的照度要求。"),
+        PageText(page=2, text="5.2 照明标准值（续）\n办公区域照度不应低于 500lx..."),
+    ]
+    _inject_page_number(nodes, by_page)
+
+    assert nodes[0].metadata["page_number"] == 1, (
+        "跨页章节 chunk 起始在 page=1，page_number 应==1（0-based）"
+    )
+
+
+def test_inject_page_number_no_match_yields_none():
+    """找不到 → page_number=None，不抛异常。"""
+    nodes = [
+        _fake_node("完全不同的文本，无法在 by_page 找到"),
+    ]
+    by_page = [
+        PageText(page=0, text="此处仅有其它内容"),
+    ]
+    _inject_page_number(nodes, by_page)
+    assert nodes[0].metadata["page_number"] is None
+
+
+def test_inject_page_number_empty_inputs_are_noop():
+    """空 nodes 或 None by_page → 安全 no-op。"""
+    _inject_page_number([], None)
+    _inject_page_number([], [])
+    nodes = [_fake_node("anything")]
+    _inject_page_number(nodes, None)  # 没传 by_page
+    assert nodes[0].metadata["page_number"] is None
+
+
+def test_inject_page_number_no_text_nodes_get_none():
+    """空 text 的 chunk → page_number=None。"""
+    nodes = [_fake_node(""), _fake_node("xxx")]
+    by_page = [PageText(page=0, text="无关内容")]
+    _inject_page_number(nodes, by_page)
+    assert nodes[0].metadata["page_number"] is None
+    assert nodes[1].metadata["page_number"] is None
+
+
+
+
+def test_index_document_does_not_impose_per_page_cuts(seed_searchable_kb):
+    """回归（PRD #29 V4）：``index_document(by_page=...)`` 不再按页硬切 chunk。
+
+    跨页章节（如 GB 50034 第 5.2 节横跨两页）：
+    - 必须作为单个 chunk 完整存在（不被按页边界腰斩）。
+    - chunk 的 page_number 标注的是章节首段所在的物理页（5.2 节首段在 page=1）。
+    """
+    import storage.kb_repo as _kb_repo
+    from models.knowledge_base import KnowledgeBase
+
+    kb = KnowledgeBase(id="kb_cross", name="cross-page test", category="national")
+    _kb_repo.update(kb)
+    _kb_repo.get("kb_cross").document_ids = ["doc_cross"]
+    seed_searchable_kb("kb_cross")
+
+    # 5.2 节横跨两页（page=1, page=2）。
+    # 仅在 page=1 起始处有 heading "## 5.2 照明标准值"，page=2 是其内容延续。
+    section_51 = "## 5.1 一般规定\n" + ("前面段落内容。" * 80)
+    section_52_head = "## 5.2 照明标准值\n本节规定了所有室内空间的照度要求。"
+    section_52_part_a = (
+        "办公区域照度不应低于 500lx。"
+        + ("商业区域不应低于 300lx。" * 80)
+    )
+    section_52_part_b = (
+        "公共场所照度不应低于 100lx。"
+        + ("学校教室在课桌面照度需达到 300lx。" * 80)
+    )
+    section_53 = "## 5.3 照明节能\n" + ("后面段落内容。" * 80)
+
+    # 物理页：page=0 含 5.1；page=1 含 5.2 标题 + 第一部分；page=2 含 5.2 续；page=3 含 5.3
+    page0 = section_51
+    page1 = section_52_head + "\n" + section_52_part_a
+    page2 = section_52_part_b
+    page3 = section_53
+    by_page = [
+        PageText(page=0, text=page0),
+        PageText(page=1, text=page1),
+        PageText(page=2, text=page2),
+        PageText(page=3, text=page3),
+    ]
+
+    # 整篇文本：pages 顺序合并 + 段间空行（heading 后换行）。
+    full_text = "\n\n".join([page0, page1, page2, page3])
+
+    index_document("kb_cross", "doc_cross", full_text,
+                   source_name="GB50034", by_page=by_page)
+
+    from core.index_manager import get_kb_index
+    idx = get_kb_index("kb_cross")
+    nodes = list(idx.docstore.docs.values())
+
+    # 核心不变量 1：5.2 节作为一个完整 chunk 存在（同时含 500lx 与 100lx）
+    section_52_chunks = [
+        n for n in nodes
+        if ("5.2 照明标准值" in (n.text or ""))
+        and ("100lx" in (n.text or ""))
+        and ("500lx" in (n.text or ""))
+    ]
+    assert len(section_52_chunks) >= 1, (
+        f"5.2 节必须作为单个 chunk 完整存在（同时含 500lx 和 100lx）；"
+        f"实际 chunks={[(n.text[:60], n.metadata.get('page_number')) for n in nodes]}"
+    )
+
+    # 核心不变量 2：该 chunk 的 page_number 是章节首段所在物理页 == 1（0-based）
+    target = section_52_chunks[0]
+    assert target.metadata.get("page_number") == 1, (
+        f"5.2 跨页 chunk 的 page_number 应==1，"
+        f"实际 metadata={target.metadata}"
+    )

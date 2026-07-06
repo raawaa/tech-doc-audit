@@ -34,13 +34,23 @@ def list_kbs():
 
 @router.get("/api/v1/search/text")
 def text_search(query: str, kb_ids: str):
-    from services.vector_search import _text_search, _get_kb_search_paths
+    """精确文本搜索（V5：pages/{doc_id}.json grep，不再依赖 rga/rg）。"""
+    from services.vector_search import search_doc_by_text
     ids = [k.strip() for k in kb_ids.split(",") if k.strip()]
-    paths = _get_kb_search_paths(ids)
-    content = _text_search(paths, [query], max_results=3)
-    if content:
-        return {"results": [{"source": "text_search", "content": content, "relevance": 0.6}]}
-    return {"results": []}
+    hits = search_doc_by_text(query, ids)
+    return {
+        "results": [
+            {
+                "source": "text_search",
+                "doc_id": h["doc_id"],
+                "kb_id": h["kb_id"],
+                "page_number": h["page_number"],
+                "content": h["content"],
+                "relevance": 0.6,
+            }
+            for h in hits[:3]
+        ]
+    }
 
 
 @router.get("/search-chat")
