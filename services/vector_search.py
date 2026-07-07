@@ -197,6 +197,10 @@ def index_document(kb_id: str, doc_id: str, file_path: str, source_name: str = "
     source_name: 来源标签，为空时自动从文件名提取。
     by_page: ``ParseResult.by_page`` 同构（list[PageText]）。若 None，则
         ``parse_document`` 内部解析以获得 by_page（pages 文件入口路径）。
+
+    V8-S2 增 by_layout 透传：parse_result.layout 传给底层 ``_index_to_store``，
+    让 ``_inject_block_range`` 能为每个 chunk 写入 block_range。非 PDF KB
+    (layout=[]) → block_range 全 None,走 fallback 高亮。
     """
     from core.parse_document import parse_document as _parse_document
 
@@ -206,7 +210,12 @@ def index_document(kb_id: str, doc_id: str, file_path: str, source_name: str = "
         return
     src = source_name or Path(file_path).stem
     # V6: by_page 来自 parse_result（pages 文件已落地，kb_files / reparse 共用一份）
-    _index_to_store(kb_id, doc_id, text, src, by_page=by_page if by_page is not None else parse_result.by_page)
+    # V8-S2: by_layout 同样透传,让 chunk → block 区间自动落到 metadata
+    _index_to_store(
+        kb_id, doc_id, text, src,
+        by_page=by_page if by_page is not None else parse_result.by_page,
+        by_layout=parse_result.layout,
+    )
 
 
 def remove_document_index(kb_id: str, doc_id: str):
