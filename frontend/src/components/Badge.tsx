@@ -80,7 +80,9 @@ export function Badge({
   return (
     <span
       className={twMerge(
-        'inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium',
+        // 'whitespace-nowrap shrink-0' 防止 Badge 文本在窄列里换行（issue #46）：
+        // 中文标签"已向量化"在 w-24 列宽下会折行；shrink-0 防止 flex 容器挤压。
+        'inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap shrink-0',
         colorMap[value] || 'bg-slate-100 text-slate-600',
         className,
       )}
