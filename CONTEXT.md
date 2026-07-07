@@ -32,8 +32,12 @@
 
 ## Chunk → Layout 映射与高亮坐标（V8 PRD #49）
 
-- **block_range** — KB chunk 在 `node.metadata` 上的字段，类型 `Optional[tuple[int, int]] = None`，记 `(start_block_order, end_block_order)` 闭区间，表示该 chunk 文本覆盖到的 KB layout blocks（参见 `core.parse_document.Block.block_order`）。索引阶段由 `core.index_manager._inject_block_range(nodes, by_page)` 写入，与 `page_number` 同级（同一处调用点）。`None` 表示：注入失败 / KB 非 PDF（如 `.md`）/ 旧 KB 未触发 reparse——这种情况下高亮走原有 `matchHighlightToShapes` 字符串匹配 fallback 路线。V8-S1 实现为 no-op，所有 chunk 的 `block_range` 暂时一律 `None`。
-- **standard_block_range** — `IssueResponse` 上 API 暴露的字段，类型 `Optional[tuple[int, int]] = None`，与 `issue.standard_reference.block_range` 同值（拷贝自 `StandardRef`），供前端 `PdfViewer` 直接读坐标画高亮、跳过字符串匹配。`standard_reference=None`（旧 issue）时为 `None`，前端走 fallback。
+- **block_range** — KB chunk 在 `node.metadata` 上的字段，类型 `Optional[tuple[int, int]] = None`，记 `(start_block_order, end_block_order)` 闭区间（同一 page 内），表示该 chunk 文本覆盖到的 KB layout blocks（参见 `core.parse_document.Block.block_order`）。`start_block_order` 取 chunk 文本首次出现在 page 内的那一个 layout block；`end_block_order` 取最后一次。索引阶段由 `core.index_manager._inject_block_range(nodes, by_page)` 写入，与 `page_number` 同级（同一处调用点）。`None` 表示：注入失败 / KB 非 PDF（如 `.md`）/ 旧 KB 未触发 reparse——这种情况下高亮走原有 `matchHighlightToShapes` 字符串匹配 fallback。V8-S1 实现为 no-op，所有 chunk 的 `block_range` 暂时一律 `None`。
+- **standard_block_range** — `IssueResponse.standard_block_range: Optional[tuple[int, int]] = None`，从 `issue.standard_reference.block_range` 拷贝（旧 issue / `standard_reference=None` 时为 `None`）。供前端 `PdfViewer` 直接读坐标画高亮、跳过字符串匹配。
+- **正向高亮 (Forward Highlight)** — 高亮坐标**追溯自 agent 召回的 chunk**，即 KB 索引阶段已记录的 `block_range`，经 `flag_issue` / `standard_linker` 路径自动落到 `StandardRef.block_range`。前端 `PdfViewer` 拿坐标直接画，不经字符串匹配。
+  _Avoid_: 把"高亮"等同为"字符串反查"——`matchHighlightToBlocks` 仅在 `block_range` 缺失时作 fallback；命名上不要再混用"高亮=反查"。
+- **Block 范围回填 (Block-Range Backfill)** — 仅在 `index_document` / `rebuild_kb_index` / `reparse` 触发**重新嵌入**时同步写入 `block_range`。**不**为旧 KB 写一次性全量迁移（详见 `docs/adr/0005-no-one-shot-kb-block-range-backfill.md`）：存量 chunk 暂留空 `block_range`，运行时 fallback 到字符串匹配，逐步随 reparse 补齐。
+- **MVP 边界** — 允许 `start == end`（单 block）、`start < end`（多 block 合并高亮）；跨页 chunk 仅记录起始页的 `block_range`（后续 reparse 链路再扩展）。
 
 ## KB 文档解析流水线（PRD #29）
 
@@ -45,3 +49,12 @@
   _Avoid_: 把按页文本写在 `doc.metadata["page_texts"]` ——metadata 字段会随布局/坐标增长而膨胀，且无 schema。把 layout / bbox 数据也存在 `metadata` 里——一并放在 `pages_store` 下保持关注点分离。
 - **重新解析 (Reparse)** — 对单篇 KB 文档触发的一次性重建流程，入口 `POST /api/v1/kb-documents/{doc_id}/reparse`。流程：`parse_document` → `pages_store.save_pages` → 重建向量索引 → 更新 `embedding_status`。状态机：``pending_index`` → ``indexing`` → ``embedded``，失败回 ``failed``。故意**不**自动迁移存量 KB 文档——OCR 配额由用户决定是否消耗，详见 `docs/adr/0004-kb-document-parse-pipeline.md`（取舍 1）。
   _Avoid_: 在代码里写"导入时自动全量 reparse 现有文档"——这是 ADR-0004 明确拒绝的取舍，会无声消耗 OCR 配额。
+
+## 跨层坐标语义
+
+代码层锚点（语义与用法见上文 §"Chunk → Layout 映射与高亮坐标"）：
+
+- `node.metadata.page_number`（int, 0-based） — chunk 起始所在物理页号。
+- `node.metadata.block_range`（`(start_block_order, end_block_order)`） — chunk 在该页覆盖的 layout block 区间。
+- `IssueResponse.standard_block_range`（`(start, end)`） — API 暴露给前端，拷贝自 `issue.standard_reference.block_range`。
+- `PdfViewer` URL 参数 `highlight=chunk_text`（保留） — 当 `block_range` 不可用时，`PdfViewer` 走原 `matchHighlightToBlocks` 字符串模糊匹配路线。
