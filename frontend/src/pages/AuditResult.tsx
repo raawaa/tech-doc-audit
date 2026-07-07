@@ -207,7 +207,19 @@ export function AuditResult() {
                               <span className="font-medium text-slate-600">依据：</span>
                               {issue.standard_doc_id ? (
                                 <a
-                                  href={`/pdf-viewer/${issue.standard_doc_id}?page=${issue.standard_page_number ?? ''}&clause=${encodeURIComponent(issue.standard_clause || '')}&highlight=${encodeURIComponent(issue.standard_chunk_text || '')}`}
+                                  href={(() => {
+                                    const qs = new URLSearchParams()
+                                    if (issue.standard_page_number) qs.set('page', String(issue.standard_page_number))
+                                    if (issue.standard_clause) qs.set('clause', issue.standard_clause)
+                                    // V8-S6: 透传 block_range 让 PdfViewer 走坐标路径;缺失时
+                                    // PdfViewer fallback 到 highlight 字符串匹配。
+                                    if (issue.standard_block_range) {
+                                      qs.set('block_range', `${issue.standard_block_range[0]},${issue.standard_block_range[1]}`)
+                                    } else if (issue.standard_chunk_text) {
+                                      qs.set('highlight', issue.standard_chunk_text)
+                                    }
+                                    return `/pdf-viewer/${issue.standard_doc_id}?${qs.toString()}`
+                                  })()}
                                   target="_blank"
                                   rel="noopener noreferrer"
                                   className="text-blue-600 hover:underline cursor-pointer"

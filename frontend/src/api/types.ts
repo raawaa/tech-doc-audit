@@ -85,6 +85,9 @@ export interface AuditIssue {
   standard_page_number?: number
   standard_chunk_text?: string
   standard_file_type?: string
+  // V8-S6: 正向高亮坐标 (start_block_order, end_block_order)。
+  // 非空时 PdfViewer 走坐标主路径;缺失/旧 KB 时 fallback 到 highlight 字符串匹配。
+  standard_block_range?: [number, number]
 }
 
 export interface AuditResult {
@@ -116,6 +119,9 @@ export interface AuditEventIssue {
   standard_doc_id?: string
   standard_page_number?: number
   standard_chunk_text?: string
+  // V8-S6: 同 AuditIssue.standard_block_range —— 由 flag_issue 落地或
+  // standard_linker 回填,前端透传到 PdfViewer 走坐标路径。
+  standard_block_range?: [number, number]
 }
 
 export type AuditEvent =

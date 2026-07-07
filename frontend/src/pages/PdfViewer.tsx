@@ -6,6 +6,7 @@ import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
 import {
+  matchBlockRangeToBlocks,
   matchHighlightToBlocks,
   type Block as LayoutBlock,
   type HighlightRect,
@@ -49,12 +50,35 @@ interface LayoutState {
 const INITIAL_LAYOUT: LayoutState = { data: null, loading: false, error: null }
 
 
+/** 解析 ``block_range`` URL 参数 ``"start,end"`` → ``[start, end] | null``。
+
+V8-S6:后端 IssueResponse.standard_block_range 经 AuditResult 跳转时通过 URL
+``?block_range=start,end&page=N`` 传递；这里是该路径的入口。
+解析失败 / 缺字段 / 反序 → null,走 fallback。
+*/
+function parseBlockRangeParam(raw: string | null): [number, number] | null {
+  if (!raw) return null
+  const parts = raw.split(',')
+  if (parts.length !== 2) return null
+  const start = Number.parseInt(parts[0].trim(), 10)
+  const end = Number.parseInt(parts[1].trim(), 10)
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null
+  if (start < 0 || end < start) return null
+  return [start, end]
+}
+
+
 export function PdfViewer() {
   const pathname = window.location.pathname
   const docId = pathname.split('/').pop() || ''
   const [searchParams, setSearchParams] = useSearchParams()
   const targetPage = parseInt(searchParams.get('page') || '1', 10)
   const highlight = searchParams.get('highlight') || ''
+  // V8-S6:正向 block_range 坐标路径(优先级高于字符串匹配)。
+  // 解析失败 / 缺字段 → null → 走 matchHighlightToBlocks fallback。
+  const blockRange = parseBlockRangeParam(searchParams.get('block_range'))
+  // V8-S6:block_range 路径只画起始页(MVP 限制,与后端 page_number 同语义)。
+  const blockRangePage0 = blockRange && targetPage > 0 ? targetPage - 1 : null
 
   const [meta, setMeta] = useState<DocMeta | null>(null)
   const [loading, setLoading] = useState(true)
@@ -123,13 +147,21 @@ export function PdfViewer() {
     setNumPages(total)
   }
 
-  // 高亮计算：layout + highlight 就绪后一次性算所有命中，**保留归一化坐标**
-  // （实际绘制在 page render success 时按 canvas 显示尺寸换算）。
+  // 高亮计算：layout + (block_range | highlight) 就绪后一次性算所有命中，
+  // **保留归一化坐标**（实际绘制在 page render success 时按 canvas 显示尺寸换算）。
+  //
+  // V8-S6 路径优先级：
+  // 1. ``block_range`` 非空 + layout 已加载 → 走 ``matchBlockRangeToBlocks`` 坐标路径
+  //    （仅画起始页，跨页 chunk MVP 限制）。
+  // 2. 否则 ``highlight`` 非空 → 走 ``matchHighlightToBlocks`` 字符串匹配 fallback
+  //    （旧 KB chunk 兼容）。
   useEffect(() => {
-    if (!numPages || !layout.data || !highlight) {
+    const useBlockRange = !!(blockRange && layout.data && numPages)
+    const useFallback = !!(highlight && layout.data && numPages)
+
+    if (!useBlockRange && !useFallback) {
       normalizedHitsByPage.current = new Map()
       firstHitPage.current = null
-      // 触发重画（如有挂载页）
       if (pageCanvasRefs.current.size > 0) {
         pageCanvasRefs.current.forEach((_, pageNum) => {
           paintedPages.current.delete(pageNum)
@@ -139,17 +171,37 @@ export function PdfViewer() {
     }
     const allHits = new Map<number, HighlightRect[]>()
     let firstPage: number | null = null
-    for (const page of layout.data.layout) {
-      const pageW = Math.max(page.width, 1)
-      const pageH = Math.max(page.height, 1)
-      const hits = matchHighlightToBlocks(
-        highlight, page.blocks, pageW, pageH, page.page,
-      )
-      if (hits.length > 0) {
-        allHits.set(page.page, hits)
-        if (firstPage === null || page.page < firstPage) firstPage = page.page
+
+    if (useBlockRange && blockRange && layout.data) {
+      // 坐标路径：只在起始页（blockRangePage0）画
+      const targetPage0 = blockRangePage0!
+      const page = layout.data.layout.find(p => p.page === targetPage0)
+      if (page) {
+        const pageW = Math.max(page.width, 1)
+        const pageH = Math.max(page.height, 1)
+        const hits = matchBlockRangeToBlocks(
+          blockRange, page.blocks, pageW, pageH, page.page,
+        )
+        if (hits.length > 0) {
+          allHits.set(page.page, hits)
+          firstPage = page.page
+        }
+      }
+    } else if (useFallback && highlight && layout.data) {
+      // 字符串匹配 fallback
+      for (const page of layout.data.layout) {
+        const pageW = Math.max(page.width, 1)
+        const pageH = Math.max(page.height, 1)
+        const hits = matchHighlightToBlocks(
+          highlight, page.blocks, pageW, pageH, page.page,
+        )
+        if (hits.length > 0) {
+          allHits.set(page.page, hits)
+          if (firstPage === null || page.page < firstPage) firstPage = page.page
+        }
       }
     }
+
     normalizedHitsByPage.current = allHits
     firstHitPage.current = firstPage
     // 让已挂载页重画：fillStyle+fillRect 直接画（layoutMatch 单测覆盖了
@@ -165,14 +217,15 @@ export function PdfViewer() {
       for (const h of hits) ctx.fillRect(h.x, h.y, h.w, h.h)
       paintedPages.current.add(pageNum)
     })
-  }, [layout.data, highlight, numPages])
+  }, [layout.data, highlight, numPages, blockRange, blockRangePage0])
   // —— 滚动到第一命中页或 URL targetPage ——
-  // 用签名（docId + firstHitPage + targetPage）作 latch，避免 URL `page=` 改了
-  // 但没 remount 时不触发；同时 highlight 命中变化（layout data 换新）也重滚。
+  // 用签名（docId + firstHitPage + targetPage + blockRange）作 latch，避免 URL
+  // `page=` 改了但没 remount 时不触发；同时 highlight / block_range 命中变化
+  // （layout data 换新）也重滚。
   const lastScrollSignatureRef = useRef<string | null>(null)
   useEffect(() => {
     if (numPages <= 0) return
-    const signature = `${docId}|${firstHitPage.current}|${targetPage}`
+    const signature = `${docId}|${firstHitPage.current}|${targetPage}|${blockRange ? blockRange.join(',') : ''}`
     if (lastScrollSignatureRef.current === signature) return
     lastScrollSignatureRef.current = signature
     const target = firstHitPage.current !== null
@@ -180,7 +233,7 @@ export function PdfViewer() {
       : targetPage
     const idx = Math.min(Math.max(target - 1, 0), numPages - 1)
     requestAnimationFrame(() => virtuosoRef.current?.scrollToIndex(idx))
-  }, [docId, numPages, targetPage, layout.data, highlight])
+  }, [docId, numPages, targetPage, layout.data, highlight, blockRange])
 
   // 绘制层：某页渲染完成时画归一化命中（内联 fillStyle+fillRect，与上文
   // 匹配完成时绘制共用同一绘制入口；真正需要被单测的是 layoutMatch 模块）。

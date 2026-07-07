@@ -39,8 +39,19 @@ function formatToolArgs(tool: string, args: Record<string, unknown>): string {
 }
 
 function IssueCard({ issue }: { issue: AuditEventIssue }) {
+  // V8-S6: 透传 block_range 让 PdfViewer 走坐标路径;缺失时 fallback 到 highlight 字符串匹配。
   const pdfUrl = issue.standard_doc_id
-    ? `/pdf-viewer/${issue.standard_doc_id}?page=${issue.standard_page_number ?? ''}&clause=${encodeURIComponent(issue.standard_clause || '')}&highlight=${encodeURIComponent(issue.standard_chunk_text || '')}`
+    ? (() => {
+        const qs = new URLSearchParams()
+        if (issue.standard_page_number) qs.set('page', String(issue.standard_page_number))
+        if (issue.standard_clause) qs.set('clause', issue.standard_clause)
+        if (issue.standard_block_range) {
+          qs.set('block_range', `${issue.standard_block_range[0]},${issue.standard_block_range[1]}`)
+        } else if (issue.standard_chunk_text) {
+          qs.set('highlight', issue.standard_chunk_text)
+        }
+        return `/pdf-viewer/${issue.standard_doc_id}?${qs.toString()}`
+      })()
     : null
 
   return (

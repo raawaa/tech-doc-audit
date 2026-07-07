@@ -128,10 +128,67 @@ export function lcsRatio(a: string, b: string): number {
 
 
 /**
+ * V8-S6:把正向 ``block_range = (start, end)`` 直接映射到该页 layout blocks，
+ * 产出对应 blocks 的画布像素矩形。
+ *
+ * 这是 V8 正向高亮主路径——KB 索引阶段已经记下 chunk 覆盖的 layout block 区间，
+ * 前端拿到 ``standard_block_range`` 后跳过字符串匹配，直接读 bbox 画高亮。
+ *
+ * 与 ``matchHighlightToBlocks`` 的关键差异：
+ * - **不跑**字符串/NFKC/LCS 匹配——直接按 ``block_order`` 区间筛 blocks。
+ * - 跨页 chunk 仅记录起始页(MVP 限制)，调用方负责把 pageNumber 定位到起始页。
+ * - 任何 blocks 缺 ``bbox_norm`` 跳过，不阻塞其他 blocks。
+ *
+ * @param blockRange 闭区间 ``(start_block_order, end_block_order)``,
+ *                   ``start == end`` 单 block,``start < end`` 多 block。
+ * @param blocks     该页的 layout blocks（已按 block_order 升序）。
+ * @param pageW      PDF 页面渲染像素宽。
+ * @param pageH      PDF 页面渲染像素高。
+ * @param page       该页的逻辑页号（0-based），用于 HighlightRect.page 准确。
+ * @returns 命中 blocks 的画布像素矩形（一一对应：每个匹配 block 一条 rect）。
+ */
+export function matchBlockRangeToBlocks(
+  blockRange: readonly [number, number],
+  blocks: ReadonlyArray<Block>,
+  pageW: number,
+  pageH: number,
+  page: number = 0,
+): HighlightRect[] {
+  if (!blockRange || blockRange.length !== 2) return []
+  const [start, end] = blockRange
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return []
+  if (start > end) return []  // 异常区间,防御
+
+  const hits: HighlightRect[] = []
+  for (const b of blocks) {
+    const order = b.block_order ?? -1
+    if (order < start || order > end) continue
+    const bbox = b.bbox_norm
+    if (!Array.isArray(bbox) || bbox.length !== 4) continue
+    const x = bbox[0] * pageW
+    const y = bbox[1] * pageH
+    const w = (bbox[2] - bbox[0]) * pageW
+    const h = (bbox[3] - bbox[1]) * pageH
+    if (!isFinite(x) || !isFinite(y) || !isFinite(w) || !isFinite(h)) continue
+    if (w <= 0 || h <= 0) continue
+    hits.push({ page, x, y, w, h })
+  }
+  return hits
+}
+
+
+/**
  * 把 URL 参数 ``highlight`` 映射到一页的 layout blocks 列表，产出命中 block 的
  * 画布像素矩形（顶原点）。
  *
+ * V8 起:仅作为 ``matchBlockRangeToBlocks`` 缺失时的 fallback 路径——KB 索引
+ * 阶段写出的 ``block_range`` 优先,字符串匹配兜底,确保旧 KB chunk
+ * （``block_range=None``）仍能高亮。
+ *
  * 匹配优先级：
+ * - T1:双向 includes（block 是 highlight 子串也算——OCR 拆散场景）。
+ * - P2:短串 < MIN_LCS_LEN 时不跑 LCS；>= 时跑 LCS ratio 兜底（>= 0.85）。
+ *
  * @param pageW    PDF 页面渲染像素宽（react-pdf <Page> 内部分辨率 = 磅 × scale）。
  * @param pageH    PDF 页面渲染像素高。
  * @param page     该页的逻辑页号（0-based，与 PageLayout.page 对齐）。默认 0，
