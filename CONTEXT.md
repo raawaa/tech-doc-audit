@@ -30,6 +30,11 @@
   _Avoid_: "就绪""ready"——必须与文档向量化层的终态严格区分。
 - **两者关系** — 文档向量化是知识库检索索引的**构成材料**（前置条件），不是同一回事：全部文档已向量化 ≠ 该库可检索，仍需合并建索引。类比："砖都烧好了 ≠ 墙砌好了"。
 
+## Chunk → Layout 映射与高亮坐标（V8 PRD #49）
+
+- **block_range** — KB chunk 在 `node.metadata` 上的字段，类型 `Optional[tuple[int, int]] = None`，记 `(start_block_order, end_block_order)` 闭区间，表示该 chunk 文本覆盖到的 KB layout blocks（参见 `core.parse_document.Block.block_order`）。索引阶段由 `core.index_manager._inject_block_range(nodes, by_page)` 写入，与 `page_number` 同级（同一处调用点）。`None` 表示：注入失败 / KB 非 PDF（如 `.md`）/ 旧 KB 未触发 reparse——这种情况下高亮走原有 `matchHighlightToShapes` 字符串匹配 fallback 路线。V8-S1 实现为 no-op，所有 chunk 的 `block_range` 暂时一律 `None`。
+- **standard_block_range** — `IssueResponse` 上 API 暴露的字段，类型 `Optional[tuple[int, int]] = None`，与 `issue.standard_reference.block_range` 同值（拷贝自 `StandardRef`），供前端 `PdfViewer` 直接读坐标画高亮、跳过字符串匹配。`standard_reference=None`（旧 issue）时为 `None`，前端走 fallback。
+
 ## KB 文档解析流水线（PRD #29）
 
 - **KB 文档解析 (Parse)** — 单份 KB 文档进入流水线被结构化解析的全过程，入口 `core.parse_document.parse_document(path) -> ParseResult`。一次解析产出 `{by_page, full_text, layout}` 三类结果，被向量索引、按页文本存储、文本搜索等下游共用——避免历史上双解析器（`extract_text` + `extract_text_by_page`）导致的不一致。
