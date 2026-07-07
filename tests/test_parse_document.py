@@ -288,6 +288,151 @@ def test_paddleocr_jsonl_handles_garbled_lines_gracefully():
     assert pr.by_page[0].text == "ok"
 
 
+# ── V7.1: PaddleOCR 响应字段 None-safety ───────────────────────────────────────
+
+
+def test_paddleocr_jsonl_handles_none_block_order():
+    """``block_order=None`` 不应让 _extract_blocks 崩溃。"""
+    jsonl = json.dumps({
+        "result": {
+            "layoutParsingResults": [
+                {
+                    "markdown": {"text": "page"},
+                    "width": 1000,
+                    "height": 2000,
+                    "prunedResult": {
+                        "image_size": [1000, 2000],
+                        "parsing_res_list": [
+                            {
+                                "block_label": "text",
+                                "block_content": "foo",
+                                "block_bbox": [10, 20, 100, 200],
+                                "block_order": None,
+                            },
+                            {
+                                "block_label": "text",
+                                "block_content": "bar",
+                                "block_bbox": [10, 20, 100, 200],
+                                # block_order 缺失 → 用索引 1
+                            },
+                        ],
+                    },
+                }
+            ]
+        }
+    })
+    pr = pd_module._paddleocr_jsonl_to_parse_result(jsonl)
+    assert len(pr.layout) == 1
+    blocks = pr.layout[0].blocks
+    assert len(blocks) == 2
+    # None → 回退索引 0
+    assert blocks[0].block_order == 0
+    # 缺失 → 回退索引 1
+    assert blocks[1].block_order == 1
+    # 坐标仍然归一化
+    assert blocks[0].bbox_norm == [0.01, 0.01, 0.1, 0.1]
+
+
+def test_paddleocr_jsonl_handles_none_bbox_and_polygon():
+    """``block_bbox=None`` / ``block_polygon=None`` 不应让 _extract_blocks 崩溃。"""
+    jsonl = json.dumps({
+        "result": {
+            "layoutParsingResults": [
+                {
+                    "markdown": {"text": "x"},
+                    "width": 100,
+                    "height": 100,
+                    "prunedResult": {
+                        "image_size": [100, 100],
+                        "parsing_res_list": [
+                            {"block_label": "text", "block_content": "a",
+                             "block_bbox": None, "block_polygon": None},
+                        ],
+                    },
+                }
+            ]
+        }
+    })
+    pr = pd_module._paddleocr_jsonl_to_parse_result(jsonl)
+    assert len(pr.layout) == 1
+    b = pr.layout[0].blocks[0]
+    # block 仍产出（label + content 保留），坐标退空
+    assert b.block_content == "a"
+    assert b.bbox_norm == []
+    assert b.polygon_norm == []
+
+
+def test_paddleocr_jsonl_falls_back_width_height_through_chain():
+    """``res.width/height`` 为 None 时退到 ``prunedResult.width/height``，再退到 ``image_size``。"""
+    # case 1: res 全缺，prunedResult 顶层有
+    jsonl = json.dumps({
+        "result": {
+            "layoutParsingResults": [
+                {
+                    "markdown": {"text": "x"},
+                    # res.width / res.height 缺省
+                    "prunedResult": {
+                        "width": 500,
+                        "height": 800,
+                        "image_size": [1000, 1000],
+                        "parsing_res_list": [
+                            {"block_label": "text", "block_content": "y",
+                             "block_bbox": [50, 80, 100, 160]},
+                        ],
+                    },
+                }
+            ]
+        }
+    })
+    pr = pd_module._paddleocr_jsonl_to_parse_result(jsonl)
+    assert pr.layout[0].width == 500
+    assert pr.layout[0].height == 800
+    # 坐标用 prunedResult 尺寸归一化
+    assert pr.layout[0].blocks[0].bbox_norm == [0.1, 0.1, 0.2, 0.2]
+
+    # case 2: 全部缺失 → 退 0，block 仍产出（坐标空）
+    jsonl2 = json.dumps({
+        "result": {
+            "layoutParsingResults": [
+                {
+                    "markdown": {"text": "z"},
+                    "prunedResult": {
+                        # width/height/image_size 全缺
+                        "parsing_res_list": [
+                            {"block_label": "text", "block_content": "q",
+                             "block_bbox": [10, 20, 30, 40]},
+                        ],
+                    },
+                }
+            ]
+        }
+    })
+    pr2 = pd_module._paddleocr_jsonl_to_parse_result(jsonl2)
+    assert pr2.layout[0].width == 0
+    assert pr2.layout[0].height == 0
+    assert pr2.layout[0].blocks[0].bbox_norm == []
+
+
+def test_paddleocr_jsonl_supports_multi_page_packed_layout():
+    """单行 JSONL 里多个 layoutParsingResults 应按出现顺序累加 page_order。"""
+    jsonl = json.dumps({
+        "result": {
+            "layoutParsingResults": [
+                {"markdown": {"text": "p1"}, "width": 100, "height": 200,
+                 "prunedResult": {"image_size": [100, 200], "parsing_res_list": []}},
+                {"markdown": {"text": "p2"}, "width": 100, "height": 200,
+                 "prunedResult": {"image_size": [100, 200], "parsing_res_list": []}},
+                {"markdown": {"text": "p3"}, "width": 100, "height": 200,
+                 "prunedResult": {"image_size": [100, 200], "parsing_res_list": []}},
+            ]
+        }
+    })
+    pr = pd_module._paddleocr_jsonl_to_parse_result(jsonl)
+    assert len(pr.by_page) == 3
+    assert [p.page for p in pr.by_page] == [0, 1, 2]
+    assert [p.page for p in pr.layout] == [0, 1, 2]
+    assert pr.full_text == "p1\n\np2\n\np3"
+
 # ── _paddleocr_call 跳过（要求联网/不强制调用） ───────────────────────────────────
 
 
