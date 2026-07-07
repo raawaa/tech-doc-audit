@@ -26,7 +26,7 @@ nohup uvicorn api.main:app --port 8000 > /tmp/backend.log 2>&1 &
 | Agentic Markdown 解析 | `services/agentic_audit.py` _parse_action_fallback() | 支持 ```json 代码块 + 中文 Markdown 混合格式 |
 | 审核去重 | `services/audit_task_service.py` _deduplicate_issues() | 按 cited_excerpt 去重 |
 |标准关联多 KB 召回稀释（#23）|`services/standard_linker.py` `_pick_text_hit()` + 策略1.1|文本回填 `doc_id`；多文档按 name 优先级挑选，详见函数 docstring|
-
+|Badge 文本不换行（#46）|`frontend/src/components/Badge.tsx` `Badge()`|默认 class 加 `whitespace-nowrap shrink-0`；中文标签在 `w-24` 列宽下不再折行（"已向量化"/"证据不足"等），同时阻止 flex 父容器挤压。其他 ~10 处 Badge 调用点全员受益。|
 ## 常用命令
 
 ```bash
