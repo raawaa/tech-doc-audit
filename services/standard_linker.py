@@ -239,10 +239,14 @@ def _search_and_link_standards(
                 if vh["doc_id"] in matched_doc_ids:
                     content = vh.get("content", "")
                     if any(sn in content for sn in standard_numbers):
+                        # V8-S5: 透传 block_range —— 命中 vec chunk 自带的 layout
+                        # 坐标区间(由 core.index_manager.search 写入,见 V8-S3)。
+                        # None → 走前端 fallback 字符串匹配,与策略1.1 行为一致。
                         best_hit = {
                             "doc_id": vh["doc_id"],
                             "page_number": vh.get("page_number"),
                             "chunk_text": content[:500],
+                            "block_range": vh.get("block_range"),
                         }
                         break
 
@@ -250,10 +254,13 @@ def _search_and_link_standards(
             if best_hit is None:
                 picked = _pick_text_hit(text_hits, standard_numbers, standard_names, doc_name_by_id)
                 if picked is not None and standard_numbers:
+                    # V8-S5: 文本回填没有对应 chunk 节点,block_range 留 None
+                    # ——与 MVP chunk_text = 标准编号 一致,前端走 fallback。
                     best_hit = {
                         "doc_id": picked["doc_id"],
                         "page_number": picked.get("page_number"),
                         "chunk_text": standard_numbers[0],  # 编号自身，用于 PDF 高亮搜索
+                        "block_range": None,
                     }
                     # 留出回填审计线索
                     _logger.info(
@@ -281,10 +288,12 @@ def _search_and_link_standards(
                     verified = any(nm in content for nm in standard_names)
 
                 if verified:
+                    # V8-S5: 透传 block_range —— 同策略1。
                     best_hit = {
                         "doc_id": vh["doc_id"],
                         "page_number": vh.get("page_number"),
                         "chunk_text": content[:500],
+                        "block_range": vh.get("block_range"),
                     }
                     if standard_numbers:
                         for sn in standard_numbers:
@@ -298,13 +307,16 @@ def _search_and_link_standards(
             raw_page = best_hit.get("page_number")
             sr.page_number = raw_page + 1 if raw_page is not None else None
             sr.chunk_text = best_hit.get("chunk_text")
+            # V8-S5: 把命中 chunk 的 block_range 拷到 StandardRef,与 page_number 平级。
+            # 字段不存在(策略1.1 文本回填) → None;存在但为 None → 保留 None。
+            sr.block_range = best_hit.get("block_range")
             doc_name = doc_name_by_id.get(best_hit["doc_id"])
             if doc_name:
                 sr.standard_name = doc_name
                 sr.standard_id = doc_name
             _logger.info(
-                "_search_and_link_standards: linked issue #%d to doc %s",
-                issue.id, best_hit["doc_id"],
+                "_search_and_link_standards: linked issue #%d to doc %s (block_range=%s)",
+                issue.id, best_hit["doc_id"], sr.block_range,
             )
         if not sr.standard_name and standard_numbers:
             sr.standard_name = standard_numbers[0]

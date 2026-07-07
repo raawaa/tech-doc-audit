@@ -428,3 +428,117 @@ def test_text_fallback_chunk_text_uses_first_standard_number(monkeypatch):
     )
     sr = issue.standard_reference
     assert sr.chunk_text == "GB/T 20145-2006"  # 取第一个
+
+
+# ── V8-S5: standard_linker 透传 block_range 到 StandardRef ───────────────────────
+
+
+def test_strategy1_passes_block_range_from_vec_hit(monkeypatch):
+    """策略1(vec 验证命中)→ best_hit["block_range"] 从 vec hit 透传到 sr.block_range。"""
+    issue = _issue(1)
+    monkeypatch.setattr(standard_linker, "_doc_repo", _fake_repo(["d1"]))
+    monkeypatch.setattr(standard_linker, "search_doc_by_text", lambda n, k: [{"doc_id": "d1"}])
+    monkeypatch.setattr(
+        standard_linker, "vec_search",
+        lambda kb_ids, q, top_k=5: [{
+            "doc_id": "d1", "page_number": 2,
+            "content": "应符合 GB/T 20145-2006 的要求",
+            "block_range": (3, 7),
+        }],
+    )
+    standard_linker.link_standards(
+        [issue], ["kb1"], extractor=lambda pending: dict([_ext(1, ["GB/T 20145-2006"])])
+    )
+    sr = issue.standard_reference
+    assert sr.doc_id == "d1"
+    assert sr.block_range == (3, 7), (
+        f"策略1 应透传 vec hit 的 block_range=(3,7),实际 {sr.block_range}"
+    )
+
+
+def test_strategy2_passes_block_range_from_vec_hit(monkeypatch):
+    """策略2(vec 直接命中)→ best_hit["block_range"] 透传到 sr.block_range。"""
+    issue = _issue(1)
+    monkeypatch.setattr(standard_linker, "_doc_repo", _fake_repo([]))
+    monkeypatch.setattr(standard_linker, "search_doc_by_text", lambda n, k: [])
+    monkeypatch.setattr(
+        standard_linker, "vec_search",
+        lambda kb_ids, q, top_k=5: [{
+            "doc_id": "d2", "page_number": 5,
+            "content": "灯和灯系统的光生物安全性 规定",
+            "block_range": (10, 15),
+        }],
+    )
+    standard_linker.link_standards(
+        [issue], ["kb1"], extractor=lambda pending: dict([_ext(1, [], ["灯和灯系统的光生物安全性"])])
+    )
+    sr = issue.standard_reference
+    assert sr.doc_id == "d2"
+    assert sr.block_range == (10, 15)
+
+
+def test_strategy1_text_fallback_block_range_is_none(monkeypatch):
+    """策略1.1(文本回填,vec 未验证通过)→ block_range = None,走前端 fallback。"""
+    issue = _issue(1)
+    monkeypatch.setattr(standard_linker, "_doc_repo", _fake_repo([]))
+    monkeypatch.setattr(
+        standard_linker, "search_doc_by_text",
+        lambda n, k: [{"doc_id": "d1", "page_number": None, "content": "..."}],
+    )
+    monkeypatch.setattr(
+        standard_linker, "vec_search",
+        lambda kb_ids, q, top_k=5: [{
+            "doc_id": "d1", "page_number": 1, "content": "完全无关的内容"
+        }],
+    )
+    standard_linker.link_standards(
+        [issue], ["kb1"], extractor=lambda pending: dict([_ext(1, ["GB 50016"])])
+    )
+    sr = issue.standard_reference
+    assert sr.doc_id == "d1"
+    assert sr.block_range is None, (
+        f"文本回填场景无对应 chunk 节点,block_range 应为 None,实际 {sr.block_range}"
+    )
+
+
+def test_strategy1_vec_hit_without_block_range_yields_none(monkeypatch):
+    """vec hit 命中但 hit dict 无 block_range 字段(旧索引)→ sr.block_range = None。"""
+    issue = _issue(1)
+    monkeypatch.setattr(standard_linker, "_doc_repo", _fake_repo(["d1"]))
+    monkeypatch.setattr(standard_linker, "search_doc_by_text", lambda n, k: [{"doc_id": "d1"}])
+    monkeypatch.setattr(
+        standard_linker, "vec_search",
+        # 旧 hit dict 没有 block_range 字段
+        lambda kb_ids, q, top_k=5: [{
+            "doc_id": "d1", "page_number": 0,
+            "content": "应符合 GB/T 20145-2006 的要求",
+        }],
+    )
+    standard_linker.link_standards(
+        [issue], ["kb1"], extractor=lambda pending: dict([_ext(1, ["GB/T 20145-2006"])])
+    )
+    sr = issue.standard_reference
+    assert sr.doc_id == "d1"
+    assert sr.block_range is None, (
+        f"旧 hit 缺 block_range 字段 → 应为 None,实际 {sr.block_range}"
+    )
+
+
+def test_strategy1_vec_hit_with_none_block_range_yields_none(monkeypatch):
+    """vec hit 命中且有 block_range=None(旧 KB chunk)→ sr.block_range = None。"""
+    issue = _issue(1)
+    monkeypatch.setattr(standard_linker, "_doc_repo", _fake_repo(["d1"]))
+    monkeypatch.setattr(standard_linker, "search_doc_by_text", lambda n, k: [{"doc_id": "d1"}])
+    monkeypatch.setattr(
+        standard_linker, "vec_search",
+        lambda kb_ids, q, top_k=5: [{
+            "doc_id": "d1", "page_number": 0,
+            "content": "应符合 GB/T 20145-2006 的要求",
+            "block_range": None,
+        }],
+    )
+    standard_linker.link_standards(
+        [issue], ["kb1"], extractor=lambda pending: dict([_ext(1, ["GB/T 20145-2006"])])
+    )
+    sr = issue.standard_reference
+    assert sr.block_range is None
