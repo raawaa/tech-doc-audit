@@ -79,7 +79,6 @@ export function PdfViewer() {
   const firstHitPage = useRef<number | null>(null)
 
   const virtuosoRef = useRef<VirtuosoHandle>(null)
-  const didInitialScrollRef = useRef(false)
 
   const apiBase = import.meta.env.VITE_API_BASE_URL || ''
   const pdfUrl = meta?.file_type === 'pdf' ? `${apiBase}/api/v1/kb-documents/${docId}/file` : null
@@ -143,7 +142,9 @@ export function PdfViewer() {
     for (const page of layout.data.layout) {
       const pageW = Math.max(page.width, 1)
       const pageH = Math.max(page.height, 1)
-      const hits = matchHighlightToBlocks(highlight, page.blocks, pageW, pageH)
+      const hits = matchHighlightToBlocks(
+        highlight, page.blocks, pageW, pageH, page.page,
+      )
       if (hits.length > 0) {
         allHits.set(page.page, hits)
         if (firstPage === null || page.page < firstPage) firstPage = page.page
@@ -151,7 +152,9 @@ export function PdfViewer() {
     }
     normalizedHitsByPage.current = allHits
     firstHitPage.current = firstPage
-    // 让已挂载页重画——直接内联 fillStyle+fillRect，避免再开一层 tiny function。
+    // 让已挂载页重画：fillStyle+fillRect 直接画（layoutMatch 单测覆盖了
+  // bbox_norm → 像素换算语义），同时把 paintedPages 重置以便 onRenderSuccess
+  // 回调对后续 mount 的页继续画。
     paintedPages.current = new Set()
     pageCanvasRefs.current.forEach((canvas, pageNum) => {
       const hits = allHits.get(pageNum)
@@ -162,20 +165,22 @@ export function PdfViewer() {
       for (const h of hits) ctx.fillRect(h.x, h.y, h.w, h.h)
       paintedPages.current.add(pageNum)
     })
-    // 触发 effect 重渲让回调刷新
-    setLayout(prev => prev)
   }, [layout.data, highlight, numPages])
-
   // —— 滚动到第一命中页或 URL targetPage ——
+  // 用签名（docId + firstHitPage + targetPage）作 latch，避免 URL `page=` 改了
+  // 但没 remount 时不触发；同时 highlight 命中变化（layout data 换新）也重滚。
+  const lastScrollSignatureRef = useRef<string | null>(null)
   useEffect(() => {
-    if (numPages <= 0 || didInitialScrollRef.current) return
-    didInitialScrollRef.current = true
+    if (numPages <= 0) return
+    const signature = `${docId}|${firstHitPage.current}|${targetPage}`
+    if (lastScrollSignatureRef.current === signature) return
+    lastScrollSignatureRef.current = signature
     const target = firstHitPage.current !== null
-      ? firstHitPage.current + 1  // 1-based 显示；page=0 显示在第 0 行
+      ? firstHitPage.current + 1  // 0-based → 1-based 显示
       : targetPage
     const idx = Math.min(Math.max(target - 1, 0), numPages - 1)
     requestAnimationFrame(() => virtuosoRef.current?.scrollToIndex(idx))
-  }, [numPages, targetPage])
+  }, [docId, numPages, targetPage, layout.data, highlight])
 
   // 绘制层：某页渲染完成时画归一化命中（内联 fillStyle+fillRect，与上文
   // 匹配完成时绘制共用同一绘制入口；真正需要被单测的是 layoutMatch 模块）。
