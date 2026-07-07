@@ -61,6 +61,8 @@ class IssueResponse(BaseModel):
     standard_page_number: int | None = None
     standard_chunk_text: str | None = None
     standard_file_type: str | None = None
+    # V8 正向高亮坐标：与 issue.standard_reference.block_range 同值；旧 issue 为 None
+    standard_block_range: Optional[tuple[int, int]] = None
 
 
 class ResultResponse(BaseModel):
@@ -168,6 +170,7 @@ def get_audit_result(task_id: str):
             standard_page_number=std_ref.page_number if std_ref else None,
             standard_chunk_text=std_ref.chunk_text if std_ref else None,
             standard_file_type=file_type,
+            standard_block_range=std_ref.block_range if std_ref else None,
         ))
 
     return ResultResponse(

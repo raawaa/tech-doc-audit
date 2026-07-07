@@ -25,6 +25,8 @@ class StandardRef(BaseModel):
     doc_id: Optional[str] = None          # KB 文档 ID，定位文件
     page_number: Optional[int] = None     # 条款所在页码 (1-based)
     chunk_text: Optional[str] = None      # chunk 原文片段，用于 PDF 高亮搜索
+    # V8 正向高亮坐标：chunk 覆盖的 KB layout block 区间 (start, end)，None 表示未填充
+    block_range: Optional[tuple[int, int]] = None
 
 
 class ExtractedStandard(BaseModel):

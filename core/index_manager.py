@@ -243,6 +243,33 @@ def _inject_page_number(nodes: list, by_page) -> None:
         node.metadata["page_number"] = page_num
 
 
+def _inject_block_range(nodes: list, by_page) -> list:
+    """[V8-S1 占位] 把 chunk 覆盖的 KB layout block 区间写进 ``node.metadata["block_range"]``。
+
+    V8 后续 slice (S2/S3) 会在这里实现：归一化 (NFKC + casefold + 去空白) chunk 文本，
+    在该页 ``by_page[i].blocks`` (按 ``block_order`` 排序) 里反查，区间 ``(start, end)`` 写入
+    ``node.metadata["block_range"] = tuple[int, int]``。跨页 chunk 仅记录起始页。
+
+    本 slice (S1) 是 **no-op**：原地把 ``metadata["block_range"]`` 全部置 ``None``，
+    保证：
+      - 旧 KB / 旧 audit 结果不受影响（``None`` 走字符串匹配 fallback）
+      - ``StandardRef.block_range`` / ``IssueResponse.standard_block_range`` schema
+        在仓库里占位，后续 slice 只填实现，不必跨文件改类型签名
+      - ``_rebuild_from_vectors`` 也无需本函数：它从 ``_nodes.json`` 加载已落盘的
+        metadata（含 ``block_range``），无需在重建时再注入
+
+    Contract:
+      - 输入：已经 ``_inject_page_number`` 过的 nodes；``by_page`` 与 ``_inject_page_number`` 同构。
+      - 输出：原 nodes（原地修改 metadata），便于调用方 ``nodes = _inject_block_range(...)`` 链式接住。
+      - 非 PDF KB / OCR 重排 / 找不到任何命中 → 写 ``None``，不抛、不阻塞索引。
+    """
+    if not nodes:
+        return nodes
+    for node in nodes:
+        node.metadata["block_range"] = None
+    return nodes
+
+
 def index_document(kb_id: str, doc_id: str, text: str, source_name: str = "",
                    by_page=None):
     """对文档文本分块 → embedding → 写入 KB 索引 + 持久化向量（V6 单一入口）。
@@ -277,6 +304,8 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = "",
         _enrich_chunk_metadata(all_nodes, doc_id, source_name or doc_id)
         # 事后注入页号
         _inject_page_number(all_nodes, by_page)
+        # V8-S1: 预留 block_range 调用点（当前 no-op，所有 chunk.block_range = None）
+        all_nodes = _inject_block_range(all_nodes, by_page)
         del doc
 
         if not all_nodes:
@@ -383,6 +412,8 @@ def index_documents_batch(
             _enrich_chunk_metadata(all_nodes, doc_id, source_name or doc_id)
             # 事后注入页号（接受页级粒度退化，None 不阻塞）
             _inject_page_number(all_nodes, by_page)
+            # V8-S1: 预留 block_range 调用点（当前 no-op，所有 chunk.block_range = None）
+            all_nodes = _inject_block_range(all_nodes, by_page)
             del doc
 
             if not all_nodes:
