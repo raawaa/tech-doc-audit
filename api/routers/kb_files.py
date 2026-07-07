@@ -132,17 +132,33 @@ def get_document_layout(doc_id: str):
     if not raw_layout:
         raise HTTPException(status_code=404, detail="该文档无 OCR layout 数据（仅按页文本）")
 
-    # 仅保留非空 layout 页 + 非空 blocks 段（与前端契约对齐：has_layout=True 即至少有 1 个 block）
+    # 仅保留非空 layout 页 + 非空 blocks 段（与前端契约对齐：has_layout=True 即至少有 1 个 block）。
+    # 按文档化的契约字段白名单输出，避免把 pages 文件里多余的字段透传给前端
+    # （将来 pages 文件加新字段时不会意外破坏前端契约）。
+    # 仅保留非空 layout 页 + 非空 blocks 段（has_layout=True 即至少有 1 个 block）。
+    # 同时按文档化的契约字段白名单输出 blocks（block_label / block_content /
+    # bbox_norm / polygon_norm / block_order），避免把 pages 文件里多余的字段
+    # 透传给前端。
     cleaned = []
     for page in raw_layout:
-        blocks = page.get("blocks") or []
-        if not blocks:
+        raw_blocks = page.get("blocks") or []
+        if not raw_blocks:
             continue
+        cleaned_blocks = [
+            {
+                "block_label": b.get("block_label", ""),
+                "block_content": b.get("block_content", ""),
+                "bbox_norm": b.get("bbox_norm", []),
+                "polygon_norm": b.get("polygon_norm", []),
+                "block_order": b.get("block_order", 0),
+            }
+            for b in raw_blocks
+        ]
         cleaned.append({
             "page": page.get("page", 0),
             "width": page.get("width", 0),
             "height": page.get("height", 0),
-            "blocks": blocks,
+            "blocks": cleaned_blocks,
         })
 
     if not cleaned:
@@ -150,6 +166,7 @@ def get_document_layout(doc_id: str):
 
     return {"layout": cleaned, "has_layout": True}
 
+@router.get("/{doc_id}/page/{page_number}")
 def get_page_text(doc_id: str, page_number: int):
     """获取文档指定页码的文本内容（V6：从 pages/{doc_id}.json 读取）。
 

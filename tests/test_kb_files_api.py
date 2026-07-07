@@ -185,3 +185,37 @@ def test_layout_drops_pages_with_no_blocks(tmp_path):
     body = r.json()
     assert len(body["layout"]) == 1
     assert body["layout"][0]["page"] == 1
+
+
+def test_layout_strips_unexpected_block_fields(tmp_path):
+    """block 字段应当白名单输出，pages 文件里多余的字段不能透传给前端。"""
+    doc_id, kb_id = _create_doc(tmp_path)
+    pages_store.save_pages(
+        kb_id=kb_id, doc_id=doc_id,
+        parse_result={
+            "by_page": [{"page": 0, "text": "p0"}],
+            "full_text": "p0",
+            "layout": [{
+                "page": 0, "width": 100, "height": 100,
+                "blocks": [{
+                    "block_label": "text",
+                    "block_content": "x",
+                    "bbox_norm": [0, 0, 1, 1],
+                    "polygon_norm": [],
+                    "block_order": 0,
+                    "extra_field": "should not leak",
+                    "scores": [0.9, 0.1],
+                }],
+            }],
+        },
+        file_hash="h", model_version="m", parsed_at="2026-07-06T00:00:00Z",
+    )
+    r = client.get(f"/api/v1/kb-documents/{doc_id}/layout")
+    assert r.status_code == 200
+    b = r.json()["layout"][0]["blocks"][0]
+    assert set(b.keys()) == {
+        "block_label", "block_content", "bbox_norm",
+        "polygon_norm", "block_order",
+    }
+    assert "extra_field" not in b
+    assert "scores" not in b
