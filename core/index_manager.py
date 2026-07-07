@@ -26,7 +26,8 @@ from llama_index.core.schema import TextNode
 from llama_index.vector_stores.faiss import FaissVectorStore
 
 from core.settings import get_embed_model, get_gpu_inference_lock
-from core.parse_document import PageText
+from core.parse_document import PageText, PageLayout
+from core.text_norm import lcs_len, norm
 
 
 DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
@@ -243,43 +244,157 @@ def _inject_page_number(nodes: list, by_page) -> None:
         node.metadata["page_number"] = page_num
 
 
-def _inject_block_range(nodes: list, by_page) -> list:
-    """[V8-S1 占位] 把 chunk 覆盖的 KB layout block 区间写进 ``node.metadata["block_range"]``。
+# 不参与 LCS 兜底的最小串长（少于 4 字符噪声比太高且短到无意义）。
+# 与 frontend/src/lib/layoutMatch.ts:MIN_LCS_LEN 对齐。
+_MIN_LCS_LEN = 4
+# LCS ratio 阈值：归一化后命中长度 / min(a, b) >= 此值才算命中。
+_LCS_RATIO_THRESHOLD = 0.85
 
-    V8 后续 slice (S2/S3) 会在这里实现：归一化 (NFKC + casefold + 去空白) chunk 文本，
-    在该页 ``by_page[i].blocks`` (按 ``block_order`` 排序) 里反查，区间 ``(start, end)`` 写入
-    ``node.metadata["block_range"] = tuple[int, int]``。跨页 chunk 仅记录起始页。
 
-    本 slice (S1) 是 **no-op**：原地把 ``metadata["block_range"]`` 全部置 ``None``，
-    保证：
-      - 旧 KB / 旧 audit 结果不受影响（``None`` 走字符串匹配 fallback）
-      - ``StandardRef.block_range`` / ``IssueResponse.standard_block_range`` schema
-        在仓库里占位，后续 slice 只填实现，不必跨文件改类型签名
-      - ``_rebuild_from_vectors`` 也无需本函数：它从 ``_nodes.json`` 加载已落盘的
-        metadata（含 ``block_range``），无需在重建时再注入
+def _block_matches_chunk(chunk_text_norm: str, block_content_norm: str) -> bool:
+    """判断归一化后的 block_content 是否与归一化后的 chunk_text 命中。
+
+    与 ``frontend/src/lib/layoutMatch.ts:matchHighlightToBlocks`` 的 T1/P2 规则
+    对齐——保证 KB 索引阶段写出的 block_range 与前端 fallback 字符串匹配
+    的高亮位置一致,不会因为后端阈值更严/更松导致两侧漂移。
+
+    T1:双向 includes(block 是 chunk 子串也算——OCR 把同一段拆到多个 block
+        时也能找到所有子块)。
+    P2:短串 < MIN_LCS_LEN 时不跑 LCS,直接 false(短串噪声比太高)。
+    """
+    if not chunk_text_norm or not block_content_norm:
+        return False
+    # T1:双向 includes
+    if chunk_text_norm in block_content_norm or block_content_norm in chunk_text_norm:
+        return True
+    # P2:LCS 兜底
+    short_len = min(len(chunk_text_norm), len(block_content_norm))
+    if short_len < _MIN_LCS_LEN:
+        return False
+    if len(block_content_norm) <= len(chunk_text_norm):
+        ratio = lcs_len(block_content_norm, chunk_text_norm) / short_len
+    else:
+        ratio = lcs_len(chunk_text_norm, block_content_norm) / short_len
+    return ratio >= _LCS_RATIO_THRESHOLD
+
+
+def _find_chunk_block_range(
+    chunk_text: str,
+    page_blocks: list,
+) -> tuple[int, int] | None:
+    """在单页 layout blocks 中找 chunk 覆盖的 (start_block_order, end_block_order) 区间。
+
+    按 block_order 升序遍历,记录所有命中 block 的 block_order;
+    至少一个命中才返回闭区间 ``(min, max)``,全无命中返回 ``None``。
+    跨 block 的 chunk(OCR 拆散场景)→ 区间 ``(min, max)``,``max > min``。
+    """
+    if not chunk_text or not page_blocks:
+        return None
+    chunk_norm = norm(chunk_text)
+    if not chunk_norm:
+        return None
+
+    sorted_blocks = sorted(page_blocks, key=lambda b: getattr(b, "block_order", 0) or 0)
+    matched_orders: list[int] = []
+    for b in sorted_blocks:
+        block_content = getattr(b, "block_content", "") or ""
+        if _block_matches_chunk(chunk_norm, norm(block_content)):
+            order = getattr(b, "block_order", 0) or 0
+            matched_orders.append(int(order))
+    if not matched_orders:
+        return None
+    return (min(matched_orders), max(matched_orders))
+
+
+def _inject_block_range(nodes: list, by_page=None, by_layout=None) -> list:
+    """[V8-S2] 把 chunk 覆盖的 KB layout block 区间写进 ``node.metadata["block_range"]``。
 
     Contract:
-      - 输入：已经 ``_inject_page_number`` 过的 nodes；``by_page`` 与 ``_inject_page_number`` 同构。
-      - 输出：原 nodes（原地修改 metadata），便于调用方 ``nodes = _inject_block_range(...)`` 链式接住。
-      - 非 PDF KB / OCR 重排 / 找不到任何命中 → 写 ``None``，不抛、不阻塞索引。
+      - 输入:已经 ``_inject_page_number`` 过的 nodes(node.metadata["page_number"]
+        已是 0-based 页号)。
+      - by_page:``list[PageText]``,与 ``_inject_page_number`` 同构(预留接口、
+        当前未使用——分块落点已在 ``page_number`` 字段)。
+      - by_layout:``list[PageLayout]`` 或 ``list[dict]``(0-based 与 by_page 平行)。
+        旧 API 残留 dict 形式由本函数内自动归一为 PageLayout。
+        ``None`` 或缺失页 → chunk.block_range = None(非 PDF KB / 旧 KB / 异常
+        layout 走 fallback)。
+      - 输出:原 nodes(原地修改 metadata),便于调用方链式接住。
+      - 找不到任何命中(罕见,OCR 重排/字符差异大)→ 写 ``None``,不抛、不阻塞索引。
+      - 跨页 chunk:仅记录起始页的 block 区间(与 ``page_number`` 同语义,MVP 限制)。
+
+    匹配规则与 ``frontend/src/lib/layoutMatch.ts:matchHighlightToBlocks`` 对齐:
+    NFKC + casefold + 去空白 + 去中英标点 → T1 双向 includes → P2 LCS 兜底
+    (短串 < 4 字符不跑 LCS)。这保证:
+      - KB 索引阶段写出的 block_range 区间在前端 fallback 字符串匹配下也能
+        命中(语义一致)。
+      - 反向:前端 fallback 路径不再误匹配相邻段落,因为后端算法已经过滤了
+        弱匹配。
     """
     if not nodes:
         return nodes
+    # 兼容 list[dict] / list[PageLayout] 混合
+    normalized_layout = _normalize_layout(by_layout) if by_layout is not None else None
     for node in nodes:
-        node.metadata["block_range"] = None
+        if normalized_layout is None:
+            node.metadata["block_range"] = None
+            continue
+        page_number = node.metadata.get("page_number")
+        if page_number is None or page_number < 0 or page_number >= len(normalized_layout):
+            node.metadata["block_range"] = None
+            continue
+        page_layout = normalized_layout[page_number]
+        page_blocks = getattr(page_layout, "blocks", None) or []
+        chunk_text = node.text or ""
+        result = _find_chunk_block_range(chunk_text, page_blocks)
+        node.metadata["block_range"] = result
     return nodes
 
 
+def _normalize_layout(by_layout) -> list | None:
+    """``list[PageLayout]`` / ``list[dict]`` / ``None`` → ``list[PageLayout] | None``。
+
+    旧 API 残留:tests / 序列化路径可能传 ``list[dict]``。归一后下游只读
+    ``PageLayout.blocks`` / ``PageLayout.page`` 属性,不再做类型判断。
+    """
+    if by_layout is None:
+        return None
+    if not by_layout:
+        return []
+    if not isinstance(by_layout[0], PageLayout):
+        from core.parse_document import Block as _Block
+        normalized = []
+        for p in by_layout:
+            if isinstance(p, dict):
+                blocks_raw = p.get("blocks") or []
+                blocks = [_Block(**b) if isinstance(b, dict) else b for b in blocks_raw]
+                normalized.append(PageLayout(
+                    page=p.get("page", 0),
+                    width=p.get("width", 0),
+                    height=p.get("height", 0),
+                    blocks=blocks,
+                ))
+            else:
+                normalized.append(p)
+        return normalized
+    return list(by_layout)
+
+
 def index_document(kb_id: str, doc_id: str, text: str, source_name: str = "",
-                   by_page=None):
+                   by_page=None, by_layout=None):
     """对文档文本分块 → embedding → 写入 KB 索引 + 持久化向量（V6 单一入口）。
 
     V4（PRD #29）chunking 与页码解耦：整篇 ``text`` 走一套分块器
     （MarkdownNodeParser / SentenceSplitter），事后 ``_inject_page_number`` 把页号
     写回 ``node.metadata["page_number"]``，跨页章节不被腰斩。
 
+    V8-S2 增 ``by_layout``：把每个 chunk 归一化后与该页 OCR layout blocks 匹配，
+    把覆盖区间 ``(start_block_order, end_block_order)`` 写入
+    ``node.metadata["block_range"]``。``None`` → block_range = None 走 fallback。
+
     Args:
         by_page: ``ParseResult.by_page`` 同构（list[PageText|str]）。
+        by_layout: ``ParseResult.layout`` 同构（list[PageLayout]）。``None`` → 跳过
+            block_range 注入（旧 KB / 非 PDF 走 fallback 高亮）。
     """
     if not text or len(text) < 20:
         return
@@ -287,6 +402,8 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = "",
     # 兼容 list[str]：旧 API 残留，pages_store / reparse 全部传 PageText 实例
     if by_page and not isinstance(by_page[0], PageText):
         by_page = [PageText(page=i, text=t) for i, t in enumerate(by_page)]
+    # 兼容 list[dict]: 旧 API 残留的 layout dict 形式由 _inject_block_range 内
+    # _normalize_layout 统一归一
     with _get_index_lock(kb_id):
         embed_model = get_embed_model()
         if embed_model is None:
@@ -304,8 +421,8 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = "",
         _enrich_chunk_metadata(all_nodes, doc_id, source_name or doc_id)
         # 事后注入页号
         _inject_page_number(all_nodes, by_page)
-        # V8-S1: 预留 block_range 调用点（当前 no-op，所有 chunk.block_range = None）
-        all_nodes = _inject_block_range(all_nodes, by_page)
+        # V8-S2: 注入 chunk 覆盖的 layout block 区间（无 by_layout → 全 None,走 fallback）
+        all_nodes = _inject_block_range(all_nodes, by_page, by_layout)
         del doc
 
         if not all_nodes:
@@ -364,7 +481,7 @@ def _enrich_chunk_metadata(
 
 def index_documents_batch(
     kb_id: str,
-    docs: list,  # [(doc_id, text, source_name, by_page?)] — 兼容 3/4 元组
+    docs: list,  # [(doc_id, text, source_name, by_page?, by_layout?)] — 兼容 3/4/5 元组
     progress_callback=None,
 ):
     """批量索引文档：分块 → 批量 embedding → 保存向量 → 写入 FAISS。
@@ -375,11 +492,17 @@ def index_documents_batch(
     V4（PRD #29）跨页章节不再被腰斩：整篇 ``text`` 走一套分块器，
     事后 ``_inject_page_number`` 把页号写回 node.metadata。
 
+    V8-S2 增 ``by_layout``：每篇 doc 携带自身 layout 数据（与 by_page 平行）；
+    ``_inject_block_range`` 用其写入 chunk 覆盖的 block_range。
+
     Args:
         kb_id: 知识库 ID。
-        docs: [(doc_id, text, source_name), ...] 或
-              [(doc_id, text, source_name, by_page), ...] 列表。
+        docs: 3/4/5 元组列表:
+              (doc_id, text, source_name) 或
+              (doc_id, text, source_name, by_page) 或
+              (doc_id, text, source_name, by_page, by_layout)。
               by_page 是 ``ParseResult.by_page`` 同构（list[PageText]）。
+              by_layout 是 ``ParseResult.layout`` 同构（list[PageLayout]）。
         progress_callback: 可选回调 (current, total, doc_name) → None。
     """
     with _get_index_lock(kb_id):
@@ -393,9 +516,12 @@ def index_documents_batch(
         for idx, item in enumerate(docs, 1):
             doc_id, text, source_name = item[0], item[1], item[2]
             by_page = item[3] if len(item) > 3 else None
+            by_layout = item[4] if len(item) > 4 else None
             # 兼容 list[str]：旧 API 残留
             if by_page and not isinstance(by_page[0], PageText):
                 by_page = [PageText(page=i, text=t) for i, t in enumerate(by_page)]
+            # 兼容 list[dict]: 旧 API 残留的 layout dict 形式由 _inject_block_range 内
+            # _normalize_layout 统一归一
             if progress_callback:
                 progress_callback(idx, total, source_name or doc_id)
 
@@ -412,8 +538,8 @@ def index_documents_batch(
             _enrich_chunk_metadata(all_nodes, doc_id, source_name or doc_id)
             # 事后注入页号（接受页级粒度退化，None 不阻塞）
             _inject_page_number(all_nodes, by_page)
-            # V8-S1: 预留 block_range 调用点（当前 no-op，所有 chunk.block_range = None）
-            all_nodes = _inject_block_range(all_nodes, by_page)
+            # V8-S2: 注入 chunk 覆盖的 layout block 区间（无 by_layout → 全 None）
+            all_nodes = _inject_block_range(all_nodes, by_page, by_layout)
             del doc
 
             if not all_nodes:
@@ -668,6 +794,7 @@ def rebuild_kb_index(kb_id: str, progress_callback=None):
                                 index_document(
                                     kb_id, doc_id, text,
                                     by_page=parse_result.by_page,
+                                    by_layout=parse_result.layout,
                                 )
                         except Exception as e:
                             _logger.warning("  [skip] %s: %s", doc_id, e)
@@ -785,6 +912,10 @@ def search(kb_ids: list[str], query: str, top_k: int = 5, use_reranker: bool = T
             "section_path": meta.get("section_path", ""),
             "clause_number": meta.get("clause_number", ""),
             "page_number": meta.get("page_number"),  # int or None, 0-based
+            # V8-S3: 从 node.metadata 透传 block_range;None/缺失 → 字段仍暴露(None),
+            # 调用方按字段是否存在决定显示——_tool_flag_issue / standard_linker /
+            # IssueResponse 都按"非 None 才使用"消费。
+            "block_range": meta.get("block_range"),
             "relevance": round(node.get_score() or 0, 4),
         })
 

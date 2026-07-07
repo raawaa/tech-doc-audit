@@ -692,3 +692,382 @@ def test_index_document_does_not_impose_per_page_cuts(seed_searchable_kb):
         f"5.2 跨页 chunk 的 page_number 应==1，"
         f"实际 metadata={target.metadata}"
     )
+
+
+# ── V8-S2: _inject_block_range 单元测试 ──────────────────────────────────────────
+
+
+def _make_block(block_content: str, block_order: int, page: int = 0):
+    """构造测试用 layout Block,只填 _inject_block_range 实际读的几个字段。"""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        block_content=block_content,
+        block_order=block_order,
+        page=page,
+        bbox_norm=[],
+        block_label="text",
+    )
+
+
+def _make_layout(*pages_blocks):
+    """构造测试用 by_layout:``pages_blocks[i]`` 是第 i 页的 block 列表。"""
+    from types import SimpleNamespace
+    return [
+        SimpleNamespace(page=i, blocks=list(blocks), width=0, height=0)
+        for i, blocks in enumerate(pages_blocks)
+    ]
+
+
+def _make_chunk_node(text: str, page_number: int | None):
+    """构造测试用 chunk node。"""
+    from types import SimpleNamespace
+    n = SimpleNamespace(text=text, metadata={"page_number": page_number})
+    return n
+
+
+def test_inject_block_range_no_layout_all_none():
+    """by_layout=None → 所有 chunk.block_range = None(走 fallback 高亮)。"""
+    from core.index_manager import _inject_block_range
+
+    nodes = [
+        _make_chunk_node("文本 A", 0),
+        _make_chunk_node("文本 B", 1),
+    ]
+    _inject_block_range(nodes, by_page=None, by_layout=None)
+    assert nodes[0].metadata["block_range"] is None
+    assert nodes[1].metadata["block_range"] is None
+
+
+def test_inject_block_range_empty_nodes_noop():
+    """空 nodes → 不抛。"""
+    from core.index_manager import _inject_block_range
+
+    # 不应抛
+    _inject_block_range([], by_page=None, by_layout=[])
+    assert _inject_block_range(None or [], by_page=None, by_layout=[]) == []
+
+
+def test_inject_block_range_single_block_match():
+    """单 block chunk:覆盖 1 个 block → block_range = (n, n)。"""
+    from core.index_manager import _inject_block_range
+
+    by_layout = _make_layout([
+        _make_block("公司各应急保障单位应当配置", 5),
+        _make_block("无关内容", 6),
+    ])
+    nodes = [_make_chunk_node("公司各应急保障单位应当配置", 0)]
+    _inject_block_range(nodes, by_layout=by_layout)
+
+    assert nodes[0].metadata["block_range"] == (5, 5)
+
+
+def test_inject_block_range_multi_block_range():
+    """OCR 把 chunk 拆散到多个 block → block_range = (min, max),max > min。"""
+    from core.index_manager import _inject_block_range
+
+    by_layout = _make_layout([
+        _make_block("无关内容", 0),
+        _make_block("公司各应急", 1),
+        _make_block("保障单位应当", 2),
+        _make_block("配置无线对讲", 3),
+        _make_block("设备至少两套", 4),
+        _make_block("其它", 5),
+    ])
+    nodes = [
+        _make_chunk_node("公司各应急保障单位应当配置无线对讲设备至少两套", 0),
+    ]
+    _inject_block_range(nodes, by_layout=by_layout)
+    # 5 个 block 全命中,区间 (1, 4)——1-based 不动,关键在包含
+    assert nodes[0].metadata["block_range"] == (1, 4)
+
+
+def test_inject_block_range_picks_block_by_order():
+    """block 乱序时按 block_order 升序扫描,命中区间正确。"""
+    from core.index_manager import _inject_block_range
+
+    # 故意把 block 乱序传入
+    by_layout = _make_layout([
+        _make_block("无关", 0),
+        _make_block("配置至少两套", 7),
+        _make_block("公司各应急", 3),
+        _make_block("保障单位", 5),
+    ])
+    nodes = [
+        _make_chunk_node("公司各应急保障单位配置至少两套", 0),
+    ]
+    _inject_block_range(nodes, by_layout=by_layout)
+    # 3 个 block 命中,排序后 order 是 3, 5, 7 → 区间 (3, 7)
+    assert nodes[0].metadata["block_range"] == (3, 7)
+
+
+def test_inject_block_range_no_match_yields_none():
+    """找不到任何命中 → block_range = None,不阻塞。"""
+    from core.index_manager import _inject_block_range
+
+    by_layout = _make_layout([
+        _make_block("完全无关的 PDF 内容", 0),
+    ])
+    nodes = [
+        _make_chunk_node("公司各应急保障单位应当配置无线对讲机", 0),
+    ]
+    _inject_block_range(nodes, by_layout=by_layout)
+    assert nodes[0].metadata["block_range"] is None
+
+
+def test_inject_block_range_page_out_of_range_yields_none():
+    """page_number 越界 → None(不抛)。"""
+    from core.index_manager import _inject_block_range
+
+    by_layout = _make_layout([_make_block("内容", 0)])
+    nodes = [_make_chunk_node("内容", 99)]  # 越界
+    _inject_block_range(nodes, by_layout=by_layout)
+    assert nodes[0].metadata["block_range"] is None
+
+
+def test_inject_block_range_no_page_number_yields_none():
+    """page_number = None → None(由 _inject_page_number 已写过,这里读出来兜底)。"""
+    from core.index_manager import _inject_block_range
+
+    by_layout = _make_layout([_make_block("内容", 0)])
+    nodes = [_make_chunk_node("内容", None)]
+    _inject_block_range(nodes, by_layout=by_layout)
+    assert nodes[0].metadata["block_range"] is None
+
+
+def test_inject_block_range_picks_correct_page():
+    """chunk 在第 2 页,只在该页 blocks 里找,不在第 1 页找。"""
+    from core.index_manager import _inject_block_range
+
+    by_layout = _make_layout(
+        # 第 0 页有"公司各应急保障"——与第 1 页 chunk 无关,不能误匹配
+        [_make_block("第一页内容 公司各应急保障", 0)],
+        # 第 1 页有"第二章要求"——chunk 落点
+        [_make_block("第二章要求的内容", 1)],
+    )
+    nodes = [
+        _make_chunk_node("第二章要求的内容", 1),  # chunk 落在第 1 页
+    ]
+    _inject_block_range(nodes, by_layout=by_layout)
+    assert nodes[0].metadata["block_range"] == (1, 1), (
+        f"应只匹配第 1 页的 block(1,1),实际 {nodes[0].metadata.get('block_range')}"
+    )
+
+
+def test_inject_block_range_punctuation_normalized():
+    """标点差异经归一化后命中(NFKC + 去标点)。"""
+    from core.index_manager import _inject_block_range
+
+    by_layout = _make_layout([
+        _make_block("公司各应急保障单位。应当配置——800兆对讲机", 0),
+    ])
+    nodes = [
+        # chunk 标点格式不同,但归一化后应一致
+        _make_chunk_node("公司各应急保障单位应当配置800兆对讲机", 0),
+    ]
+    _inject_block_range(nodes, by_layout=by_layout)
+    assert nodes[0].metadata["block_range"] == (0, 0)
+
+
+def test_inject_block_range_fullwidth_normalized():
+    """全角字符经 NFKC 归一化后命中(对齐 layoutMatch.norm 的 NFKC 契约)。"""
+    from core.index_manager import _inject_block_range
+
+    by_layout = _make_layout([
+        _make_block("800兆对讲机", 0),
+    ])
+    # chunk 用了全角 ８
+    nodes = [
+        _make_chunk_node("８00兆对讲机", 0),
+    ]
+    _inject_block_range(nodes, by_layout=by_layout)
+    assert nodes[0].metadata["block_range"] == (0, 0)
+
+
+def test_inject_block_range_ocr_typo_lcs_fallback():
+    """OCR 单字错但 chunk 够长 → LCS 兜底命中。"""
+    from core.index_manager import _inject_block_range
+
+    long_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
+    by_layout = _make_layout([
+        _make_block(long_text, 0),
+    ])
+    # chunk 单字错(讲 → 话),14 字符差异 1 → ratio = 13/14 = 0.928 >= 0.85
+    typo = "公司各应急保障单位应当配置无线对话设备至少两套"
+    nodes = [_make_chunk_node(typo, 0)]
+    _inject_block_range(nodes, by_layout=by_layout)
+    assert nodes[0].metadata["block_range"] == (0, 0)
+
+
+def test_inject_block_range_short_string_no_lcs():
+    """短串(< 4 字符)includes miss 时不跑 LCS,直接 None。"""
+    from core.index_manager import _inject_block_range
+
+    by_layout = _make_layout([
+        _make_block("wxyz", 0),
+    ])
+    # 3 字符 < MIN_LCS_LEN,includes miss → 不命中
+    nodes = [_make_chunk_node("abc", 0)]
+    _inject_block_range(nodes, by_layout=by_layout)
+    assert nodes[0].metadata["block_range"] is None
+
+
+def test_inject_block_range_empty_page_blocks():
+    """该页没有 layout blocks(layout 退化)→ chunk.block_range = None。"""
+    from core.index_manager import _inject_block_range
+
+    by_layout = _make_layout([])  # 第 0 页 blocks=[]
+    nodes = [_make_chunk_node("任何内容", 0)]
+    _inject_block_range(nodes, by_layout=by_layout)
+    assert nodes[0].metadata["block_range"] is None
+
+
+def test_inject_block_range_layout_dict_input_compat():
+    """by_layout 传 list[dict] 时也能工作(旧 API 残留兼容)。"""
+    from core.index_manager import _inject_block_range
+
+    layout_dicts = [
+        {"page": 0, "blocks": [{"block_content": "公司各应急保障", "block_order": 0}], "width": 0, "height": 0},
+    ]
+    nodes = [_make_chunk_node("公司各应急保障单位", 0)]
+    _inject_block_range(nodes, by_layout=layout_dicts)
+    assert nodes[0].metadata["block_range"] == (0, 0)
+
+
+# ── V8-S2: 端到端 index_document 集成测试 ──────────────────────────────────────
+
+
+def test_index_document_writes_block_range_for_pdf_layout(seed_searchable_kb, fake_models):
+    """index_document 拿到 by_layout 后,chunks 的 node.metadata["block_range"] 写入非空。
+
+    这是 V8-S2 的核心不变量:不再 no-op,真实产出 block_range。
+    """
+    from core.index_manager import get_kb_index
+    from core.parse_document import PageLayout, PageText
+
+    kb_id = seed_searchable_kb("test_kb_block_range")
+
+    full_text = "公司各应急保障单位应当配置无线对讲设备至少两套。"
+    # by_page 与 chunk prefix 必须有公共子串(让 _inject_page_number 找到 page=0)
+    by_page = [PageText(page=0, text=full_text)]
+    # by_layout:1 页,3 个 block,与 chunk 内容对齐
+    by_layout = [PageLayout(
+        page=0, width=0, height=0,
+        blocks=[
+            _make_block("公司各应急保障单位", 0),
+            _make_block("应当配置无线对讲", 1),
+            _make_block("设备至少两套", 2),
+        ],
+    )]
+
+    index_document(
+        kb_id, "doc_br",
+        full_text,
+        source_name="br_test.txt",
+        by_page=by_page,
+        by_layout=by_layout,
+    )
+
+    # 把 KB 切回 searchable(search 默认读 kb.index_status)
+    import storage.kb_repo as _kb_repo
+    kb = _kb_repo.get(kb_id)
+    kb.index_status = "searchable"
+    _kb_repo.update(kb)
+
+    # 读 nodes,验证 block_range
+    idx = get_kb_index(kb_id)
+    nodes = list(idx.docstore.docs.values())
+    assert len(nodes) >= 1, "应至少有 1 个 chunk"
+
+    # 至少一个 chunk 的 block_range 非空(全文就是一个 chunk,匹配全部 3 个 block)
+    br_values = [n.metadata.get("block_range") for n in nodes]
+    assert any(br is not None for br in br_values), (
+        f"至少一个 chunk 应有非空 block_range,实际 {br_values}"
+    )
+    # 取第一个有 block_range 的 chunk 验证(全文 chunk 匹配 3 个 block → (0, 2))
+    full_chunk = next(n for n in nodes if n.metadata.get("block_range") is not None)
+    start, end = full_chunk.metadata["block_range"]
+    assert start == 0
+    assert end == 2
+
+
+def test_search_hit_dict_includes_block_range(seed_searchable_kb, fake_models):
+    """V8-S3: ``search()`` 返回的 hit dict 含 ``block_range`` 字段,与
+    ``node.metadata["block_range"]`` 同值——保证检索链路透传到下游消费者
+    (agent_tools / _tool_flag_issue / standard_linker)。
+    """
+    from core.parse_document import PageLayout, PageText
+
+    kb_id = seed_searchable_kb("test_kb_search_block_range")
+
+    full_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
+    by_page = [PageText(page=0, text=full_text)]
+    by_layout = [PageLayout(
+        page=0, width=0, height=0,
+        blocks=[
+            _make_block("公司各应急保障单位", 0),
+            _make_block("应当配置无线对讲", 1),
+            _make_block("设备至少两套", 2),
+        ],
+    )]
+
+    index_document(
+        kb_id, "doc_br_search",
+        full_text,
+        source_name="br_search.txt",
+        by_page=by_page, by_layout=by_layout,
+    )
+
+    # 把 KB 切回 searchable(search 默认读 kb.index_status)
+    import storage.kb_repo as _kb_repo
+    kb = _kb_repo.get(kb_id)
+    kb.index_status = "searchable"
+    _kb_repo.update(kb)
+
+    results = search([kb_id], "公司各应急", top_k=5)
+    assert len(results) >= 1
+    hit = results[0]
+    # V8-S3 契约:hit dict 显式含 block_range 字段,与 node.metadata 一致
+    assert "block_range" in hit, "hit dict 应显式含 block_range 字段"
+    assert hit["block_range"] == (0, 2), (
+        f"hit block_range 应==(0, 2),实际 {hit['block_range']}"
+    )
+
+
+def test_search_hit_dict_block_range_none_for_old_kb(seed_searchable_kb, fake_models):
+    """V8-S3:旧 KB chunk 不带 block_range(metadata 缺该键)→ hit block_range = None。
+
+    验证:不抛异常 + 字段存在且为 None,下游可正确判断走 fallback。
+    """
+    from types import SimpleNamespace
+
+    kb_id = seed_searchable_kb("test_kb_old_kb_block_range")
+
+    # 直接构造 node(模拟旧 KB metadata 不含 block_range 的场景)
+    # 通过 index_document + 直接修改 metadata 来模拟
+    index_document(
+        kb_id, "doc_old",
+        "旧知识库内容文本测试用例,验证无 block_range 时 hit 字段透传为 None。",
+        source_name="old.txt",
+    )
+
+    import storage.kb_repo as _kb_repo
+    kb = _kb_repo.get(kb_id)
+    kb.index_status = "searchable"
+    _kb_repo.update(kb)
+
+    # 直接 pop metadata["block_range"] 模拟旧 KB chunk
+    idx = get_kb_index(kb_id)
+    for doc_id in list(idx.docstore.docs.keys()):
+        try:
+            node = idx.docstore.get_document(doc_id)
+            if hasattr(node, "metadata") and "block_range" in node.metadata:
+                del node.metadata["block_range"]
+        except Exception:
+            pass
+
+    results = search([kb_id], "旧知识库内容", top_k=5)
+    assert len(results) >= 1
+    hit = results[0]
+    assert "block_range" in hit
+    assert hit["block_range"] is None
+
