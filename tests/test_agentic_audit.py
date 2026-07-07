@@ -143,6 +143,247 @@ class TestChapterExtraction:
         assert issues[0].severity == "high"
 
 
+# ── V8-S4: _lookup_chunk_block_range + _tool_flag_issue 自动补全 block_range ──
+
+
+def _make_block(block_content: str, block_order: int):
+    """V8-S4 测试用:构造 layout block SimpleNamespace。"""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        block_content=block_content,
+        block_order=block_order,
+        page=0,
+        bbox_norm=[],
+        block_label="text",
+    )
+
+
+class TestV8S4FlagIssueBlockRange:
+    """V8-S4: LLM 提交 standard_* 字段后,系统后端透明补全 block_range。
+    不改 LLM 工具 schema,失败 best-effort → block_range = None。
+    """
+
+    def test_lookup_chunk_block_range_with_valid_inputs(self, fake_models):
+        """合法 doc_id + page_number + chunk_text → 命中,返回 block_range。"""
+        from core.index_manager import index_document
+        from core.parse_document import PageLayout, PageText
+        from services.agentic_audit import _lookup_chunk_block_range
+
+        kb_id = "test_kb_v8s4_lookup"
+        import storage.kb_repo as _kb_repo
+        from models.knowledge_base import KnowledgeBase
+        kb = KnowledgeBase(id=kb_id, name="v8s4", category="national")
+        _kb_repo.update(kb)
+        kb = _kb_repo.get(kb_id)
+        kb.document_ids = ["doc_v8s4"]
+        kb.index_status = "searchable"
+        _kb_repo.update(kb)
+
+        full_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
+        index_document(
+            kb_id, "doc_v8s4",
+            full_text,
+            source_name="v8s4.txt",
+            by_page=[PageText(page=0, text=full_text)],
+            by_layout=[PageLayout(
+                page=0, width=0, height=0,
+                blocks=[
+                    _make_block("公司各应急保障单位", 0),
+                    _make_block("应当配置无线对讲", 1),
+                    _make_block("设备至少两套", 2),
+                ],
+            )],
+        )
+
+        result = _lookup_chunk_block_range(
+            standard_doc_id="doc_v8s4",
+            standard_page_number_1based=1,
+            standard_chunk_text=full_text,
+            kb_ids=[kb_id],
+        )
+        assert result == (0, 2), f"应反查到 (0, 2),实际 {result}"
+
+    def test_lookup_chunk_block_range_invalid_doc_id_returns_none(self, fake_models):
+        """虚构 doc_id → None,不抛。"""
+        from services.agentic_audit import _lookup_chunk_block_range
+
+        result = _lookup_chunk_block_range(
+            standard_doc_id="ghost_doc_id",
+            standard_page_number_1based=1,
+            standard_chunk_text="任何文本",
+            kb_ids=["test_kb_v8s4_lookup"],
+        )
+        assert result is None
+
+    def test_lookup_chunk_block_range_empty_inputs_returns_none(self):
+        """doc_id=None / chunk_text='' / kb_ids=[] → None,不抛。"""
+        from services.agentic_audit import _lookup_chunk_block_range
+
+        assert _lookup_chunk_block_range(None, 1, "text", ["kb1"]) is None
+        assert _lookup_chunk_block_range("doc1", 1, "text", []) is None
+        assert _lookup_chunk_block_range("doc1", 0, "", ["kb1"]) is None
+
+    def test_lookup_chunk_block_range_page_number_zero_no_filter(self, fake_models):
+        """page_number=0(LLM 越界)→ 不按页过滤,仍能按 doc_id + chunk_text 命中。"""
+        from core.index_manager import index_document
+        from core.parse_document import PageLayout, PageText
+        from services.agentic_audit import _lookup_chunk_block_range
+
+        kb_id = "test_kb_v8s4_p0"
+        import storage.kb_repo as _kb_repo
+        from models.knowledge_base import KnowledgeBase
+        kb = KnowledgeBase(id=kb_id, name="v8s4p0", category="national")
+        _kb_repo.update(kb)
+        kb = _kb_repo.get(kb_id)
+        kb.document_ids = ["doc_v8s4p0"]
+        kb.index_status = "searchable"
+        _kb_repo.update(kb)
+
+        full_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
+        index_document(
+            kb_id, "doc_v8s4p0",
+            full_text, source_name="p0.txt",
+            by_page=[PageText(page=0, text=full_text)],
+            by_layout=[PageLayout(
+                page=0, width=0, height=0,
+                blocks=[_make_block("公司各应急保障单位应当配置无线对讲设备至少两套", 0)],
+            )],
+        )
+
+        result = _lookup_chunk_block_range(
+            standard_doc_id="doc_v8s4p0",
+            standard_page_number_1based=0,
+            standard_chunk_text="公司各应急保障单位",
+            kb_ids=[kb_id],
+        )
+        assert result == (0, 0)
+
+    def test_lookup_chunk_block_range_chunk_text_mismatch_returns_none(self, fake_models):
+        """chunk_text 不匹配该节点 → None(LLM 幻觉/乱填)。"""
+        from core.index_manager import index_document
+        from core.parse_document import PageLayout, PageText
+        from services.agentic_audit import _lookup_chunk_block_range
+
+        kb_id = "test_kb_v8s4_mismatch"
+        import storage.kb_repo as _kb_repo
+        from models.knowledge_base import KnowledgeBase
+        kb = KnowledgeBase(id=kb_id, name="v8s4mm", category="national")
+        _kb_repo.update(kb)
+        kb = _kb_repo.get(kb_id)
+        kb.document_ids = ["doc_v8s4mm"]
+        kb.index_status = "searchable"
+        _kb_repo.update(kb)
+
+        full_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
+        index_document(
+            kb_id, "doc_v8s4mm",
+            full_text, source_name="mm.txt",
+            by_page=[PageText(page=0, text=full_text)],
+            by_layout=[PageLayout(
+                page=0, width=0, height=0,
+                blocks=[_make_block(full_text, 0)],
+            )],
+        )
+
+        result = _lookup_chunk_block_range(
+            standard_doc_id="doc_v8s4mm",
+            standard_page_number_1based=1,
+            standard_chunk_text="完全不相关的其他文本内容 ABCXYZ",
+            kb_ids=[kb_id],
+        )
+        assert result is None
+
+    def test_tool_flag_issue_fills_block_range_from_kb(self, fake_models):
+        """_tool_flag_issue: LLM 提交合法 standard_* → block_range 非空。"""
+        from core.index_manager import index_document
+        from core.parse_document import PageLayout, PageText
+        from services.agentic_audit import _tool_flag_issue
+        from models.llm_schemas import AgentAction
+
+        kb_id = "test_kb_v8s4_flag"
+        import storage.kb_repo as _kb_repo
+        from models.knowledge_base import KnowledgeBase
+        kb = KnowledgeBase(id=kb_id, name="v8s4flag", category="national")
+        _kb_repo.update(kb)
+        kb = _kb_repo.get(kb_id)
+        kb.document_ids = ["doc_flag"]
+        kb.index_status = "searchable"
+        _kb_repo.update(kb)
+
+        full_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
+        index_document(
+            kb_id, "doc_flag",
+            full_text, source_name="flag.txt",
+            by_page=[PageText(page=0, text=full_text)],
+            by_layout=[PageLayout(
+                page=0, width=0, height=0,
+                blocks=[
+                    _make_block("公司各应急保障单位", 0),
+                    _make_block("应当配置无线对讲", 1),
+                    _make_block("设备至少两套", 2),
+                ],
+            )],
+        )
+
+        issues = []
+        action = AgentAction(
+            thought="发现条款问题",
+            action="flag_issue",
+            issue_type="compliance",
+            issue_severity="high",
+            issue_description="不符合标准条款",
+            standard_name="GB/T 123",
+            standard_doc_id="doc_flag",
+            standard_page_number=1,
+            standard_chunk_text=full_text,
+        )
+        _tool_flag_issue(action, issues, kb_ids=[kb_id])
+
+        assert len(issues) == 1
+        sr = issues[0].standard_reference
+        assert sr is not None
+        assert sr.block_range == (0, 2), (
+            f"应自动补全 block_range=(0, 2),实际 {sr.block_range}"
+        )
+
+    def test_tool_flag_issue_invalid_doc_id_yields_none(self, fake_models):
+        """_tool_flag_issue: LLM 提交不存在的 doc_id → block_range = None,issue 正常落地。"""
+        from services.agentic_audit import _tool_flag_issue
+        from models.llm_schemas import AgentAction
+
+        issues = []
+        action = AgentAction(
+            thought="幻觉引用",
+            action="flag_issue",
+            issue_type="compliance",
+            issue_severity="medium",
+            issue_description="不符合标准",
+            standard_doc_id="ghost_doc_xyz",
+            standard_page_number=1,
+            standard_chunk_text="任何文本",
+        )
+        result = _tool_flag_issue(action, issues, kb_ids=["any_kb"])
+        assert "已记录" in result
+        assert len(issues) == 1
+        assert issues[0].standard_reference.block_range is None
+
+    def test_tool_flag_issue_no_standard_doc_id_yields_none(self):
+        """_tool_flag_issue: LLM 没填 standard_doc_id → 不反查,block_range = None。"""
+        from services.agentic_audit import _tool_flag_issue
+        from models.llm_schemas import AgentAction
+
+        issues = []
+        action = AgentAction(
+            thought="internal issue",
+            action="flag_issue",
+            issue_type="consistency",
+            issue_severity="low",
+            issue_description="内部矛盾",
+        )
+        _tool_flag_issue(action, issues, kb_ids=["any_kb"])
+        assert issues[0].standard_reference.block_range is None
+
+
 class TestPipelineRouting:
     """测试审核管线 — agentic 为唯一路径。"""
 

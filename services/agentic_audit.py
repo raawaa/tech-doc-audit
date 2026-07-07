@@ -24,6 +24,7 @@ from llama_index.core.llms import ChatMessage, MessageRole
 
 from core.logger import get_logger
 from core.settings import get_llm, make_deepseek_client
+from core.text_norm import lcs_len, norm
 from services.agent_tools import search_kb, search_kb_text
 from services.agent_trace import save_trace
 from core.degradation import record as _deg_record
@@ -391,8 +392,92 @@ def _format_chapter_text(text: str, index: int, label: str) -> str:
     )
 
 
-def _tool_flag_issue(action: AgentAction, issues: list[AuditIssue]) -> str:
-    """记录审核问题（含去重检查）。"""
+def _lookup_chunk_block_range(
+    standard_doc_id: str | None,
+    standard_page_number_1based: int | None,
+    standard_chunk_text: str | None,
+    kb_ids: list[str],
+) -> tuple[int, int] | None:
+    """V8-S4: 根据 LLM 提交的 ``standard_*`` 字段在 KB 索引中反查 chunk 节点,
+    拷贝它的 ``block_range`` 到 ``issue.standard_reference.block_range``。
+
+    Args:
+        standard_doc_id: LLM 工具 schema 中的标准 KB 文档 ID(可选——LLM 可能没填)。
+        standard_page_number_1based: LLM 工具 schema 中的页码(1-based)。
+            ``None`` / 0 / 负数 → 不按页过滤(LLM 漏填或越界时仍能命中)。
+        standard_chunk_text: chunk 原文片段(可能不完整,需要归一化匹配)。
+        kb_ids: 限定 KB 范围——多 KB 召回场景下避免跨 KB 误匹配。
+
+    Returns:
+        ``(start, end)`` 闭区间,或 ``None``(任何步骤失败都不抛,best-effort)。
+
+    失败语义:
+      - 索引未建立 / 加载异常 / 节点无 metadata / doc_id 不匹配
+        / page 不匹配 / chunk_text 归一化后不命中 → None。
+      - 记录 ``_logger.debug``,不阻断审核流程。
+    """
+    if not standard_doc_id or not kb_ids:
+        return None
+    target_page: int | None = None
+    if standard_page_number_1based and standard_page_number_1based > 0:
+        target_page = standard_page_number_1based - 1  # 1-based → 0-based
+    chunk_norm = norm(standard_chunk_text or "")
+
+    try:
+        from core.index_manager import get_kb_index
+        for kb_id in kb_ids:
+            try:
+                idx = get_kb_index(kb_id)
+            except Exception as e:
+                _logger.debug("_lookup_chunk_block_range: get_kb_index(%s) failed: %s", kb_id, e)
+                continue
+            try:
+                docs_dict = idx.docstore.docs
+            except Exception as e:
+                _logger.debug("_lookup_chunk_block_range: docstore access failed for kb %s: %s", kb_id, e)
+                continue
+
+            for _node_id, node in docs_dict.items():
+                meta = getattr(node, "metadata", None) or {}
+                if meta.get("doc_id") != standard_doc_id:
+                    continue
+                # page 过滤(target_page=None 时不按页过滤)
+                if target_page is not None:
+                    pn = meta.get("page_number")
+                    if pn != target_page:
+                        continue
+                br = meta.get("block_range")
+                if br is None:
+                    continue
+                # chunk_text 归一化 includes / LCS 兜底(短串跳过)
+                if chunk_norm:
+                    text_norm = norm(getattr(node, "text", "") or "")
+                    if not text_norm:
+                        continue
+                    if chunk_norm in text_norm or text_norm in chunk_norm:
+                        return tuple(br)
+                    # LCS 兜底——与前端 layoutMatch 阈值对齐
+                    short_len = min(len(chunk_norm), len(text_norm))
+                    if short_len >= 4:
+                        if len(text_norm) <= len(chunk_norm):
+                            ratio = lcs_len(text_norm, chunk_norm) / short_len
+                        else:
+                            ratio = lcs_len(chunk_norm, text_norm) / short_len
+                        if ratio >= 0.85:
+                            return tuple(br)
+                    # 否则:不匹配,继续找下一个 node
+                else:
+                    # chunk_text 为空但 page + doc_id 匹配——直接采用(LLM 可能只填了页)
+                    return tuple(br)
+    except Exception as e:
+        _logger.debug("_lookup_chunk_block_range failed for doc=%s: %s", standard_doc_id, e)
+        return None
+    return None
+
+
+def _tool_flag_issue(action: AgentAction, issues: list[AuditIssue],
+                     kb_ids: list[str] | None = None) -> str:
+    """记录审核问题（含去重检查 + V8 block_range 后端透明补全）。"""
     warnings = []
     if not action.cited_excerpt:
         warnings.append("缺少 cited_excerpt（原文引用），建议补充以增强证据力度")
@@ -440,6 +525,17 @@ def _tool_flag_issue(action: AgentAction, issues: list[AuditIssue]) -> str:
                     f"跳过本次标记。"
                 )
 
+    # V8-S4: 系统后端透明补全 block_range —— LLM 不需要看到/填写这个字段。
+    # 反查失败(best-effort) → block_range = None,走前端 fallback 字符串匹配。
+    block_range: tuple[int, int] | None = None
+    if action.standard_doc_id:
+        block_range = _lookup_chunk_block_range(
+            action.standard_doc_id,
+            action.standard_page_number,
+            action.standard_chunk_text,
+            kb_ids or [],
+        )
+
     issue = AuditIssue(
         id=len(issues) + 1,
         type=action.issue_type or "compliance",
@@ -453,6 +549,7 @@ def _tool_flag_issue(action: AgentAction, issues: list[AuditIssue]) -> str:
             doc_id=action.standard_doc_id,
             page_number=action.standard_page_number,
             chunk_text=action.standard_chunk_text,
+            block_range=block_range,
         ),
         cited_excerpt=action.cited_excerpt or "",
         document_position=action.document_position or "",
@@ -883,7 +980,9 @@ def _dispatch_tool(
             standard_page_number=tool_args.get("standard_page_number"),
             standard_chunk_text=tool_args.get("standard_chunk_text"),
         )
-        return _tool_flag_issue(action, issues)
+        # V8-S4: 把 kb_ids 透传给 _tool_flag_issue,让 block_range 反查限定在本任务
+        # 的 KB 范围(避免多 KB 召回场景下跨 KB 误匹配)。
+        return _tool_flag_issue(action, issues, kb_ids)
     return (
         f"未知工具: {tool_name}。"
         f"可用的工具有：read_chapter、search_kb、search_kb_text、flag_issue。"
