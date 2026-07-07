@@ -84,6 +84,11 @@ def search_kb(
             meta_parts.append(f"doc_id: {doc_id}")
         if page_number is not None:
             meta_parts.append(f"页码: 第{page_number + 1}页")  # 0-based → 1-based display
+        # V8-S3: 把 block_range 透传到 LLM 可见的工具输出。仅在非空时追加,
+        # 避免对旧 KB(无 block_range)的输出加噪音字段——LLM 不需要按字段思考。
+        block_range = r.get("block_range")
+        if block_range:
+            meta_parts.append(f"block_range: {tuple(block_range)}")
         meta_line = " | ".join(meta_parts)
 
         lines.append(f"\n{i}. {label}\n   {meta_line}\n   {content}")

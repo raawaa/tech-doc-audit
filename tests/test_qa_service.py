@@ -179,3 +179,23 @@ def test_sources_from_nodes_page_number_none_when_absent():
     node = _fake_node({"kb_id": "kb1", "doc_id": "doc1", "source": "某标准"})
     sources = qa_service._sources_from_nodes([node])
     assert sources[0]["page_number"] is None
+
+
+# ── V8-S3: block_range 透传到 sources ──────────────────────────────────────────
+
+
+def test_sources_from_nodes_includes_block_range():
+    """V8-S3: chunk metadata 的 block_range 应透传到 sources,供前端 PdfViewer 坐标高亮。"""
+    node = _fake_node({"kb_id": "kb1", "doc_id": "doc1", "source": "某标准",
+                       "page_number": 3, "block_range": (5, 8)})
+    sources = qa_service._sources_from_nodes([node])
+    assert len(sources) == 1
+    assert sources[0]["block_range"] == (5, 8)
+
+
+def test_sources_from_nodes_block_range_none_when_absent():
+    """V8-S3: metadata 无 block_range(旧 chunk)→ sources[block_range] = None。"""
+    node = _fake_node({"kb_id": "kb1", "doc_id": "doc1", "source": "某标准",
+                       "page_number": 3})
+    sources = qa_service._sources_from_nodes([node])
+    assert sources[0]["block_range"] is None

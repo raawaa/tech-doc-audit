@@ -86,6 +86,49 @@ def test_search_kb_failure_advice(monkeypatch):
     assert "search_kb_text" in out  # 失败建议指向兄弟工具
 
 
+# ── V8-S3: search_kb 透传 block_range 到 LLM 可见输出 ────────────────────────────
+
+
+def test_search_kb_includes_block_range_in_meta_line(monkeypatch):
+    """hit 带 block_range 时,格式化输出追加 ``block_range: (start, end)`` 行。"""
+    monkeypatch.setattr(
+        vector_search, "vec_search",
+        _vec_search_stub([_result(doc_id="doc_a", page_number=2,
+                                  block_range=(3, 7), content="条款内容X")]),
+    )
+    out = search_kb(["kb1"], "质保期")
+    assert "block_range:" in out
+    assert "(3, 7)" in out
+    # 同时页码仍正常显示
+    assert "第3页" in out  # 0-based + 1 → 1-based display
+
+
+def test_search_kb_omits_block_range_when_none(monkeypatch):
+    """hit 的 block_range = None（旧 KB chunk）时,格式化输出不加该字段。
+
+    防止对 LLM 输出加噪音——LLM 不需要按字段思考。
+    """
+    monkeypatch.setattr(
+        vector_search, "vec_search",
+        _vec_search_stub([_result(doc_id="doc_a", page_number=2,
+                                  block_range=None, content="条款内容X")]),
+    )
+    out = search_kb(["kb1"], "质保期")
+    assert "block_range:" not in out
+
+
+def test_search_kb_omits_block_range_when_absent(monkeypatch):
+    """hit 完全不带 block_range key（旧 hit dict 兼容场景）→ 输出也不加。"""
+    monkeypatch.setattr(
+        vector_search, "vec_search",
+        _vec_search_stub([{"relevance": 0.9, "doc_id": "d1",
+                           "doc_source": "GB-X", "page_number": 0,
+                           "content": "旧 hit 无 block_range"}]),
+    )
+    out = search_kb(["kb1"], "q")
+    assert "block_range:" not in out
+
+
 # ── search_kb_text（V5：实际走 pages grep，由 search_doc_by_text 实现）──────────────
 
 

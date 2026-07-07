@@ -109,6 +109,8 @@ def ask(kb_ids: list[str], question: str, top_k: int = 5) -> dict[str, Any]:
             "doc_source": n.metadata.get("source", ""),
             "content_snippet": n.node.text[:300],
             "page_number": n.metadata.get("page_number"),
+            # V8-S3: 透传 block_range 给 QA 客户端;旧 chunk(None) 字段保留但值为 None。
+            "block_range": n.metadata.get("block_range"),
             "relevance": round(n.score or 0, 4),
         }
         for n in response.source_nodes
@@ -202,6 +204,8 @@ def _sources_from_nodes(source_nodes) -> list[dict]:
             "doc_source": n.metadata.get("source", ""),
             "content_snippet": n.node.text[:300],
             "page_number": n.metadata.get("page_number"),
+            # V8-S3: 透传 block_range,与 ask() 一致
+            "block_range": n.metadata.get("block_range"),
             "relevance": round(n.score or 0, 4),
         }
         for n in source_nodes
