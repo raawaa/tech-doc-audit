@@ -90,50 +90,110 @@ test.describe('PDF viewer', () => {
 
   // ── V7.3: layout 高亮 + E1 fallback ──────────────────────────────────────
 
-  test('合法 doc + 带 highlight 参数：layout 命中 → 画布可见黄色高亮', async ({ page }) => {
-    // 该 doc 在手工验证清单里已经走过 reparse（具体 doc ID 见 PR 评论）。
-    // 该 case 主要验证 /layout API 命中 + 前端跑 matchHighlightToBlocks 路径。
-    // 高亮像素验证：ctx.fillStyle 已被设置成黄色；fillRect 在 fillStyle 之后
-    // 调用。我们注入 ctx hook 通过 evaluate 监听 fillRect 调用。
-    await page.goto(`/pdf-viewer/${PDF_DOC_ID}?page=&clause=&highlight=GB%2050016`)
-
-    // 等 PDF 渲染
-    await expect(page.getByText(/页 \/ 共 \d+ 页/)).toBeVisible({ timeout: 15_000 })
-
-    // layout fetch 是异步的。等 highlight 文本出现确认 URL 参数已读，
-    // 等待约 1s 让 layout + match + page render 链路完成。
-    await expect(page.getByText(/🔍 高亮/)).toBeVisible({ timeout: 5_000 })
-
-    // 容许 layout API 异步返回 + 浏览器绘制下一帧
-    await page.waitForTimeout(2_000)
-
-    // 简单验证：document 上任一 canvas 已绘制（getContext 调过 fillRect 后
-    // 像素非空）。同时确保 layout API 调用过了。
-    const layoutRequested = await page.evaluate(async () => {
-      try {
-        const r = await fetch('/api/v1/kb-documents/01KW10F4SD4BZG6SQFNQ42JDTH/layout')
-        return r.status
-      } catch {
-        return -1
+  test('合法 doc + 带 highlight 参数：layout 命中 → 画布可见黄色高亮（route mock）', async ({ page }) => {
+    // 通过 page.route mock 三个 API，断言 ctx.fillRect 被调用且 fillStyle 是黄色。
+    await page.route('**/api/v1/kb-documents/*/layout', route =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          has_layout: true,
+          layout: [{
+            page: 0,
+            width: 1000,
+            height: 2000,
+            blocks: [{
+              block_label: 'text',
+              block_content: 'GB 50016 是一个建筑防火设计规范',
+              bbox_norm: [0.05, 0.05, 0.95, 0.1],
+              polygon_norm: [],
+              block_order: 0,
+            }],
+          }],
+        }),
+      }),
+    )
+    await page.route('**/api/v1/kb-documents/*', route => {
+      const url = route.request().url()
+      if (/\/api\/v1\/kb-documents\/[^/]+$/.test(url)) {
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            id: 'mock', name: 'mock.pdf', original_name: 'mock.pdf',
+            file_type: 'pdf', page_count: 1, kb_id: 'mock_kb',
+          }),
+        })
       }
+      return route.continue()
     })
-    // 200 = 有 layout；404 = 还没 reparse；这取决于测试环境的状态。
-    // 这条断言核心是\"PDF viewer 在有 layout 时不崩\"，不强求一定有高亮像素。
-    expect([200, 404].includes(layoutRequested)).toBe(true)
+    // 拦截 PDF 文件请求，避免触发真实下载。
+    await page.route('**/api/v1/kb-documents/*/file', route =>
+      route.fulfill({
+        status: 200, body: '%PDF-1.4 dummy',
+        contentType: 'application/pdf',
+      }),
+    )
+    await page.goto(`/pdf-viewer/${PDF_DOC_ID}?page=1&highlight=${encodeURIComponent('GB 50016')}`)
+    // 等 /layout API 完成
+    await page.waitForResponse(r =>
+      /\/api\/v1\/kb-documents\/[^/]+\/layout/.test(r.url()),
+    )
+    // 在 evaluate 上下文中：注入 fillRect 代理，监控 fillStyle 黄色调用
+    const highlighted = await page.evaluate(() => new Promise<boolean>(resolve => {
+      let found = false
+      const observer = new MutationObserver(() => {
+        const c = document.querySelector('canvas') as HTMLCanvasElement | null
+        if (!c) return
+        const ctx = c.getContext('2d')
+        if (!ctx) return
+        const orig = ctx.fillRect.bind(ctx)
+        ctx.fillRect = (x: number, y: number, w: number, h: number) => {
+          const fill = String(ctx.fillStyle)
+          if (fill.includes('255') && fill.includes('0')) found = true
+          return orig(x, y, w, h)
+        }
+        observer.disconnect()
+      })
+      observer.observe(document.body, { childList: true, subtree: true })
+      // 兜底：2 秒后看是否 highlight 已发生
+      setTimeout(() => resolve(found), 2_000)
+    }))
+    expect(highlighted).toBe(true)
   })
 
-  test('未 reparse doc + 带 highlight：E1 fallback UI 出现', async ({ page }) => {
-    // 该 case 需要一个\"没 layout\"的 doc id。最简单的兜底：用一个不存在的 id
-    // 会触发 doc 404 而不是 E1。所以本测试假设测试 env 有一个未 reparse 的
-    // doc——这是手工验收的边界，e2e 这里用 API mock 的方式覆盖核心契约。
-    // 由于本测试需要真实数据依赖，**当测试 db 里没有合适的未 reparse doc 时**
-    // 整个 it 块会被跳过；保留作为上线 smoke test。
-    test.skip(true, '需要测试 db 里的未 reparse doc id；手工验证代替')
+  test('未 reparse doc + 带 highlight：E1 fallback UI 出现（route mock，不依赖真实 db）', async ({ page }) => {
+    // 使用 page.route 把 /layout 拦截成本地 404 模拟"未 reparse" 状态。
+    // 这样不依赖测试 db 里某个真实未 reparse doc id。
+    await page.route('**/api/v1/kb-documents/*/layout', route =>
+      route.fulfill({
+        status: 404,
+        contentType: 'application/json',
+        body: JSON.stringify({ detail: '该文档未解析' }),
+      }),
+    )
+    // /meta 也得 mock，否则 metadata fetch 会先 404 看到原始 404 页面，
+    // 影响 header 渲染。先把 /meta 设成合法 doc（与 PDF_DOC_ID 同源）
+    await page.route('**/api/v1/kb-documents/*', route => {
+      const url = route.request().url()
+      if (/\/api\/v1\/kb-documents\/[^/]+$/.test(url)) {
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            id: 'mock', name: 'mock.pdf', original_name: 'mock.pdf',
+            file_type: 'pdf', page_count: 1, kb_id: 'mock_kb',
+          }),
+        })
+      }
+      return route.continue()
+    })
+    // 取 docId from URL
     await page.goto(
-      `/pdf-viewer/01KW1QXZ5AKBGK34BDJRV1X4JZ?highlight=${encodeURIComponent('800兆对讲机')}`,
+      `/pdf-viewer/${PDF_DOC_ID}?page=1&highlight=${encodeURIComponent('800兆对讲机')}`,
     )
     // header 应显示 E1 小灰字
-    await expect(page.getByText(/该文档未解析/)).toBeVisible({ timeout: 15_000 })
+    await expect(page.getByText(/该文档未解析/)).toBeVisible({ timeout: 10_000 })
     // \"重新解析\" 按钮存在
     await expect(page.getByRole('button', { name: /重新解析/ })).toBeVisible()
   })

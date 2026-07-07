@@ -132,14 +132,11 @@ export function lcsRatio(a: string, b: string): number {
  * 画布像素矩形（顶原点）。
  *
  * 匹配优先级：
- *  1. N3 归一化后 includes（穷举 highlight 与 block_content 的双向 includes：
- *     block 是 highlight 子串也算命中——PDF 上 chunk 文本可能被 OCR 拆散）。
- *  2. LCS 兜底（仅当 ``min(norm(highlight).length, norm(block_content).length) >= 4``）。
- *
- * @param highlight URL 参数 / chunk_text 字符串。
- * @param blocks   服务端 ``/layout`` 返回的 blocks（含 bbox_norm）。
  * @param pageW    PDF 页面渲染像素宽（react-pdf <Page> 内部分辨率 = 磅 × scale）。
  * @param pageH    PDF 页面渲染像素高。
+ * @param page     该页的逻辑页号（0-based，与 PageLayout.page 对齐）。默认 0，
+ *                 调用方按页迭代时显式传入以让 HighlightRect.page 准确（PdfViewer
+ *                 把结果按 page 索引到 matchesByPage）。
  * @returns 命中 block 的画布像素矩形（多对一：可能多个 block 命中同一 highlight）。
  */
 export function matchHighlightToBlocks(
@@ -147,6 +144,7 @@ export function matchHighlightToBlocks(
   blocks: ReadonlyArray<Block>,
   pageW: number,
   pageH: number,
+  page: number = 0,
 ): HighlightRect[] {
   const normHighlight = norm(highlight)
   if (!normHighlight) return []
@@ -182,7 +180,7 @@ export function matchHighlightToBlocks(
     if (!isFinite(x) || !isFinite(y) || !isFinite(w) || !isFinite(h)) continue
     if (w <= 0 || h <= 0) continue
 
-    hits.push({ page: 0, x, y, w, h })
+    hits.push({ page, x, y, w, h })
   }
   return hits
 }
