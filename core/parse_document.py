@@ -236,6 +236,11 @@ def _paddleocr_jsonl_to_parse_result(jsonl_text: str) -> ParseResult:
     每行对应一页的 layoutParsingResults；从 ``markdown.text`` 取页面文本，
     从 ``prunedResult.parsing_res_list`` 取归一化 block 坐标。
     标题层级修复（HeadingProcessor）应用到 full_text。
+
+    V7.1 None-safety：宽高兜底 ``res.width/height`` → ``prunedResult.width/height``
+    → ``prunedResult.image_size`` → 0；任一维度缺省时产出的 block 不做坐标归一化
+    （坐标为空 list），但 block 本身仍保留（label / content / block_order 不丢）。
+    多页打包：单 JSONL 行 ``layoutParsingResults`` 按出现顺序累加 page_order。
     """
     page_texts: list[PageText] = []
     page_layouts: list[PageLayout] = []
@@ -250,15 +255,31 @@ def _paddleocr_jsonl_to_parse_result(jsonl_text: str) -> ParseResult:
         except json.JSONDecodeError:
             continue
         result = payload.get("result") or {}
-        for res in result.get("layoutParsingResults", []):
+        for res in result.get("layoutParsingResults") or []:
             md_text = (res.get("markdown", {}) or {}).get("text", "") or ""
             page_texts.append(PageText(page=page_order, text=md_text.strip()))
 
-            blocks = _extract_blocks(res.get("prunedResult") or {})
+            pruned = res.get("prunedResult") or {}
+            blocks = _extract_blocks(pruned)
+
+            # 宽高：res → prunedResult → image_size → 0
+            width_raw = res.get("width")
+            if width_raw is None:
+                width_raw = pruned.get("width")
+            height_raw = res.get("height")
+            if height_raw is None:
+                height_raw = pruned.get("height")
+            width = int(width_raw or 0)
+            height = int(height_raw or 0)
+            if not width or not height:
+                img_w, img_h = _page_dims(pruned.get("image_size"))
+                width = width or img_w
+                height = height or img_h
+
             page_layouts.append(PageLayout(
                 page=page_order,
-                width=int(res.get("width") or 0),
-                height=int(res.get("height") or 0),
+                width=width,
+                height=height,
                 blocks=blocks,
             ))
             page_order += 1
@@ -271,31 +292,62 @@ def _paddleocr_jsonl_to_parse_result(jsonl_text: str) -> ParseResult:
 
 
 def _extract_blocks(pruned: dict) -> list[Block]:
-    """``prunedResult.parsing_res_list`` → ``[Block]``，bbox / polygon 归一化到 0-1。"""
+    """``prunedResult.parsing_res_list`` → ``[Block]``，bbox / polygon 归一化到 0-1。
+
+    V7.1 None-safety：PaddleOCR 真实响应里 ``block_order`` / ``block_bbox`` /
+    ``block_polygon`` 偶尔为 ``None``；宽高可能在 ``prunedResult.width`` /
+    ``prunedResult.image_size`` 两层都缺。任意字段为 None 时降级到空坐标（block
+    仍产出，命中坐标丢失），不能崩。
+
+    宽高优先级：``prunedResult.width/height`` → ``prunedResult.image_size`` → 0。
+    （``res.width/height`` 已在 _paddleocr_jsonl_to_parse_result 合并到 prunedResult 层）
+    """
     raw_blocks = pruned.get("parsing_res_list") or []
-    page_size = pruned.get("image_size")
-    W, H = _page_dims(page_size)
+    W = int(pruned.get("width") or 0)
+    H = int(pruned.get("height") or 0)
+    if not W or not H:
+        img_w, img_h = _page_dims(pruned.get("image_size"))
+        W = W or img_w
+        H = H or img_h
 
     blocks: list[Block] = []
     for i, b in enumerate(raw_blocks):
+        # 容忍 None：缺字段时退到空字符串 / 空 list；block 仍保留（命中坐标系丢失）
         bbox = _coerce_bbox(b.get("block_bbox") or b.get("bbox"))
-        polygon = b.get("block_polygon") or b.get("polygon") or []
+        polygon_raw = (
+            b.get("block_polygon")
+            or b.get("polygon")
+            or b.get("block_polygon_points")
+            or []
+        )
+        if polygon_raw is None:
+            polygon_raw = []
 
         if W and H:
-            norm_bbox = [bbox[0] / W, bbox[1] / H, bbox[2] / W, bbox[3] / H] if len(bbox) == 4 else []
+            norm_bbox = (
+                [bbox[0] / W, bbox[1] / H, bbox[2] / W, bbox[3] / H]
+                if len(bbox) == 4 else []
+            )
             norm_polygon = [
                 [(float(p[0]) / W), (float(p[1]) / H)]
-                for p in polygon if isinstance(p, (list, tuple)) and len(p) >= 2
+                for p in polygon_raw if isinstance(p, (list, tuple)) and len(p) >= 2
             ]
         else:
             norm_bbox, norm_polygon = [], []
 
+        # block_order 缺省 / None / 非法时退回索引 i
+        order_raw = b.get("block_order", i)
+        try:
+            block_order = int(order_raw) if order_raw is not None else i
+        except (TypeError, ValueError):
+            block_order = i
+
         blocks.append(Block(
-            block_label=str(b.get("block_label", "") or b.get("label", "")),
-            block_content=str(b.get("block_content", "") or b.get("content", "")),
+            block_label=str(b.get("block_label", "") or b.get("label", "") or ""),
+            block_content=str(b.get("block_content", "") or b.get("content", "") or ""),
             bbox_norm=norm_bbox,
             polygon_norm=norm_polygon,
-            block_order=int(b.get("block_order", i)),
+            block_order=block_order,
         ))
     return blocks
 
