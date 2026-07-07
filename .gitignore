@@ -50,3 +50,7 @@ logs/
 
 # Benchmark cache
 benchmark/_cache/frontend/dist/
+
+# Tooling artifacts (committed by accident in past as untracked)
+node_modules/
+test-results/
