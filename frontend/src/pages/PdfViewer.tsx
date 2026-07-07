@@ -5,21 +5,32 @@ import { Document, Page, pdfjs } from 'react-pdf'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
-import * as pdfjsLib from 'pdfjs-dist'
-import { computePageMatches, paintHighlight, type HighlightMatch } from '../lib/highlight'
+import {
+  matchHighlightToBlocks,
+  type Block as LayoutBlock,
+  type HighlightRect,
+} from '../lib/layoutMatch'
 
 // 设置 worker — react-pdf 和 pdfjs-dist 共用同一个 worker
 const WORKER_SRC = '/pdfjs/pdf.worker.min.mjs'
 pdfjs.GlobalWorkerOptions.workerSrc = WORKER_SRC
-pdfjsLib.GlobalWorkerOptions.workerSrc = WORKER_SRC
 
 /**
- * 渲染缩放 = react-pdf <Page> 的 scale(默认 1) × devicePixelRatio。
- * react-pdf 把 canvas 内部分辨率设为 `磅 × scale × devicePixelRatio`，
- * 故高亮坐标换算需用此值（见 lib/highlight.ts）。
+ * 服务端 /layout 返回的页面 layout 一项。
+ * page 是 0-based，width / height 在这里仅用于 aspect ratio 校验（实际显示
+ * 尺寸由 react-pdf <Page> 渲染时的 canvas 决定）。
  */
-const RENDER_SCALE =
-  typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
+interface LayoutPage {
+  page: number
+  width: number
+  height: number
+  blocks: LayoutBlock[]
+}
+
+interface LayoutDoc {
+  layout: LayoutPage[]
+  has_layout: boolean
+}
 
 interface DocMeta {
   id: string
@@ -27,6 +38,16 @@ interface DocMeta {
   file_type: string
   page_count: number | null
 }
+
+/** layout fetch 的状态机。 */
+interface LayoutState {
+  data: LayoutDoc | null
+  loading: boolean
+  error: 'not-found' | 'other' | null
+}
+
+const INITIAL_LAYOUT: LayoutState = { data: null, loading: false, error: null }
+
 
 export function PdfViewer() {
   const pathname = window.location.pathname
@@ -39,7 +60,11 @@ export function PdfViewer() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [numPages, setNumPages] = useState(0)
-  const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null)
+
+  // —— 布局数据（V7.3）——
+  const [layout, setLayout] = useState<LayoutState>(INITIAL_LAYOUT)
+  // —— 重新解析状态（E1 按钮）——
+  const [reparsing, setReparsing] = useState(false)
 
   // —— 绘制层状态（命令式，不触发重渲）——
   // 当前已挂载页的 canvas（Virtuoso 只挂载视口内的页）
@@ -47,9 +72,11 @@ export function PdfViewer() {
   // 已画过高亮的页（避免同一画布重复绘制；卸载时清除以便重挂后重画）
   const paintedPages = useRef<Set<number>>(new Set())
 
-  // —— 匹配层状态 ——
-  // { 页号 → 磅坐标命中[] }，匹配层异步增量写入
-  const matchesByPage = useRef<Map<number, HighlightMatch[]>>(new Map())
+  // —— 匹配层产出：仅缓存归一化坐标 + page 索引 ——
+  // { 页号 → 命中 block（归一化坐标）}
+  const normalizedHitsByPage = useRef<Map<number, HighlightRect[]>>(new Map())
+  // 第一个命中所在页号；用于 scrollToIndex
+  const firstHitPage = useRef<number | null>(null)
 
   const virtuosoRef = useRef<VirtuosoHandle>(null)
   const didInitialScrollRef = useRef(false)
@@ -67,19 +94,29 @@ export function PdfViewer() {
       .finally(() => setLoading(false))
   }, [docId])
 
-  // 并行加载 PDF 文档用于文本搜索（浏览器缓存确保只下载一次）
+  // mount 时 fetch layout
   useEffect(() => {
     if (!meta || meta.file_type !== 'pdf') return
-    const apiBase = import.meta.env.VITE_API_BASE_URL || ''
-    const url = `${apiBase}/api/v1/kb-documents/${docId}/file`
-    pdfjsLib.getDocument({
-      url,
-      cMapUrl: '/cmaps/',
-      cMapPacked: true,
-      wasmUrl: '/pdfjs/wasm/',
-    }).promise.then(doc => {
-      setPdfDoc(doc)
-    }).catch(e => setError(`PDF 加载失败: ${e.message}`))
+    const ctrl = new AbortController()
+    setLayout({ data: null, loading: true, error: null })
+    fetch(`${apiBase}/api/v1/kb-documents/${docId}/layout`, { signal: ctrl.signal })
+      .then(r => {
+        if (r.status === 404) {
+          setLayout({ data: null, loading: false, error: 'not-found' })
+          return null
+        }
+        if (!r.ok) throw new Error(`layout fetch ${r.status}`)
+        return r.json() as Promise<LayoutDoc>
+      })
+      .then((doc: LayoutDoc | null) => {
+        if (!doc) return
+        setLayout({ data: doc, loading: false, error: null })
+      })
+      .catch(e => {
+        if (e instanceof DOMException && e.name === 'AbortError') return
+        setLayout({ data: null, loading: false, error: 'other' })
+      })
+    return () => ctrl.abort()
   }, [meta, docId])
 
   // 追踪 react-pdf 总页数
@@ -87,84 +124,102 @@ export function PdfViewer() {
     setNumPages(total)
   }
 
-  // —— URL `page` 参数独占定位：numPages 就绪后立即滚动，不等匹配层 ——
+  // 高亮计算：layout + highlight 就绪后一次性算所有命中，**保留归一化坐标**
+  // （实际绘制在 page render success 时按 canvas 显示尺寸换算）。
+  useEffect(() => {
+    if (!numPages || !layout.data || !highlight) {
+      normalizedHitsByPage.current = new Map()
+      firstHitPage.current = null
+      // 触发重画（如有挂载页）
+      if (pageCanvasRefs.current.size > 0) {
+        pageCanvasRefs.current.forEach((_, pageNum) => {
+          paintedPages.current.delete(pageNum)
+        })
+      }
+      return
+    }
+    const allHits = new Map<number, HighlightRect[]>()
+    let firstPage: number | null = null
+    for (const page of layout.data.layout) {
+      const pageW = Math.max(page.width, 1)
+      const pageH = Math.max(page.height, 1)
+      const hits = matchHighlightToBlocks(highlight, page.blocks, pageW, pageH)
+      if (hits.length > 0) {
+        allHits.set(page.page, hits)
+        if (firstPage === null || page.page < firstPage) firstPage = page.page
+      }
+    }
+    normalizedHitsByPage.current = allHits
+    firstHitPage.current = firstPage
+    // 让已挂载页重画——直接内联 fillStyle+fillRect，避免再开一层 tiny function。
+    paintedPages.current = new Set()
+    pageCanvasRefs.current.forEach((canvas, pageNum) => {
+      const hits = allHits.get(pageNum)
+      if (!hits) return
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return
+      ctx.fillStyle = 'rgba(255, 255, 0, 0.4)'
+      for (const h of hits) ctx.fillRect(h.x, h.y, h.w, h.h)
+      paintedPages.current.add(pageNum)
+    })
+    // 触发 effect 重渲让回调刷新
+    setLayout(prev => prev)
+  }, [layout.data, highlight, numPages])
+
+  // —— 滚动到第一命中页或 URL targetPage ——
   useEffect(() => {
     if (numPages <= 0 || didInitialScrollRef.current) return
     didInitialScrollRef.current = true
-    const idx = Math.min(Math.max(targetPage - 1, 0), numPages - 1)
-    //下一帧再滚，确保 Virtuoso 已挂载
+    const target = firstHitPage.current !== null
+      ? firstHitPage.current + 1  // 1-based 显示；page=0 显示在第 0 行
+      : targetPage
+    const idx = Math.min(Math.max(target - 1, 0), numPages - 1)
     requestAnimationFrame(() => virtuosoRef.current?.scrollToIndex(idx))
   }, [numPages, targetPage])
 
-  // 匹配层：异步遍历各页文本，增量写入 matchesByPage 并对"已挂载但未画"的页补画。
-  // 不再依赖"所有页渲染完"闸门；不再自动滚动到首个匹配页。
-  useEffect(() => {
-    if (!pdfDoc || !highlight || numPages <= 0) return
-    const searchTerms = highlight.split(/\s+/).filter(t => t.length > 1)
-    if (searchTerms.length === 0) return
-
-    // 重置该次搜索的匹配与绘制标记
-    matchesByPage.current = new Map()
-    paintedPages.current = new Set()
-
-    let cancelled = false
-    const doc = pdfDoc
-
-    async function searchAndHighlight() {
-      for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-        if (cancelled) return
-        try {
-          const page = await doc.getPage(pageNum)
-          if (cancelled) return
-          const textContent = await page.getTextContent()
-          if (cancelled) return
-          const matches = computePageMatches(
-            textContent.items as Array<{ str: string; transform: number[] }>,
-            searchTerms,
-            RENDER_SCALE,
-          )
-          if (matches.length > 0) {
-            matchesByPage.current.set(pageNum, matches)
-            // 补画：若该页 canvas 已挂载且尚未画，立即画
-            const canvas = pageCanvasRefs.current.get(pageNum)
-            if (canvas && !paintedPages.current.has(pageNum)) {
-              paintHighlight(canvas, pageNum, matches)
-              paintedPages.current.add(pageNum)
-            }
-          }
-        } catch {
-          // 跳过读取失败的页面
-        }
-      }
-    }
-
-    searchAndHighlight()
-    return () => { cancelled = true }
-  }, [pdfDoc, highlight, numPages])
-
-  // 绘制层：某页渲染完成时，若已有匹配则画高亮（覆盖首屏渲染与离屏页重挂两种路径）
+  // 绘制层：某页渲染完成时画归一化命中（内联 fillStyle+fillRect，与上文
+  // 匹配完成时绘制共用同一绘制入口；真正需要被单测的是 layoutMatch 模块）。
   const handlePageRenderSuccess = useCallback((pageNumber: number) => {
-    const matches = matchesByPage.current.get(pageNumber)
-    if (!matches || paintedPages.current.has(pageNumber)) return
+    const hits = normalizedHitsByPage.current.get(pageNumber)
+    if (!hits || paintedPages.current.has(pageNumber)) return
     const canvas = pageCanvasRefs.current.get(pageNumber)
     if (!canvas) return
-    paintHighlight(canvas, pageNumber, matches)
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.fillStyle = 'rgba(255, 255, 0, 0.4)'
+    for (const h of hits) ctx.fillRect(h.x, h.y, h.w, h.h)
     paintedPages.current.add(pageNumber)
   }, [])
 
-  // canvas 注入：注册/注销当前挂载页的 canvas。
-  // 注意：不要在此绘制——react-pdf 尚未画完，会被覆盖。绘制统一在 onRenderSuccess。
+  // canvas 注入
   const registerCanvas = useCallback((pageNumber: number) => (ref: HTMLCanvasElement | null) => {
     if (ref) {
       pageCanvasRefs.current.set(pageNumber, ref)
     } else {
       pageCanvasRefs.current.delete(pageNumber)
-      // 卸载后清除绘制标记，使该页重新挂载时能被重画
       paintedPages.current.delete(pageNumber)
     }
   }, [])
 
-  // 页码跳转（PDF 模式）：交给 Virtuoso 定位
+  // E1 重新解析按钮
+  const handleReparse = useCallback(async () => {
+    setReparsing(true)
+    try {
+      const r = await fetch(
+        `${apiBase}/api/v1/kb-documents/${docId}/reparse`,
+        { method: 'POST' },
+      )
+      if (!r.ok) {
+        setError(`重新解析失败: ${r.status}`)
+        return
+      }
+      setError('已提交重新解析，请稍后刷新页面查看 layout')
+    } finally {
+      setReparsing(false)
+    }
+  }, [apiBase, docId])
+
+  // 页码跳转（PDF 模式）
   const handleJumpToPage = (page: number) => {
     if (numPages <= 0) return
     const clamped = Math.min(Math.max(page, 1), numPages)
@@ -178,7 +233,7 @@ export function PdfViewer() {
   useEffect(() => {
     if (!meta || meta.file_type === 'pdf') return
     const apiBase = import.meta.env.VITE_API_BASE_URL || ''
-    const page = Math.max(targetPage - 1, 0)  // URL is 1-based, API is 0-based
+    const page = Math.max(targetPage - 1, 0)
     fetch(`${apiBase}/api/v1/kb-documents/${docId}/page/${page}`)
       .then(r => r.json())
       .then(d => { setTextContent(d.text); setTextTotalPages(d.total_pages) })
@@ -189,6 +244,9 @@ export function PdfViewer() {
   if (error) return <div className="text-center py-20 text-red-500">{error}</div>
   if (!meta) return <div className="text-center py-20 text-slate-500">文档不存在</div>
 
+  const showE1 = layout.error === 'not-found' && !!highlight
+  const showE2 = layout.error === 'other' && !!highlight
+
   return (
     <div className="min-h-screen bg-slate-100">
       {/* Header */}
@@ -198,7 +256,6 @@ export function PdfViewer() {
           <p className="text-xs text-slate-400">{meta.file_type.toUpperCase()} · {meta.page_count || '?'} 页</p>
         </div>
         <div className="flex items-center gap-3 text-sm">
-          {/* PDF 模式：页码跳转 */}
           {numPages > 0 && (
             <div className="flex items-center gap-2 text-xs text-slate-500">
               <span>跳至</span>
@@ -217,7 +274,6 @@ export function PdfViewer() {
               <span>页 / 共 {numPages} 页</span>
             </div>
           )}
-          {/* 非 PDF 模式：翻页按钮 */}
           {!numPages && textTotalPages > 0 && (
             <>
               <button className="px-2 py-1 rounded hover:bg-slate-100 disabled:opacity-30"
@@ -230,6 +286,23 @@ export function PdfViewer() {
             </>
           )}
           {highlight && <span className="text-xs text-amber-600 ml-2">🔍 高亮: {highlight.slice(0, 50)}</span>}
+          {showE1 && (
+            <div className="flex items-center gap-2 ml-2 text-xs text-slate-400">
+              <span>该文档未解析，无法定位引用位置</span>
+              <button
+                className="px-2 py-1 rounded border border-slate-300 hover:bg-slate-50 disabled:opacity-50"
+                onClick={handleReparse}
+                disabled={reparsing}
+              >
+                {reparsing ? '提交中…' : '重新解析'}
+              </button>
+            </div>
+          )}
+          {showE2 && (
+            <div className="flex items-center gap-2 ml-2 text-xs text-slate-400">
+              <span>无法读取 layout 数据</span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -295,3 +368,4 @@ export function PdfViewer() {
     </div>
   )
 }
+
