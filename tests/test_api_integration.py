@@ -320,5 +320,145 @@ def test_reparse_endpoint_404_for_unknown_doc():
     assert resp.status_code == 404
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+# ── V8-S4 e2e: IssueResponse 暴露 standard_block_range ──────────────────────
+
+def test_audit_task_result_exposes_standard_block_range(fake_models):
+    """V8-S4 e2e: _tool_flag_issue 自动补全的 block_range 经 API 透传。
+
+    链路: 创建 KB → 索引一份带 block_range 的 chunk(走真 _inject_block_range) →
+    创建 audit task + 直接调 _tool_flag_issue 注入 issue →
+    GET /api/v1/audit-tasks/{id}/result → 断言
+    issues[*].standard_block_range 非空且数值与 chunk 一致。
+
+    不依赖 PaddleOCR / bge-m3: 用 fake_models 走假 embedder,
+    直接调 index_document 喂已知 layout 触发 _inject_block_range 真实计算。
+    """
+    from fastapi.testclient import TestClient
+    from core.parse_document import Block, PageLayout, PageText
+    from core.index_manager import index_document, get_kb_index
+    from models.llm_schemas import AgentAction
+    from services.agentic_audit import _tool_flag_issue
+    from models.audit_task import AuditIssue
+    import storage.kb_repo as _kb_repo
+
+    # 1. 创建 KB
+    kb_resp = client.post(
+        "/api/v1/knowledge-bases",
+        json={"name": "v8-e2e-kb", "category": "national"},
+    )
+    kb_id = kb_resp.json()["id"]
+
+    # 2. 索引一份带 block_range 的 chunk。
+    #    文本必须 >= 20 字符(index_document 门槛) 且与 by_page 公共子串(让 _inject_page_number 找到 page=0)
+    fake_doc_id = "01FAKE_DOC_V8_E2E"
+    chunk_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
+    by_page = [PageText(page=0, text=chunk_text)]
+    fake_layout = [PageLayout(
+        page=0, width=0, height=0,
+        blocks=[
+            Block(block_order=0, block_content="公司各应急保障单位", bbox_norm=[0, 0, 1, 0.33]),
+            Block(block_order=1, block_content="应当配置无线对讲", bbox_norm=[0, 0.33, 1, 0.66]),
+            Block(block_order=2, block_content="设备至少两套", bbox_norm=[0, 0.66, 1, 1.0]),
+        ],
+    )]
+    index_document(
+        kb_id, fake_doc_id,
+        text=chunk_text,
+        source_name="v8-e2e.pdf",
+        by_page=by_page,
+        by_layout=fake_layout,
+    )
+
+    # 3. 把 KB 切回 searchable(让 _lookup_chunk_block_range 能 read)
+    kb = _kb_repo.get(kb_id)
+    kb.index_status = "searchable"
+    _kb_repo.update(kb)
+
+    # 验证 chunk 真的被写入了 block_range
+    idx = get_kb_index(kb_id)
+    nodes = [n for n in idx.docstore.docs.values()
+             if n.metadata.get("doc_id") == fake_doc_id]
+    assert nodes, f"index_document 应当写入了至少一个 chunk, 实际 {len(nodes)} 个"
+    node = nodes[0]
+    expected_br = node.metadata.get("block_range")
+    assert expected_br is not None, (
+        f"chunk 应当被 _inject_block_range 标记, 实际 block_range={expected_br}"
+    )
+    # 4. 上传一份假的审核文档 + 创建一个 audit task
+    import io as _io
+    doc_resp = client.post(
+        "/api/v1/audit-documents",
+        files={"file": ("v8-e2e.pdf", _io.BytesIO(b"%PDF-1.4\ntest content for v8 e2e"), "application/pdf")},
+    )
+    audit_doc_id = doc_resp.json()["id"]
+    task_resp = client.post(
+        "/api/v1/audit-tasks",
+        json={"document_id": audit_doc_id, "kb_ids": [kb_id]},
+    )
+    task_id = task_resp.json()["id"]
+    action = AgentAction(
+        thought="v8 e2e: 测试 block_range 透传",
+        action="flag_issue",
+        issue_type="compliance",
+        issue_severity="medium",
+        issue_description="v8 e2e: 测试 block_range 透传",
+        standard_name="v8-e2e-fake-standard",
+        standard_doc_id=fake_doc_id,
+        standard_page_number=1,  # 1-based, page 0
+        standard_chunk_text=chunk_text,
+        cited_excerpt="v8 e2e cited excerpt 测试",
+        document_position="v8 e2e: § 1",
+    )
+    issues: list[AuditIssue] = []
+    _tool_flag_issue(action, issues, kb_ids=[kb_id])
+    assert len(issues) == 1
+
+    # 6. 把 issue 落地到 task 的 result(repo 直接挂载,避免跑完整 loop)
+    from storage.audit_task_repo import save_task
+    from services.audit_task_service import get_task
+    from models.audit_task import AuditResult, ResultSummary
+
+    task_obj = get_task(task_id)
+    task_obj.status = "completed"
+    task_obj.result = AuditResult(
+        task_id=task_id,
+        document_id=task_obj.document_id,
+        document_name=task_obj.document_name,
+        summary=ResultSummary(),  # 默认空 summary,本测试只验证 issues
+        issues=issues,
+    )
+    save_task(task_obj)
+
+
+
+    # 7. 通过 API 验证 IssueResponse.standard_block_range 正确暴露
+    api_resp = client.get(f"/api/v1/audit-tasks/{task_id}/result")
+    assert api_resp.status_code == 200, api_resp.text
+    payload = api_resp.json()
+    api_issues = payload.get("issues", [])
+    assert len(api_issues) == 1, f"应当返回 1 个 issue，实际 {len(api_issues)}"
+    api_block_range = api_issues[0].get("standard_block_range")
+    assert api_block_range == list(expected_br), (
+        f"API 应当暴露 standard_block_range={list(expected_br)}，实际 {api_block_range}"
+    )
+
+    # 8. 负向 case: 虚构 doc_id → block_range = null, issue 仍落地
+    issues.clear()
+    bad_action = AgentAction(
+        thought="v8 e2e negative",
+        action="flag_issue",
+        issue_type="compliance",
+        issue_severity="low",
+        issue_description="v8 e2e negative: doc 不存在",
+        standard_name="v8-e2e-fake-standard",
+        standard_doc_id="01NONEXISTENT_DOC",
+        standard_page_number=1,
+        standard_chunk_text="不存在的 chunk text",
+        cited_excerpt="v8 e2e negative cited excerpt",
+        document_position="v8 e2e negative: § 1",
+    )
+    _tool_flag_issue(bad_action, issues, kb_ids=[kb_id])
+    assert len(issues) == 1
+    assert issues[0].standard_reference.block_range is None, (
+        "虚构 doc_id 反查应失败 → block_range=None, 不抛异常"
+    )

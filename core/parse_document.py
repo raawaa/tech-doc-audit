@@ -153,28 +153,34 @@ def _parse_pdf(file_path: str, *, use_cache: bool) -> ParseResult:
     if cached is not None:
         return ParseResult.from_dict(cached)
 
-    result = _paddleocr_parse(file_path)
+    result, source = _paddleocr_parse(file_path)
 
     if use_cache and result.by_page:
         try:
             from core.paddleocr_cache import save_cached
-            save_cached(file_path, result.to_dict())
+            save_cached(file_path, result.to_dict(), source=source)
         except Exception as e:
             _logger.warning("parse_document: cache save failed for %s: %s", file_path, e)
 
     return result
 
 
-def _paddleocr_parse(file_path: str) -> ParseResult:
-    """调 PaddleOCR API → 落 ParseResult；不可用 / 失败 → 降级。"""
+def _paddleocr_parse(file_path: str) -> tuple[ParseResult, str]:
+    """调 PaddleOCR API → 落 ParseResult；不可用 / 失败 → 降级。
+
+    返回 ``(result, source)``: source 是 cache 元数据，标识结果来自哪个解析器
+    （见 ``paddleocr_cache.save_cached`` 的 source 参数说明，issue #57）。
+    """
     if not _paddleocr_available():
-        return _pdf_fallback(file_path)
+        result = _pdf_fallback(file_path)
+        return result, "fallback_pdfplumber"
 
     try:
-        return _paddleocr_call(file_path)
+        result = _paddleocr_call(file_path)
+        return result, "paddleocr"
     except Exception as e:
         _logger.warning("paddleocr_parse failed for %s: %s", file_path, e)
-        return _pdf_fallback(file_path)
+        return _pdf_fallback(file_path), "fallback_pdfplumber"
 
 
 def _paddleocr_call(file_path: str) -> ParseResult:

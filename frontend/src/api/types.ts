@@ -141,6 +141,8 @@ export interface QASource {
   content_snippet: string
   page_number?: number | null
   relevance: number
+  // V8-S7: 正向 block_range 坐标；后端 qa_service 在 V8-S3 已透传，前端按优先顺序消费
+  block_range?: [number, number] | null
 }
 
 export interface QAResponse {

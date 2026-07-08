@@ -174,3 +174,55 @@ def test_reparse_idempotent_when_cached(reparse_target_kb, monkeypatch):
     _reparse(doc.id)
     time.sleep(2.0)
     assert called["count"] == 0, f"PaddleOCR 被调 {called['count']} 次（缓存应当命中）"
+
+
+# ── 单元测试（不需要 Token） ────────────────────────────────────────────────────────
+def test_reparse_passes_by_layout_to_index_document(
+    reparse_target_kb, monkeypatch
+):
+    """V8-S2 漏改防御：reparse_service 调 index_document 时显式传 by_layout。
+
+    之前 V8-S2 在 vector_search.index_document_document 路径上加了
+    ``by_layout=parse_result.layout``（commit a58eba3），但 reparse_service
+    没跟进，导致走 reparse 路径的 doc 永远 block_range=None。
+
+    不需要 PaddleOCR token：通过 mock parse_document / index_document 同步验证调用契约。
+    """
+    from unittest.mock import MagicMock, patch
+    from core.parse_document import Block, PageLayout, ParseResult
+
+    kb, doc, _ = reparse_target_kb
+
+    # 准备一份带 layout 的 mock parse_result
+    fake_layout = [PageLayout(page=0, blocks=[Block(block_order=0), Block(block_order=1)])]
+    fake_parse_result = ParseResult(
+        by_page=[],
+        full_text="x" * 50,  # >20 字符避开稀疏文本 raise
+        layout=fake_layout,
+    )
+
+    # 用 unittest.mock.patch 拦截 import 时已绑定的名字（monkeypatch.setattr 对
+    # `from x import y` 形式的 import 无效 —— y 是模块级本地名, 不能从外部重绑）
+    with patch("services.reparse_service.parse_document", return_value=fake_parse_result), \
+         patch("services.reparse_service.save_pages", return_value=None), \
+         patch("services.reparse_service.remove_document", return_value=None), \
+         patch("services.reparse_service.index_document", return_value=None) as mock_idx, \
+         patch("services.reparse_service.kb_repo") as mock_kb_repo, \
+         patch("services.reparse_service.doc_repo") as mock_doc_repo:
+        # 模拟 kb_repo.get(kb_id) → KB 实例(index_status 等可写)
+        fake_kb = MagicMock()
+        mock_kb_repo.get.return_value = fake_kb
+        # 模拟 doc_repo.get_doc(kb_id, doc_id) → doc 实例
+        mock_doc_repo.get_doc.return_value = doc
+
+        from services.reparse_service import _reparse_async
+        _reparse_async(kb.id, doc.id)
+
+    mock_idx.assert_called_once()
+    call = mock_idx.call_args
+    # 位置/关键字参数: by_layout 必须在 kwargs 里
+    assert call.kwargs.get("by_layout") is fake_layout, (
+        f"reparse 必须把 parse_result.layout 传给 index_document.by_layout，"
+        f"否则 _inject_block_range 永远拿不到 layout, block_range 永远 None。"
+        f"实际 call={call!r}"
+    )

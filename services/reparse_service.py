@@ -93,6 +93,7 @@ def _reparse_async(kb_id: str, doc_id: str) -> None:
                 kb_id, doc_id, parse_result.full_text,
                 source_name=doc.original_name,
                 by_page=parse_result.by_page,
+                by_layout=parse_result.layout,
             )
 
             # 5) 更新文档与 KB 状态

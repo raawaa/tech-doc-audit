@@ -39,4 +39,55 @@ describe('buildQASourcePreviewUrl', () => {
     const url = buildQASourcePreviewUrl(src({ doc_id: 'd1', page_number: 0, content_snippet: '' }))
     expect(url).not.toContain('highlight=')
   })
+
+  // ── V8-S7: block_range 优先路径 ──────────────────────────────────────────────────
+
+
+  it('uses block_range when present and omits highlight', () => {
+    // V8-S7 核心契约: block_range 非空时 URL 走坐标路径，不带 highlight
+    const url = buildQASourcePreviewUrl(src({
+      doc_id: 'd1', page_number: 15, content_snippet: 'some highlight text',
+      block_range: [2, 5],
+    }))
+    expect(url).toContain('/pdf-viewer/d1?')
+    expect(url).toContain('page=16')
+    expect(url).toContain('block_range=2%2C5')  // URLSearchParams 编码逗号
+    expect(url).not.toContain('highlight=')
+  })
+
+  it('falls back to highlight when block_range is null', () => {
+    const url = buildQASourcePreviewUrl(src({
+      doc_id: 'd1', page_number: 0,
+      content_snippet: 'fallback text',
+      block_range: null,
+    }))
+    expect(url).toContain('highlight=fallback')
+    expect(url).not.toContain('block_range=')
+  })
+
+  it('falls back to highlight when block_range is undefined', () => {
+    const url = buildQASourcePreviewUrl(src({
+      doc_id: 'd1', page_number: 0,
+      content_snippet: 'fallback text',
+    }))
+    expect(url).toContain('highlight=fallback')
+    expect(url).not.toContain('block_range=')
+  })
+
+  it('block_range takes precedence over content_snippet', () => {
+    // 即便 content_snippet 存在, block_range 优先
+    const url = buildQASourcePreviewUrl(src({
+      doc_id: 'd1', page_number: 0,
+      content_snippet: 'long snippet text',
+      block_range: [0, 1],
+    }))
+    expect(url).toContain('block_range=0%2C1')
+    expect(url).not.toContain('highlight=')
+  })
+
+  it('omits both block_range and highlight when source is empty', () => {
+    const url = buildQASourcePreviewUrl(src({ doc_id: 'd1', page_number: 0 }))
+    expect(url).not.toContain('block_range=')
+    expect(url).not.toContain('highlight=')
+  })
 })

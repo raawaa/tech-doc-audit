@@ -776,7 +776,7 @@ class TestUnifiedLoop:
                     structure=None, kb_ids=["kb1"], doc_name="t", task_id="loop_t", doc_id="d",
                     max_turns=5,
                 )
-        mock_search.assert_called_once_with(["kb1"], "test_query", 3)
+        mock_search.assert_called_once_with(["kb1"], "test_query", 3, sync_rebuild_for_audit=True)
         assert result.raw_analysis == "done"
 
     @patch("services.agent_trace.save_trace")
