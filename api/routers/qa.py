@@ -288,7 +288,10 @@ def chat_stream(req: ChatRequest):
                          "doc_source": s.get("doc_source", "未知来源"),
                          "content_snippet": s.get("content_snippet", ""),
                          "page_number": s.get("page_number"),
-                         "relevance": s.get("relevance", 1.0)}
+                         "relevance": s.get("relevance", 1.0),
+                         # V8: 透传 block_range 到 SSE 客户端;非空时前端走
+                         # 坐标高亮主路径,缺失/None 时 fallback 到 highlight。
+                         "block_range": s.get("block_range")}
                         for s in result["sources"]
                     ]},
                 })
