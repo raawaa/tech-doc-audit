@@ -234,6 +234,9 @@ _SRC_NAME = re.compile(r"【(.+?)】")
 _SRC_RELEVANCE = re.compile(r"相关度:\s*([\d.]+)")
 _SRC_DOC_ID = re.compile(r"doc_id:\s*(\S+)")
 _SRC_PAGE = re.compile(r"页码:\s*第(\d+)页")
+# V8: search_kb 工具输出追加 "block_range: (x, y)" 时解析;非空闭区间
+# (0-based block_order) 用于前端 PdfViewer 坐标高亮主路径。
+_SRC_BLOCK_RANGE = re.compile(r"block_range:\s*\(?(\d+)\s*,\s*(\d+)\)?")
 _SRC_SKIP_MARKERS = ("搜索结果", "文本搜索", "精确匹配")
 
 
@@ -279,6 +282,9 @@ def _extract_sources(messages: list[dict]) -> list[dict]:
                     sources.append({
                         "doc_source": name, "doc_id": "",
                         "page_number": None, "content_snippet": "", "relevance": 0.0,
+                        # V8: search_kb_text 关键词搜索无 layout 概念,block_range 永远 None,
+                        # 保持字段一致性,前端按缺失走 highlight fallback。
+                        "block_range": None,
                     })
             continue
 
@@ -294,6 +300,9 @@ def _extract_sources(messages: list[dict]) -> list[dict]:
                 current = {
                     "doc_source": doc_source, "doc_id": "",
                     "page_number": None, "content_snippet": "", "relevance": 0.0,
+                    # V8: 块坐标区间;由 search_kb 输出 "block_range: (x, y)" 解析,
+                    # 缺失时为 None(非 PDF / 旧 KB / 匹配失败),前端 fallback。
+                    "block_range": None,
                 }
                 continue
             if current is None:
@@ -308,6 +317,11 @@ def _extract_sources(messages: list[dict]) -> list[dict]:
                 pg_m = _SRC_PAGE.search(line)
                 if pg_m:
                     current["page_number"] = int(pg_m.group(1)) - 1  # 1-based 文本 → 0-based
+                # V8: 块坐标区间。search_kb 工具输出 (x, y) 元组形式;
+                # None(未匹配)走前端 highlight 字符串匹配 fallback。
+                br_m = _SRC_BLOCK_RANGE.search(line)
+                if br_m:
+                    current["block_range"] = [int(br_m.group(1)), int(br_m.group(2))]
             elif _is_content_line(line):
                 current["content_snippet"] = (current["content_snippet"] + "\n" + line.strip()).strip() if current["content_snippet"] else line.strip()
         _flush(current, seen, sources)

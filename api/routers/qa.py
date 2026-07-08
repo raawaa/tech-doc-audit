@@ -31,6 +31,9 @@ class QASource(BaseModel):
     content_snippet: str
     page_number: Optional[int] = None
     relevance: float
+    # V8: block_range 坐标（[start, end] 0-based block_order 闭区间）;
+    # None = 非 PDF / 旧 KB / 匹配失败 → 前端 fallback 到 highlight 字符串匹配。
+    block_range: Optional[list[int]] = None
 
 
 class QAResponse(BaseModel):
@@ -75,6 +78,7 @@ def ask_question(req: QARequest):
                     content_snippet=s.get("content_snippet", ""),
                     page_number=s.get("page_number"),
                     relevance=s.get("relevance", 1.0),
+                    block_range=s.get("block_range"),
                 ) for s in result["sources"]] if result["sources"] else [],
             )
         else:

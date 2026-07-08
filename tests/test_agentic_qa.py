@@ -110,3 +110,41 @@ def test_extract_sources_skips_single_source_warning():
     sources = _extract_sources([{"role": "tool", "content": content}])
     assert len(sources) == 1
     assert "来源单一性警告" not in sources[0]["content_snippet"]
+
+
+def test_extract_sources_parses_block_range_from_v8_search_kb_output():
+    """V8: search_kb 输出追加 'block_range: (x, y)' 时正确解析;无则 None。
+
+    配套于 services/agent_tools.search_kb 第 87-91 行的 V8 输出格式。
+    缺失该字段(旧 KB / 匹配失败)→ block_range = None,前端 fallback 到 highlight。
+    """
+    content_with_br = (
+        "【知识库搜索结果（搜索词: 应急处置，共 1 条）】\n"
+        "\n"
+        "1. 【应急管理办法】 第四十五条\n"
+        "   相关度: 0.92 | doc_id: 01KW1QXZ5AKBGK34BDJRV1X4JZ | 页码: 第18页 | block_range: (1, 2)\n"
+        "   发生突发事件后,公司各应急保障单位应当立即启动本单位应急预案。\n"
+    )
+    sources = _extract_sources([{"role": "tool", "content": content_with_br}])
+    assert len(sources) == 1
+    assert sources[0]["block_range"] == [1, 2]
+    assert sources[0]["page_number"] == 17  # 1-based 第18页 → 0-based 17
+
+    content_without_br = (
+        "【知识库搜索结果（搜索词: x，共 1 条）】\n"
+        "\n"
+        "1. 【某旧KB文档】\n"
+        "   相关度: 0.50 | doc_id: doc-old | 页码: 第1页\n"
+        "   旧KB内容。\n"
+    )
+    sources_old = _extract_sources([{"role": "tool", "content": content_without_br}])
+    assert sources_old[0]["block_range"] is None  # 旧 KB / 无 layout → 走 fallback
+
+    # search_kb_text 路径不应带 block_range(关键词搜索无 layout 概念)。
+    text_search = (
+        "【知识库文本搜索结果（精确匹配: 应急）】\n"
+        "【应急管理办法】\n"
+    )
+    sources_text = _extract_sources([{"role": "tool", "content": text_search}])
+    assert len(sources_text) == 1
+    assert sources_text[0]["block_range"] is None
