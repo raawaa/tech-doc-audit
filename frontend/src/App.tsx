@@ -1,4 +1,6 @@
+import { Suspense, lazy } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
+import { Loader2 } from 'lucide-react'
 import { Sidebar } from './components/Sidebar'
 import { HealthBanner } from './components/HealthBanner'
 import { AuditDashboard } from './pages/AuditDashboard'
@@ -7,8 +9,12 @@ import { AuditResult } from './pages/AuditResult'
 import { KnowledgeBases } from './pages/KnowledgeBases'
 import { KnowledgeBaseDetail } from './pages/KnowledgeBaseDetail'
 import { QA } from './pages/QA'
-import { PdfViewer } from './pages/PdfViewer'
-import { PdfViewerDropin } from './pages/PdfViewerDropin'
+
+// PdfViewer 懒加载:embedpdf drop-in(@embedpdf/react-pdf-viewer + pdfium)
+// 体积大(~272 kB gzip),拆成独立 chunk 避免拖累主 index bundle(V9 PRD #68)。
+const PdfViewer = lazy(() =>
+  import('./pages/PdfViewer').then(m => ({ default: m.PdfViewer })),
+)
 
 export default function App() {
   return (
@@ -26,8 +32,20 @@ export default function App() {
             <Route path="/knowledge-bases" element={<KnowledgeBases />} />
             <Route path="/knowledge-bases/:id" element={<KnowledgeBaseDetail />} />
             <Route path="/qa" element={<QA />} />
-            <Route path="/pdf-viewer/:docId" element={<PdfViewer />} />
-            <Route path="/pdf-viewer-dropin/:docId" element={<PdfViewerDropin />} />
+            <Route
+              path="/pdf-viewer/:docId"
+              element={
+                <Suspense
+                  fallback={
+                    <div className="flex justify-center py-20">
+                      <Loader2 className="w-6 h-6 animate-spin text-slate-400" />
+                    </div>
+                  }
+                >
+                  <PdfViewer />
+                </Suspense>
+              }
+            />
           </Routes>
         </div>
         </main>
