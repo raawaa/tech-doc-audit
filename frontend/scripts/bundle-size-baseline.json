@@ -1,0 +1,38 @@
+{
+  "at": "2026-07-09 (pre-spike parent a0b6a31)",
+  "note": "Baseline against commit a0b6a31 before spike #66 added @embedpdf/react-pdf-viewer. Re-capture by stashing the spike changes and running `node scripts/report-bundle-size.mjs`.",
+  "totalRaw": 6471644,
+  "totalGzip": 2534210,
+  "files": [
+    {
+      "name": "pdfium-*.wasm",
+      "raw": 4633788,
+      "gzip": 2143350
+    },
+    {
+      "name": "index-*.js",
+      "raw": 812613,
+      "gzip": 240691
+    },
+    {
+      "name": "worker-engine-*.js",
+      "raw": 704613,
+      "gzip": 122593
+    },
+    {
+      "name": "direct-engine-*.js",
+      "raw": 316488,
+      "gzip": 72124
+    },
+    {
+      "name": "browser-*.js",
+      "raw": 20132,
+      "gzip": 4616
+    },
+    {
+      "name": "index-*.css",
+      "raw": 29150,
+      "gzip": 5697
+    }
+  ]
+}

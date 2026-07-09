@@ -16,7 +16,8 @@
  *   "刷新后高亮消失" 由此保证。
  * - **工具栏精简**:drop-in 自带大量 toolbar,通过 ``disabledCategories`` 砍掉
  *   annotation/redaction/form/print/export/history 等,保留 selection 让
- *   auditor 能复制 PDF 原文引用到审核报告。
+ *   auditor 能复制 PDF 原文引用到审核报告。保留 zoom 类别(spec 明确要求
+ *   "保留 zoom / navigation / scroll / page 等基础浏览能力")。
  * - **outer wrapper 保留现有 PdfViewer 的 header**:
  *   文档名 / 页码 / E1 重新解析按钮 / 🔍高亮 / 📍block_range 状态展示,
  *   与 drop-in viewer 内层共存,不替换生产 PdfViewer.tsx。
@@ -39,7 +40,7 @@ import {
 import type { LayoutReadyEvent } from '@embedpdf/plugin-scroll'
 import { uuidV4 } from '@embedpdf/models'
 import {
-  norm,
+  blockMatchesHighlight,
   type Block as LayoutBlock,
 } from '../lib/layoutMatch'
 
@@ -141,17 +142,10 @@ function pickBlocksForHits(
   }
 
   const scanAllPagesByText = () => {
-    // 直接按 (block, highlight) 判定 includes 重跑 lib/layoutMatch 的 N3 归一化
-    // + includes 路径。LCS 兜底略(spike 的 fallback 路径,旧 KB 才走)。
-    const normHighlight = norm(highlight)
-    if (!normHighlight) return
+    // 复用 lib/layoutMatch.blockMatchesHighlight 的 T1+P2 判定,不在 spike
+    // 端再复制一份 N3+includes+LCS。同时空 highlight 由 predicate 短路。
     for (const page of layout.layout) {
-      const matching = page.blocks.filter(b => {
-        const c = b.block_content || ''
-        if (!c) return false
-        const nc = norm(c)
-        return nc.includes(normHighlight) || normHighlight.includes(nc)
-      })
+      const matching = page.blocks.filter(b => blockMatchesHighlight(b, highlight))
       if (matching.length > 0) {
         hitsByPage.set(page.page, matching)
         if (firstHitPage0 === null || page.page < firstHitPage0) {
@@ -215,6 +209,34 @@ function buildAnnotationsForLayout(
   }
   return items
 }
+
+// ── drop-in 配置(模块级常量,避免每 render 重建)─────────────────────
+
+/**
+ * 砍掉 drop-in 自带 UI 的白名单反义。
+ *
+ * 设计取舍:
+ * - 不列 'selection-copy'/'selection' 系列,selection 默认开,auditor 能复制
+ *   PDF 原文。
+ * - 不列 'zoom','navigation','scroll','page'(spec 要求保留"基础浏览能力")。
+ * - 'document-open'/'document-close'/'document-protect' 在 spec 列表里但
+ *   snippet 文档未列出这些 category 名。snipper 内部容错忽略未知 category,
+ *   不影响 spike。
+ */
+const SPIKE_DISABLED_CATEGORIES: string[] = [
+  'annotation', 'annotation-markup', 'annotation-highlight',
+  'annotation-underline', 'annotation-strikeout', 'annotation-squiggly',
+  'redaction', 'redaction-area', 'redaction-text', 'redaction-apply', 'redaction-clear',
+  'form', 'form-textfield', 'form-checkbox', 'form-radio', 'form-select', 'form-listbox',
+  'insert', 'insert-rubber-stamp', 'insert-signature', 'insert-image',
+  'document-print', 'document-capture', 'document-export', 'document-fullscreen',
+  'panel-sidebar', 'panel-search', 'panel-comment',
+  'pan', 'pointer',
+  'history', 'history-undo', 'history-redo',
+  'thumbnail', 'bookmark', 'attachment',
+  'capture', 'stamp', 'signature',
+  'redact-mode',
+]
 
 // ── 顶层 PdfViewerDropin:状态机 + 装配 drop-in viewer ──────────────────
 
@@ -425,10 +447,8 @@ export function PdfViewerDropin() {
   const showE1 = layout.error === 'not-found' && (!!highlight || !!blockRange)
   const showE2 = layout.error === 'other' && (!!highlight || !!blockRange)
 
-  // drop-in disabledCategories — 文档化:把工具栏/侧栏全部砍光。
-  // 注意 selection 默认开启,auditor 可复制 PDF 原文(spike acceptance)。
-  // 几个 doc 类 category 在 issue body 里列为 'document-open' 等,文档里没列;
-  // 留作未知,可能 snippet 内部容错忽略(spike PRD 的 verified-by-test 通道)。
+  // drop-in disabledCategories — 模块级常量 SPIKE_DISABLED_CATEGORIES,
+  // 避免每次 render 重建数组引用。同时 selection/zoom/navigation 默认开。
   const dropinConfig = pdfUrl
     ? {
         src: pdfUrl,
@@ -436,21 +456,7 @@ export function PdfViewerDropin() {
         // pdfium.wasm: 沿用公共目录(若缺则 drop-in 用内置路径)
         wasmUrl: '/pdfium.wasm',
         tabBar: 'never' as const,
-        disabledCategories: [
-          'annotation', 'annotation-markup', 'annotation-highlight',
-          'annotation-underline', 'annotation-strikeout', 'annotation-squiggly',
-          'redaction', 'redaction-area', 'redaction-text', 'redaction-apply', 'redaction-clear',
-          'form', 'form-textfield', 'form-checkbox', 'form-radio', 'form-select', 'form-listbox',
-          'insert', 'insert-rubber-stamp', 'insert-signature', 'insert-image',
-          'document-print', 'document-capture', 'document-export', 'document-fullscreen',
-          'panel-sidebar', 'panel-search', 'panel-comment',
-          'pan', 'pointer',
-          'history', 'history-undo', 'history-redo',
-          'thumbnail', 'bookmark', 'attachment',
-          'capture', 'stamp', 'signature',
-          'redact-mode',
-          'zoom',
-        ],
+        disabledCategories: SPIKE_DISABLED_CATEGORIES,
         annotations: { annotationAuthor: 'audit-system' },
       }
     : { tabBar: 'never' as const, worker: false as const }

@@ -3,6 +3,7 @@ import {
   norm,
   lcsRatio,
   matchHighlightToBlocks,
+  blockMatchesHighlight,
   type Block,
 } from './layoutMatch'
 
@@ -228,5 +229,68 @@ describe('matchHighlightToBlocks', () => {
     // 只应命中第 2 个 block（包含真短语的那条），不应命中第 1 个（散落命中）。
     expect(hits).toHaveLength(1)
     expect(hits[0].y).toBe(200) // 第 2 个 block 的 y = 0.1 * H = 200
+  })
+})
+
+
+describe('blockMatchesHighlight', () => {
+  const makeBlock = (block_content: string): Block => ({
+    block_label: 'text',
+    block_content,
+    bbox_norm: [0.1, 0.1, 0.9, 0.2],  // 对 predicate 而言 bbox 无关
+    block_order: 0,
+  })
+
+  it('T1 完全匹配:includes 命中', () => {
+    expect(blockMatchesHighlight(makeBlock('公司各应急保障单位应当配置'), '公司各应急保障')).toBe(true)
+  })
+
+  it('双向 includes(block 是 highlight 子串)命中:OCR 拆散场景', () => {
+    expect(
+      blockMatchesHighlight(
+        makeBlock('公司各应急保障单位应当配置'),
+        '公司各应急保障单位应当配置无线对讲设备至少两套',
+      ),
+    ).toBe(true)
+  })
+
+  it('加空格 / 标点:归一化后命中', () => {
+    expect(blockMatchesHighlight(makeBlock('公司各应急保障单位'), '公司 各应急 保障单位')).toBe(true)
+  })
+
+  it('全角字符:NFKC 后命中', () => {
+    expect(blockMatchesHighlight(makeBlock('800兆对讲机'), '８00兆对讲机')).toBe(true)
+  })
+
+  it('完全无关文本:不命中', () => {
+    expect(blockMatchesHighlight(makeBlock('与本标准无关的其他规范'), '800兆对讲机')).toBe(false)
+  })
+
+  it('空 highlight / 空 content:不命中', () => {
+    expect(blockMatchesHighlight(makeBlock('公司各应急保障'), '')).toBe(false)
+    expect(blockMatchesHighlight(makeBlock('公司各应急保障'), '   ')).toBe(false)
+    expect(blockMatchesHighlight(makeBlock(''), '800兆对讲机')).toBe(false)
+  })
+
+  it('OCR 长串 1 字差异:走 LCS ratio >= 0.85 命中', () => {
+    // 与 matchHighlightToBlocks 同型:14 字符错 1 → ratio 13/14 ≈ 0.928
+    expect(
+      blockMatchesHighlight(
+        makeBlock('公司各应急保障单位应当配置无线对讲设备至少两套'),
+        '公司各应急保障单位应当配置无线对话设备至少两套',
+      ),
+    ).toBe(true)
+  })
+
+  it('短串差异不达阈值:LCS miss', () => {
+    // 4 字符差异 1 → LCS ratio 3/4 = 0.75 < 0.85
+    expect(blockMatchesHighlight(makeBlock('abcd'), 'abce')).toBe(false)
+  })
+
+  it('highlight 字符散落长 content:不误命中(LCS ratio 用 max 而非 min)', () => {
+    // 与 matchHighlightToBlocks 的"散落不应误命中" case 同型
+    const scattered = '公司消防、医疗救护相关设备物资发生报废、故障、检修等情况,造成机场应急救援保障能力降低的,消防急救保障部应及时向公司运行指挥中心报告。'
+    expect(blockMatchesHighlight(makeBlock(scattered), '应急救援指挥中心')).toBe(false)
+    expect(blockMatchesHighlight(makeBlock('第八条 应急救援指挥中心'), '应急救援指挥中心')).toBe(true)
   })
 })

@@ -5,6 +5,10 @@ node_modules
 dist
 dist-ssr
 
+# bundle-size-current.json = `npm run bundle:report` 最近一次 build 的快照,
+# 脚本每跑都会重新写出,不入仓。baseline 是 commit a0b6a31 之前的固定快照,保留。
+scripts/bundle-size-current.json
+
 # Logs
 *.log
 

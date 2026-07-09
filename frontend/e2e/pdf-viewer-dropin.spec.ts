@@ -16,8 +16,19 @@ import { test, expect, type Page } from '@playwright/test'
  *   生产 PdfViewer 没有这条 handle — 它只在 spike 路由上挂(见 PdfViewerDropin.tsx)。
  *
  * Refs:
- * - issue #66 的 acceptance criteria 1, 2, 4, 5, 7, 9, 11
- * - issue #66 的 verification risk 1(`importAnnotations` 不调 commit 时是否渲染)
+ * - issue #66 acceptance 1 (viewer 渲染) ✓
+ * - issue #66 acceptance 2 (auto-jump + block_range):含 "18" 落在 page-counter
+ * - issue #66 acceptance 4 (block_range 2,5 → 4 annotations) ✓
+ * - issue #66 acceptance 5 (single-block → 1 annotation) ✓
+ * - issue #66 acceptance 6 (color/opacity/position):round-trip 测试断言 strokeColor/opacity/rect
+ * - issue #66 acceptance 8 (E1 fallback button) ✓
+ * - issue #66 verification risk 2 (PDF 坐标语义):round-trip 测试断言
+ *      rect.origin.y == pageH - y2*pageH(证实 Y-flip 方向)
+ *
+ * 未覆盖(挪到 #68 follow-up):
+ * - issue #66 acceptance 7 (refresh 后 PDF 字节未污染)— 需要真实 PDF + 字节对比
+ * - issue #66 acceptance 9 (preview build worker:false)— 需要 preview 环境跑
+ * - issue #66 acceptance 11 (selection-copy)— 需要交互验证
  */
 
 const DROPIN_DOC_ID = '01KW10F4SD4BZG6SQFNQ42JDTH'
@@ -55,6 +66,65 @@ async function getAnnotationCount(page: Page): Promise<number> {
     if (!ann) return -2
     return ann.forDocument(docId).getAnnotations().length
   }, DROPIN_DOC_ID)) as number
+}
+
+async function getFirstAnnotationPayload(page: Page): Promise<{
+  pageIndex: number
+  strokeColor: string | null
+  color: string | null
+  opacity: number
+  rectOriginX: number
+  rectOriginY: number
+  rectWidth: number
+  rectHeight: number
+  segmentRects: number
+  commitState: string
+} | null> {
+  return (await page.evaluate(async (docId) => {
+    const reg = (window as unknown as {
+      __pdfViewerDropinRegistry?: Promise<{
+        getPlugin: (id: string) => {
+          provides?: () => {
+            forDocument: (d: string) => {
+              getAnnotations: (opts?: { pageIndex?: number }) => Array<{
+                commitState: string
+                object: {
+                  pageIndex: number
+                  strokeColor?: string
+                  color?: string
+                  opacity: number
+                  rect: {
+                    origin: { x: number; y: number }
+                    size: { width: number; height: number }
+                  }
+                  segmentRects?: unknown[]
+                }
+              }>
+            }
+          } | null
+        } | null
+      }>
+    }).__pdfViewerDropinRegistry
+    if (!reg) return null
+    const r = await reg
+    const ann = r.getPlugin('annotation')?.provides?.()
+    if (!ann) return null
+    const all = ann.forDocument(docId).getAnnotations()
+    if (all.length === 0) return null
+    const obj = all[0].object
+    return {
+      pageIndex: obj.pageIndex,
+      strokeColor: obj.strokeColor ?? null,
+      color: obj.color ?? null,
+      opacity: obj.opacity,
+      rectOriginX: obj.rect.origin.x,
+      rectOriginY: obj.rect.origin.y,
+      rectWidth: obj.rect.size.width,
+      rectHeight: obj.rect.size.height,
+      segmentRects: obj.segmentRects?.length ?? 0,
+      commitState: all[0].commitState,
+    }
+  }, DROPIN_DOC_ID)) as Awaited<ReturnType<typeof getFirstAnnotationPayload>>
 }
 
 function makeLayout(blocks: Array<{ content: string; y1: number; y2: number; order: number }>) {
@@ -185,35 +255,62 @@ test.describe('PDF viewer drop-in spike (PRD #66)', () => {
     }).toBe(1)
   })
 
-  // ── verification risk #1 + acceptance #7: refresh 后 import 不持久 ────
+  // ── 替换原 #66 复盘的"刷新后 annotation 数 = 0 (commit 未调)"误判测试 ──
+  //
+  // issue #66 acceptance #7 真正想问的是"importAnnotations 不调 commit,
+  // 是否会污染源 PDF 字节"。该断言需要拿到原 PDF 文件 + 重新导出后对比
+  // 字节,frontend/e2e 用占位 PDF 无法完成。已挪到 issue #68 follow-up。
+  //
+  // 当前测试改成 round-trip 路径上的可证伪断言:rect 在 PDF 用户空间、
+  // strokeColor / opacity 与构造时一致。
 
-  test('import 后刷新页面:annotation 数 = 0(commit 未调)', async ({ page }) => {
+  test('round-trip:rect 是 PDF 用户空间(左下原点,Y-up),strokeColor / opacity / segmentRects 与构造值一致', async ({ page }) => {
+    // makeLayout 的 pageW=1000,pageH=2000。bbox_norm [0.05,0.1,0.95,0.2]
+    // → 期望 rect: origin (50, 1600), size (900, 200)。
     await mockLayoutWith(page, makeLayout([
-      { content: 'block 0', y1: 0.05, y2: 0.10, order: 0 },
-      { content: 'block 1', y1: 0.15, y2: 0.20, order: 1 },
+      { content: 'block 0', y1: 0.1, y2: 0.2, order: 0 },
     ]))
     await mockMeta(page)
     await mockPdfFile(page)
     await page.goto(
-      `/pdf-viewer-dropin/${DROPIN_DOC_ID}?page=1&block_range=${encodeURIComponent('0,1')}`,
+      `/pdf-viewer-dropin/${DROPIN_DOC_ID}?page=1&block_range=${encodeURIComponent('0,0')}`,
     )
     await waitForDropinRegistry(page)
-    await expect.poll(() => getAnnotationCount(page), {
-      timeout: 30_000,
-      intervals: [500, 1000, 2000],
-    }).toBe(2)
 
-    // 重载页面:重新构造 PdfViewerDropin,期望新一次 mount + import 完成,
-    // 但 import 的记忆态仅存内存,所以文档状态依旧是原始 PDF,annotation 在
-    // 第一次 mount 后由 importAnnotations 重新灌入。spike 关心的"刷新后高亮
-    // 不持久到 PDF"这里通过"内存中 annotation 重新出现,源 PDF 未污染"验证
-    // — 真实 PDF 字节无变(cannot detect in e2e without diffing bytes)。
-    await page.reload()
-    await waitForDropinRegistry(page)
-    await expect.poll(() => getAnnotationCount(page), {
-      timeout: 30_000,
-      intervals: [500, 1000, 2000],
-    }).toBe(2)
+    const payload = await getFirstAnnotationPayload(page)
+    expect(payload).not.toBeNull()
+    expect(payload!.pageIndex).toBe(0)
+    // Y-flip:页面顶部 block 应得到高 PDF-y(左下原点里"y 越大越靠上")
+    expect(payload!.rectOriginY).toBeCloseTo(1600, 0)
+    expect(payload!.rectOriginX).toBeCloseTo(50, 0)
+    expect(payload!.rectWidth).toBeCloseTo(900, 0)
+    expect(payload!.rectHeight).toBeCloseTo(200, 0)
+    expect(payload!.segmentRects).toBe(1)
+    // opacity & strokeColor:允许 'color' deprecated 字段作为兜底
+    const color = payload!.strokeColor ?? payload!.color
+    expect(color).toBe('#FFFF00')
+    expect(payload!.opacity).toBeCloseTo(0.4, 5)
+    // 没调 commit 时,commitState 应该是 'new' 而不是 'dirty'/'synced'
+    expect(payload!.commitState).toBe('new')
+  })
+
+  // ── acceptance #2: 跳到指定 page。drop-in 在 dev + dummy PDF 下 ──────────
+  //
+  // 加载占位 PDF 时,embedpdf 的 totalPages 永不变 0(spike 文档已知),所以
+  // counter 走 fallback 分支 `${targetPage} / ${pageCount}`。
+  // 我们只能断言 "18" 出现在 counter 里 — 真正的 auto-jump 验证需要在
+  // preview 跑 + 真实 PDF fixture 下做(挪到 #68 follow-up)。
+
+  test('?page=18 + block_range=0,0:page-counter 含 "18"', async ({ page }) => {
+    await mockLayoutWith(page, makeLayout([
+      { content: 'block 0', y1: 0.1, y2: 0.2, order: 0 },
+    ]))
+    await mockMeta(page, { page_count: 22 })
+    await mockPdfFile(page)
+    await page.goto(
+      `/pdf-viewer-dropin/${DROPIN_DOC_ID}?page=18&block_range=${encodeURIComponent('0,0')}`,
+    )
+    await expect(page.getByTestId('page-counter')).toContainText('18', { timeout: 30_000 })
   })
 
   // ── acceptance #8: E1 重新解析按钮在 wrapper 外层正常显示 ────────────
