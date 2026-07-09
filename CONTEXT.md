@@ -58,3 +58,19 @@
 - `node.metadata.block_range`（`(start_block_order, end_block_order)`） — chunk 在该页覆盖的 layout block 区间。
 - `IssueResponse.standard_block_range`（`(start, end)`） — API 暴露给前端，拷贝自 `issue.standard_reference.block_range`。
 - `PdfViewer` URL 参数 `highlight=chunk_text`（保留） — 当 `block_range` 不可用时，`PdfViewer` 走原 `matchHighlightToBlocks` 字符串模糊匹配路线。
+
+## QA 引用体验（V9 PRD #67）
+
+- **内联引用 (Inline Citation)** — QA 回答中"依据来源"不是位于消息末尾，而是作为 `source-document` UIMessage parts 与 `text` parts 按出现顺序交错在 message.parts 中，由前端按顺序渲染成 inline chip。每个 chip 携带 `sourceId`（格式 `src_<doc_id_short>_p<page>`），AI SDK 用它跨 message 去重相同 doc 的多次引用。同一 chat stream 中同一 doc_id 只产生一次 chip（后端按 doc_id 首次出现 emit `source-document`）。
+- **进度指示器 (Progress Indicator)** — 流式渲染中，`tool-*` parts 的 `input-available` / `input-streaming` 状态展现为带 spinner 的轻量提示条（"🧠 搜索中…"），与未来的 source-document 同位置、同 DOM 锚。当 `tool-output-available` 紧跟着 `source-document` 到达后，提示条**就地升级为 chip**（同 React key 复用 DOM，不重排），不展示 input/output JSON。
+  _Avoid_: 当前遗留的 `QA.tsx` 中 `parts.map(...) startsWith('tool-')` 渲染成 `<details>` 折叠块（展开显示 input/output）——QA 页面**不应渲染**该形态。audit 场景可参考该形态但仅作 review。
+- **Preview-on-hover** — chip 的悬浮展示取自 `QASource.content_snippet`；点击行为保持现状：新标签页打开 `/pdf-viewer/<doc_id>?block_range=…`。
+
+## PDF viewer spike routing（V9 PRD #66）
+
+- **生产 PDF viewer** — `frontend/src/pages/PdfViewer.tsx` 基于 `@embedpdf/*` 的 headless plugins（DocumentManager + Viewport + Scroll + Render），由 `frontend/src/App.tsx` 挂在 `/pdf-viewer/:docId`。这是 auditor 点击审核结果 chip 后真正打开的页面。
+- **Drop-in viewer spike** — `frontend/src/pages/PdfViewerDropin.tsx` 基于 `@embedpdf/react-pdf-viewer` 的 `<PDFViewer>` drop-in 组件，并排挂在 `/pdf-viewer-dropin/:docId`（V9 PRD #66）。它是验证性页面，**不替换生产 PdfViewer**：spike 通过后再单独开 PRD 走替换流程；不通过则关闭 issue 并写 `.out-of-scope/dropin-viewer-replacement.md`。
+  _Avoid_: 不要把 `PdfViewerDropin` 当生产路由改 URL — auditor 点的链接仍是 `/pdf-viewer/<doc_id>?block_range=…`。任何把生产 `/pdf-viewer` 改成 dropin 的改动都属于替换 PRD 的范围。
+- **坐标契约（spike 路径）** — drop-in 走 annotation plugin 的 `importAnnotations`，annotation rect 是 **PDF 用户空间**（pt 单位，左下角原点，Y-up）。`lib/layoutMatch.ts` 的 `HighlightRect` 是 **画布像素坐标，顶原点**，不能直接喂给 annotation rect。`PdfViewerDropin.tsx` 内部用 `bbox_norm × page.width/height` 在 spike 侧重新做一次坐标转换（顶 → 左下，pt 化），不修改 `lib/layoutMatch.ts`、不修改 `lib/layoutMatch.test.ts`。
+  _Avoid_: 在 spike 路径上引入 `matchBlockRangeToBlocks` 的输出作为 annotation rect 起点 — 那是 #66 复盘踩过的坑（前一轮 triage 误读了 layoutMatch 注释）。生产 PdfViewer 的 `[data-testid="highlight-rect"]` 百分比 div 路径不受这条约束。
+- **Drop-in 的 only-in-spike 测试钩子** — `PdfViewerDropin.onReady` 把 `PluginRegistry` 挂在 `window.__pdfViewerDropinRegistry: Promise<PluginRegistry>`。仅 E2E 测试（`frontend/e2e/pdf-viewer-dropin.spec.ts`）通过 `page.evaluate` 调它来断言 `annotation.getAnnotations().length`。生产 PdfViewer 没有这个 handle。
