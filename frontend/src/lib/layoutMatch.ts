@@ -111,19 +111,22 @@ function lcsLen(a: string, b: string): number {
   return (prev as Uint16Array)[m]
 }
 
-
 /**
- * LCS ratio：``lcs / min(a.length, b.length)``，值 ∈ [0, 1]。
+ * LCS ratio：``lcs / max(a.length, b.length)``，值 ∈ [0, 1]。
+ *
+ * 用 max 而非 min：把分母放到"较长一侧"后，ratio 衡量的是"较长串有多少字符
+ * 落在较短串的有序子序列里"。否则 highlight 短而 content 长时，content 里
+ * 散落着 highlight 的字符就会被 LCS 当成 1.0 ratio 命中（"应急救援" + 间隔 +
+ * "指挥中心" 的长段落 vs "应急救援指挥中心" 的短 highlight 即典型场景）。
  */
 export function lcsRatio(a: string, b: string): number {
   const na = norm(a)
   const nb = norm(b)
   if (!na.length || !nb.length) return 0
-  const shorter = na.length <= nb.length ? na : nb
-  const longer = na.length <= nb.length ? nb : na
-  // 小串 < MIN_LCS_LEN 时直接 0（与 matchHighlightToBlocks 同步：短串不跑 LCS）
-  if (shorter.length < MIN_LCS_LEN) return 0
-  return lcsLen(shorter, longer) / shorter.length
+  const minLen = Math.min(na.length, nb.length)
+  // 短串 < MIN_LCS_LEN 时直接 0（短串噪声比太高）
+  if (minLen < MIN_LCS_LEN) return 0
+  return lcsLen(na, nb) / Math.max(na.length, nb.length)
 }
 
 
@@ -216,13 +219,12 @@ export function matchHighlightToBlocks(
     let matched =
       normContent.includes(normHighlight) ||
       normHighlight.includes(normContent)
-    // P2：LCS 兜底
+    // P2：LCS 兜底——OCR 单字错场景。ratio = lcs / max（详见 lcsRatio 注释）：
+    // 否则 content 里散落 highlight 字符的"长巧合"会被 LCS 当成完整命中。
     if (!matched) {
-      const shortLen = Math.min(normContent.length, normHighlight.length)
-      if (shortLen >= MIN_LCS_LEN) {
-        const ratio = normContent.length <= normHighlight.length
-          ? lcsLen(normContent, normHighlight) / shortLen
-          : lcsLen(normHighlight, normContent) / shortLen
+      const minLen = Math.min(normContent.length, normHighlight.length)
+      if (minLen >= MIN_LCS_LEN) {
+        const ratio = lcsLen(normHighlight, normContent) / Math.max(normContent.length, normHighlight.length)
         matched = ratio >= LCS_RATIO_THRESHOLD
       }
     }

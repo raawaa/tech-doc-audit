@@ -204,4 +204,29 @@ describe('matchHighlightToBlocks', () => {
     )
     expect(hits).toHaveLength(1)
   })
+
+  // ── Bug B:highlight 字符在 content 里散开不应误命中 ───────────────────────
+  //
+  // 之前 ratio = lcs / min(content, highlight)：content 长且 highlight 短时，
+  // content 里散落 highlight 字符会被 LCS 当成 1.0 命中。典型场景：
+  //   highlight = "应急救援指挥中心" (8 字符)
+  //   content = "...应急救援保障能力...消防急救保障部应及时向公司运行指挥中心报告..."
+  // LCS 把 8 个字符全部按序匹配到 content 里，old ratio = 8/8 = 1.0 → 命中。
+  // 改成 lcs / max 后 ratio = 8/len(content) ≈ 0.12 → 不命中。
+  it('highlight 字符散落长 content 不应误命中（LCS ratio 用 max 而非 min）', () => {
+    const blocks = [
+      // 真实 PDF 里 page 13 的一个段落：包含 "应急救援" + "指挥中心"，
+      // 中间隔了 25+ 个字符。LCS 按序数得 8/8 → 旧逻辑误判。
+      makeBlock(
+        '公司消防、医疗救护相关设备物资发生报废、故障、检修等情况，造成机场应急救援保障能力降低的，消防急救保障部应及时向公司运行指挥中心报告。',
+        [0.1, 0.3, 0.9, 0.4],
+      ),
+      // 真命中的对照块——"应急救援指挥中心" 整段在这
+      makeBlock('第八条 应急救援指挥中心', [0.1, 0.1, 0.9, 0.2]),
+    ]
+    const hits = matchHighlightToBlocks('应急救援指挥中心', blocks, W, H)
+    // 只应命中第 2 个 block（包含真短语的那条），不应命中第 1 个（散落命中）。
+    expect(hits).toHaveLength(1)
+    expect(hits[0].y).toBe(200) // 第 2 个 block 的 y = 0.1 * H = 200
+  })
 })

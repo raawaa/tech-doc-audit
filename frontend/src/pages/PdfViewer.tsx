@@ -1,10 +1,39 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+/**
+ * PdfViewer: 用 @embedpdf/* headless plugins 渲染 PDF,
+ * URL 契约 `?page=` / `?block_range=` / `?highlight=` 全部接入。
+ *
+ * Slice 1 (#63): react-pdf + react-virtuoso → embedpdf DocumentManager +
+ * Viewport + Scroll + Render。高亮机制由 canvas fillRect 改为页面 wrapper
+ * 上叠 percentage `<div data-testid="highlight-rect">`。
+ *
+ * Slice 2 (#64): URL → 自动跳页 / 坐标高亮 / 文本匹配 fallback 三条路径
+ * 全部接通。`useScrollCapability().onLayoutReady` 是"layout 准备好可跳"的
+ * 信号,比之前的 `lastScrollSignatureRef` latch 稳定。
+ *
+ * 已知约束 (Slice 3 已验证):
+ * - `usePdfiumEngine({ worker: false })` 避开 Vite dev 下 inline-blob-worker 卡死
+ * - 2026-07-09 #65 验证 production build (vite preview) worker: true 同样卡死,
+ *   见 issue #62 父评论。Follow-up:embedpdf 2.15+ 或 vendored worker
+ */
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useParams, useSearchParams } from 'react-router-dom'
 import { Loader2 } from 'lucide-react'
-import { Document, Page, pdfjs } from 'react-pdf'
-import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
-import 'react-pdf/dist/Page/AnnotationLayer.css'
-import 'react-pdf/dist/Page/TextLayer.css'
+import { createPluginRegistration } from '@embedpdf/core'
+import { EmbedPDF } from '@embedpdf/core/react'
+import { usePdfiumEngine } from '@embedpdf/engines/react'
+import { Viewport, ViewportPluginPackage } from '@embedpdf/plugin-viewport/react'
+import {
+  Scroller,
+  ScrollPluginPackage,
+  ScrollStrategy,
+  useScroll,
+  useScrollCapability,
+} from '@embedpdf/plugin-scroll/react'
+import {
+  DocumentContent,
+  DocumentManagerPluginPackage,
+} from '@embedpdf/plugin-document-manager/react'
+import { RenderLayer, RenderPluginPackage } from '@embedpdf/plugin-render/react'
 import {
   matchBlockRangeToBlocks,
   matchHighlightToBlocks,
@@ -12,15 +41,41 @@ import {
   type HighlightRect,
 } from '../lib/layoutMatch'
 
-// 设置 worker — react-pdf 和 pdfjs-dist 共用同一个 worker
-const WORKER_SRC = '/pdfjs/pdf.worker.min.mjs'
-pdfjs.GlobalWorkerOptions.workerSrc = WORKER_SRC
+// ── URL 解析 helpers ──────────────────────────────────────────────────────
 
-/**
- * 服务端 /layout 返回的页面 layout 一项。
- * page 是 0-based，width / height 在这里仅用于 aspect ratio 校验（实际显示
- * 尺寸由 react-pdf <Page> 渲染时的 canvas 决定）。
+/** ``block_range`` URL 参数 ``"start,end"`` → ``[start, end] | null``。
+ *  V8-S6:AuditResult → PDF viewer 的标准链接 ``?block_range=start,end&page=N``
+ *  经此处解析;失败 / 未命中 → fallback 到 `matchHighlightToBlocks` 文本匹配。
  */
+function parseBlockRangeParam(raw: string | null): [number, number] | null {
+  if (!raw) return null
+  const parts = raw.split(',')
+  if (parts.length !== 2) return null
+  const start = Number.parseInt(parts[0].trim(), 10)
+  const end = Number.parseInt(parts[1].trim(), 10)
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null
+  if (start < 0 || end < start) return null
+  return [start, end]
+}
+
+/** 更新 search params 时保留其他键(block_range / highlight 等)——
+ *  object-form setSearchParams 会 wipe 整张表,会破坏 V8 URL 契约。
+ *  改用 functional form,把目标键以外的全部 copy 过去。
+ */
+function updateSearchParam(
+  setSearchParams: ReturnType<typeof useSearchParams>[1],
+  key: string,
+  value: string,
+) {
+  setSearchParams(prev => {
+    const next = new URLSearchParams(prev)
+    next.set(key, value)
+    return next
+  })
+}
+
+// ── layout / meta 类型 ────────────────────────────────────────────────────
+
 interface LayoutPage {
   page: number
   width: number
@@ -33,6 +88,12 @@ interface LayoutDoc {
   has_layout: boolean
 }
 
+interface LayoutState {
+  data: LayoutDoc | null
+  loading: boolean
+  error: 'not-found' | 'other' | null
+}
+
 interface DocMeta {
   id: string
   name: string
@@ -40,84 +101,261 @@ interface DocMeta {
   page_count: number | null
 }
 
-/** layout fetch 的状态机。 */
-interface LayoutState {
-  data: LayoutDoc | null
-  loading: boolean
-  error: 'not-found' | 'other' | null
-}
-
 const INITIAL_LAYOUT: LayoutState = { data: null, loading: false, error: null }
 
+// ── 命中计算：layout + URL 三条路径汇成一份 "命中 per 0-based page" ─────
 
-/** 解析 ``block_range`` URL 参数 ``"start,end"`` → ``[start, end] | null``。
-
-V8-S6:后端 IssueResponse.standard_block_range 经 AuditResult 跳转时通过 URL
-``?block_range=start,end&page=N`` 传递；这里是该路径的入口。
-解析失败 / 缺字段 / 反序 → null,走 fallback。
-*/
-function parseBlockRangeParam(raw: string | null): [number, number] | null {
-  if (!raw) return null
-  const parts = raw.split(',')
-  if (parts.length !== 2) return null
-  const start = Number.parseInt(parts[0].trim(), 10)
-  const end = Number.parseInt(parts[1].trim(), 10)
-  if (!Number.isFinite(start) || !Number.isFinite(end)) return null
-  if (start < 0 || end < start) return null
-  return [start, end]
+interface HitsResult {
+  hitsByPage: Map<number, HighlightRect[]>
+  firstHitPage0: number | null
+  pagePdfDims: Map<number, { w: number; h: number }>
 }
 
+/** 把 URL 三条路径 (block_range / highlight fallback / 都无) 汇成 hits map。
+ *  - block_range 命中(>0 hits):记下 hits,firstHit = 命中页 0-based
+ *  - block_range 不命中(0 hits)+ highlight 存在:fallback 到 highlight 全页扫描
+ *  - highlight 命中:记下所有命中页的 rects,firstHit = 最小命中页 0-based
+ *  - 都无:空 map
+ *
+ *  pagePdfDims 永远收集所有出现过的页(供 PageView 算 percentage 用)。
+ */
+function computeHits(
+  layout: LayoutDoc | null,
+  blockRange: [number, number] | null,
+  highlight: string,
+  urlPage: number,
+): HitsResult {
+  const hitsByPage = new Map<number, HighlightRect[]>()
+  const pagePdfDims = new Map<number, { w: number; h: number }>()
+  let firstHitPage0: number | null = null
+  if (!layout) return { hitsByPage, firstHitPage0, pagePdfDims }
+
+  const tryBlockRange = (): boolean => {
+    if (!blockRange) return false
+    const targetPage0 = urlPage - 1
+    const page = layout.layout.find(p => p.page === targetPage0)
+    if (!page) return false
+    const pageW = Math.max(page.width, 1)
+    const pageH = Math.max(page.height, 1)
+    pagePdfDims.set(page.page, { w: pageW, h: pageH })
+    const hits = matchBlockRangeToBlocks(
+      blockRange, page.blocks, pageW, pageH, page.page,
+    )
+    if (hits.length === 0) return false
+    hitsByPage.set(page.page, hits)
+    firstHitPage0 = page.page
+    return true
+  }
+
+  const scanAllPagesByText = () => {
+    for (const page of layout.layout) {
+      const pageW = Math.max(page.width, 1)
+      const pageH = Math.max(page.height, 1)
+      pagePdfDims.set(page.page, { w: pageW, h: pageH })
+      const hits = matchHighlightToBlocks(
+        highlight, page.blocks, pageW, pageH, page.page,
+      )
+      if (hits.length > 0) {
+        hitsByPage.set(page.page, hits)
+        if (firstHitPage0 === null || page.page < firstHitPage0) {
+          firstHitPage0 = page.page
+        }
+      }
+    }
+  }
+
+  if (tryBlockRange()) return { hitsByPage, firstHitPage0, pagePdfDims }
+  if (highlight) scanAllPagesByText()
+  return { hitsByPage, firstHitPage0, pagePdfDims }
+}
+
+// ── 单页渲染：embedpdf RenderLayer + 命中 rects overlay ─────────────────
+
+function PageView(props: {
+  documentId: string
+  pageIndex: number
+  width: number
+  height: number
+  hits: HighlightRect[]
+  pagePdfWidth: number
+  pagePdfHeight: number
+}) {
+  const { documentId, pageIndex, width, height, hits, pagePdfWidth, pagePdfHeight } = props
+  return (
+    <div
+      data-testid="pdf-page"
+      data-page-index={pageIndex}
+      style={{ width, height, position: 'relative' }}
+    >
+      <RenderLayer documentId={documentId} pageIndex={pageIndex} />
+      {hits.length > 0 && (
+        <div
+          className="absolute inset-0 pointer-events-none"
+          data-testid="highlight-overlay"
+        >
+          {hits.map((h, i) => {
+            const leftPct = (h.x / pagePdfWidth) * 100
+            const topPct = (h.y / pagePdfHeight) * 100
+            const wPct = (h.w / pagePdfWidth) * 100
+            const hPct = (h.h / pagePdfHeight) * 100
+            return (
+              <div
+                key={i}
+                data-testid="highlight-rect"
+                style={{
+                  position: 'absolute',
+                  left: `${leftPct}%`,
+                  top: `${topPct}%`,
+                  width: `${wPct}%`,
+                  height: `${hPct}%`,
+                  background: 'rgba(255, 255, 0, 0.4)',
+                  border: '1px solid rgba(255, 200, 0, 0.7)',
+                }}
+              />
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── embedpdf 视图（拿到 engine 后才能挂载）───────────────────────────────
+
+function EmbedContent(props: {
+  documentId: string
+  layout: LayoutDoc | null
+  blockRange: [number, number] | null
+  highlight: string
+  urlPage: number
+  onJump: (page: number) => void
+}) {
+  const { documentId, layout, blockRange, highlight, urlPage, onJump } = props
+  const { provides: cap } = useScrollCapability()
+  const { state } = useScroll(documentId)
+  const { hitsByPage, firstHitPage0, pagePdfDims } = useMemo(
+    () => computeHits(layout, blockRange, highlight, urlPage),
+    [layout, blockRange, highlight, urlPage],
+  )
+
+  // 自动跳页 — 等 embedpdf onLayoutReady 触发后再 scrollToPage。
+  // ref latch + urlPage 入参保证每文档仅跳一次:
+  //   - 首次 mount 跳到 firstHitPage0(若有)/ urlPage
+  //   - 后续 urlPage 变化(layout refresh)不重跳——用户 header 跳页走 cap.scrollToPage 直接调
+  const jumpedRef = useRef(false)
+  useEffect(() => {
+    if (!cap) return
+    if (jumpedRef.current) return
+    const target = firstHitPage0 !== null ? firstHitPage0 + 1 : urlPage
+    const off = cap.onLayoutReady((evt) => {
+      if (jumpedRef.current) return
+      if (evt.documentId !== documentId) return
+      jumpedRef.current = true
+      off()
+      cap.scrollToPage({ pageNumber: target, behavior: 'auto' })
+    })
+    return () => {
+      if (!jumpedRef.current) off()
+    }
+  }, [cap, documentId, firstHitPage0, urlPage])
+
+  const handleHeaderJump = useCallback((n: number) => {
+    if (!cap) return
+    cap.scrollToPage({ pageNumber: n, behavior: 'auto' })
+    onJump(n)
+  }, [cap, onJump])
+
+  return (
+    <Viewport documentId={documentId} className="bg-slate-100">
+      <div className="absolute top-2 right-2 z-10 bg-white border border-slate-200 rounded shadow px-3 py-1 text-xs flex items-center gap-2">
+        <span data-testid="page-counter">
+          {state.currentPage} / {state.totalPages} 页
+        </span>
+        <span>跳至</span>
+        <input
+          type="number"
+          className="w-14 px-2 py-1 border rounded text-center text-xs"
+          min={1}
+          max={state.totalPages || undefined}
+          defaultValue={String(urlPage)}
+          onKeyDown={e => {
+            if (e.key === 'Enter') {
+              const n = parseInt((e.target as HTMLInputElement).value, 10)
+              if (!Number.isFinite(n) || n < 1) return
+              if (state.totalPages && n > state.totalPages) return
+              handleHeaderJump(n)
+            }
+          }}
+          data-testid="page-jump-input"
+        />
+        <span>页</span>
+      </div>
+      <Scroller
+        documentId={documentId}
+        renderPage={({ pageIndex, width, height }) => {
+          const dims = pagePdfDims.get(pageIndex) || { w: width, h: height }
+          return (
+            <PageView
+              documentId={documentId}
+              pageIndex={pageIndex}
+              width={width}
+              height={height}
+              hits={hitsByPage.get(pageIndex) || []}
+              pagePdfWidth={dims.w}
+              pagePdfHeight={dims.h}
+            />
+          )
+        }}
+      />
+    </Viewport>
+  )
+}
+
+// ── 顶层 PdfViewer：负责 meta / layout / engine 初始化 + 状态机 ─────────
 
 export function PdfViewer() {
-  const pathname = window.location.pathname
-  const docId = pathname.split('/').pop() || ''
+  const { docId: docIdParam } = useParams<{ docId: string }>()
+  const docId = docIdParam || ''
   const [searchParams, setSearchParams] = useSearchParams()
   const targetPage = parseInt(searchParams.get('page') || '1', 10)
   const highlight = searchParams.get('highlight') || ''
-  // V8-S6:正向 block_range 坐标路径(优先级高于字符串匹配)。
-  // 解析失败 / 缺字段 → null → 走 matchHighlightToBlocks fallback。
   const blockRange = parseBlockRangeParam(searchParams.get('block_range'))
-  // V8-S6:block_range 路径只画起始页(MVP 限制,与后端 page_number 同语义)。
-  const blockRangePage0 = blockRange && targetPage > 0 ? targetPage - 1 : null
 
   const [meta, setMeta] = useState<DocMeta | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [numPages, setNumPages] = useState(0)
-
-  // —— 布局数据（V7.3）——
   const [layout, setLayout] = useState<LayoutState>(INITIAL_LAYOUT)
-  // —— 重新解析状态（E1 按钮）——
   const [reparsing, setReparsing] = useState(false)
+  const [textContent, setTextContent] = useState('')
+  const [textTotalPages, setTextTotalPages] = useState(0)
 
-  // —— 绘制层状态（命令式，不触发重渲）——
-  // 当前已挂载页的 canvas（Virtuoso 只挂载视口内的页）
-  const pageCanvasRefs = useRef<Map<number, HTMLCanvasElement>>(new Map())
-  // 已画过高亮的页（避免同一画布重复绘制；卸载时清除以便重挂后重画）
-  const paintedPages = useRef<Set<number>>(new Set())
-
-  // —— 匹配层产出：仅缓存归一化坐标 + page 索引 ——
-  // { 页号 → 命中 block（归一化坐标）}
-  const normalizedHitsByPage = useRef<Map<number, HighlightRect[]>>(new Map())
-  // 第一个命中所在页号；用于 scrollToIndex
-  const firstHitPage = useRef<number | null>(null)
-
-  const virtuosoRef = useRef<VirtuosoHandle>(null)
+  // 顶层拿不到 useScrollCapability()(它依赖 <EmbedPDF> 上下文)。
+  // header 的 PDF 状态显示由 PdfStatus 内部用 useScrollCapability
+  // (在 <EmbedPDF> 内部的子组件里) 处理。顶层 PdfStatus 不显示 PDF 状态。
+  // 这里只显示 DOCX nav 跳页。
 
   const apiBase = import.meta.env.VITE_API_BASE_URL || ''
-  const pdfUrl = meta?.file_type === 'pdf' ? `${apiBase}/api/v1/kb-documents/${docId}/file` : null
+  const pdfUrl =
+    meta?.file_type === 'pdf'
+      ? `${apiBase}/api/v1/kb-documents/${docId}/file`
+      : null
 
-  // 获取文档元数据
+  // ── 文档 meta ────────────────────────────────────────────────────────
   useEffect(() => {
-    const apiBase = import.meta.env.VITE_API_BASE_URL || ''
-    fetch(`${apiBase}/api/v1/kb-documents/${docId}`)
+    if (!docId) return
+    const ctrl = new AbortController()
+    fetch(`${apiBase}/api/v1/kb-documents/${docId}`, { signal: ctrl.signal })
       .then(r => { if (!r.ok) throw new Error('文档不存在'); return r.json() })
       .then(m => setMeta(m))
-      .catch(e => setError(e.message))
+      .catch(e => {
+        if (e instanceof DOMException && e.name === 'AbortError') return
+        setError(e.message)
+      })
       .finally(() => setLoading(false))
-  }, [docId])
+    return () => ctrl.abort()
+  }, [docId, apiBase])
 
-  // mount 时 fetch layout
+  // ── layout ───────────────────────────────────────────────────────────
   useEffect(() => {
     if (!meta || meta.file_type !== 'pdf') return
     const ctrl = new AbortController()
@@ -140,126 +378,56 @@ export function PdfViewer() {
         setLayout({ data: null, loading: false, error: 'other' })
       })
     return () => ctrl.abort()
-  }, [meta, docId])
+  }, [meta, docId, apiBase])
 
-  // 追踪 react-pdf 总页数
-  function handleDocumentLoadSuccess({ numPages: total }: { numPages: number }) {
-    setNumPages(total)
-  }
+  // ── DOCX/MD 文本降级 ────────────────────────────────────────────────
+  useEffect(() => {
+    if (!meta || meta.file_type === 'pdf') return
+    const ctrl = new AbortController()
+    const page = Math.max(targetPage - 1, 0)
+    fetch(`${apiBase}/api/v1/kb-documents/${docId}/page/${page}`, { signal: ctrl.signal })
+      .then(r => {
+        if (!r.ok) throw new Error(`text page fetch ${r.status}`)
+        return r.json()
+      })
+      .then(d => { setTextContent(d.text); setTextTotalPages(d.total_pages) })
+      .catch(e => {
+        if (e instanceof DOMException && e.name === 'AbortError') return
+        setError(e.message)
+      })
+    return () => ctrl.abort()
+  }, [meta, docId, targetPage, apiBase])
 
-  // 高亮计算：layout + (block_range | highlight) 就绪后一次性算所有命中，
-  // **保留归一化坐标**（实际绘制在 page render success 时按 canvas 显示尺寸换算）。
+  // ── embedpdf engine + plugins ────────────────────────────────────────
   //
-  // V8-S6 路径优先级：
-  // 1. ``block_range`` 非空 + layout 已加载 → 走 ``matchBlockRangeToBlocks`` 坐标路径
-  //    （仅画起始页，跨页 chunk MVP 限制）。
-  // 2. 否则 ``highlight`` 非空 → 走 ``matchHighlightToBlocks`` 字符串匹配 fallback
-  //    （旧 KB chunk 兼容）。
-  useEffect(() => {
-    const useBlockRange = !!(blockRange && layout.data && numPages)
-    const useFallback = !!(highlight && layout.data && numPages)
+  // worker: false (deferred) — 2026-07 spike 验证 Vite dev 下 inline-blob-worker
+  // 初始化卡死,2026-07-09 #65 验证 production build (vite preview) worker: true
+  // 同样卡死(`isLoaded=false isLoading=true` 永不变;wasm 永远不被 worker 拉取)。
+  // 留 follow-up 给 #62 父 issue 排查 inline-blob-worker + pdfium.wasm 跨
+  // worker 上下文 fetch 失败的原因。
+  const {
+    engine,
+    isLoading: engineLoading,
+    error: engineError,
+  } = usePdfiumEngine({ wasmUrl: '/pdfium.wasm', worker: false })
 
-    if (!useBlockRange && !useFallback) {
-      normalizedHitsByPage.current = new Map()
-      firstHitPage.current = null
-      if (pageCanvasRefs.current.size > 0) {
-        pageCanvasRefs.current.forEach((_, pageNum) => {
-          paintedPages.current.delete(pageNum)
-        })
-      }
-      return
-    }
-    const allHits = new Map<number, HighlightRect[]>()
-    let firstPage: number | null = null
+  const plugins = useMemo(
+    () => [
+      createPluginRegistration(DocumentManagerPluginPackage, {
+        initialDocuments: pdfUrl ? [{ url: pdfUrl, documentId: docId }] : [],
+      }),
+      createPluginRegistration(ViewportPluginPackage, { viewportGap: 10 }),
+      createPluginRegistration(ScrollPluginPackage, {
+        defaultStrategy: ScrollStrategy.Vertical,
+        defaultPageGap: 10,
+        defaultBufferSize: 2,
+      }),
+      createPluginRegistration(RenderPluginPackage),
+    ],
+    [pdfUrl, docId],
+  )
 
-    if (useBlockRange && blockRange && layout.data) {
-      // 坐标路径：只在起始页（blockRangePage0）画
-      const targetPage0 = blockRangePage0!
-      const page = layout.data.layout.find(p => p.page === targetPage0)
-      if (page) {
-        const pageW = Math.max(page.width, 1)
-        const pageH = Math.max(page.height, 1)
-        const hits = matchBlockRangeToBlocks(
-          blockRange, page.blocks, pageW, pageH, page.page,
-        )
-        if (hits.length > 0) {
-          allHits.set(page.page, hits)
-          firstPage = page.page
-        }
-      }
-    } else if (useFallback && highlight && layout.data) {
-      // 字符串匹配 fallback
-      for (const page of layout.data.layout) {
-        const pageW = Math.max(page.width, 1)
-        const pageH = Math.max(page.height, 1)
-        const hits = matchHighlightToBlocks(
-          highlight, page.blocks, pageW, pageH, page.page,
-        )
-        if (hits.length > 0) {
-          allHits.set(page.page, hits)
-          if (firstPage === null || page.page < firstPage) firstPage = page.page
-        }
-      }
-    }
-
-    normalizedHitsByPage.current = allHits
-    firstHitPage.current = firstPage
-    // 让已挂载页重画：fillStyle+fillRect 直接画（layoutMatch 单测覆盖了
-  // bbox_norm → 像素换算语义），同时把 paintedPages 重置以便 onRenderSuccess
-  // 回调对后续 mount 的页继续画。
-    paintedPages.current = new Set()
-    pageCanvasRefs.current.forEach((canvas, pageNum) => {
-      const hits = allHits.get(pageNum)
-      if (!hits) return
-      const ctx = canvas.getContext('2d')
-      if (!ctx) return
-      ctx.fillStyle = 'rgba(255, 255, 0, 0.4)'
-      for (const h of hits) ctx.fillRect(h.x, h.y, h.w, h.h)
-      paintedPages.current.add(pageNum)
-    })
-  }, [layout.data, highlight, numPages, blockRange, blockRangePage0])
-  // —— 滚动到第一命中页或 URL targetPage ——
-  // 用签名（docId + firstHitPage + targetPage + blockRange）作 latch，避免 URL
-  // `page=` 改了但没 remount 时不触发；同时 highlight / block_range 命中变化
-  // （layout data 换新）也重滚。
-  const lastScrollSignatureRef = useRef<string | null>(null)
-  useEffect(() => {
-    if (numPages <= 0) return
-    const signature = `${docId}|${firstHitPage.current}|${targetPage}|${blockRange ? blockRange.join(',') : ''}`
-    if (lastScrollSignatureRef.current === signature) return
-    lastScrollSignatureRef.current = signature
-    const target = firstHitPage.current !== null
-      ? firstHitPage.current + 1  // 0-based → 1-based 显示
-      : targetPage
-    const idx = Math.min(Math.max(target - 1, 0), numPages - 1)
-    requestAnimationFrame(() => virtuosoRef.current?.scrollToIndex(idx))
-  }, [docId, numPages, targetPage, layout.data, highlight, blockRange])
-
-  // 绘制层：某页渲染完成时画归一化命中（内联 fillStyle+fillRect，与上文
-  // 匹配完成时绘制共用同一绘制入口；真正需要被单测的是 layoutMatch 模块）。
-  const handlePageRenderSuccess = useCallback((pageNumber: number) => {
-    const hits = normalizedHitsByPage.current.get(pageNumber)
-    if (!hits || paintedPages.current.has(pageNumber)) return
-    const canvas = pageCanvasRefs.current.get(pageNumber)
-    if (!canvas) return
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
-    ctx.fillStyle = 'rgba(255, 255, 0, 0.4)'
-    for (const h of hits) ctx.fillRect(h.x, h.y, h.w, h.h)
-    paintedPages.current.add(pageNumber)
-  }, [])
-
-  // canvas 注入
-  const registerCanvas = useCallback((pageNumber: number) => (ref: HTMLCanvasElement | null) => {
-    if (ref) {
-      pageCanvasRefs.current.set(pageNumber, ref)
-    } else {
-      pageCanvasRefs.current.delete(pageNumber)
-      paintedPages.current.delete(pageNumber)
-    }
-  }, [])
-
-  // E1 重新解析按钮
+  // ── E1 重新解析按钮 ──────────────────────────────────────────────────
   const handleReparse = useCallback(async () => {
     setReparsing(true)
     try {
@@ -277,36 +445,26 @@ export function PdfViewer() {
     }
   }, [apiBase, docId])
 
-  // 页码跳转（PDF 模式）
-  const handleJumpToPage = (page: number) => {
-    if (numPages <= 0) return
-    const clamped = Math.min(Math.max(page, 1), numPages)
-    virtuosoRef.current?.scrollToIndex(clamped - 1)
+  // ── 顶层状态机 ───────────────────────────────────────────────────────
+  if (loading) {
+    return (
+      <div className="flex justify-center py-20">
+        <Loader2 className="w-6 h-6 animate-spin text-slate-400" />
+      </div>
+    )
+  }
+  if (error && !meta) {
+    return <div className="text-center py-20 text-red-500">{error}</div>
+  }
+  if (!meta) {
+    return <div className="text-center py-20 text-slate-500">文档不存在</div>
   }
 
-  // 文本降级模式（DOCX/MD）
-  const [textContent, setTextContent] = useState('')
-  const [textTotalPages, setTextTotalPages] = useState(0)
-
-  useEffect(() => {
-    if (!meta || meta.file_type === 'pdf') return
-    const apiBase = import.meta.env.VITE_API_BASE_URL || ''
-    const page = Math.max(targetPage - 1, 0)
-    fetch(`${apiBase}/api/v1/kb-documents/${docId}/page/${page}`)
-      .then(r => r.json())
-      .then(d => { setTextContent(d.text); setTextTotalPages(d.total_pages) })
-      .catch(e => setError(e.message))
-  }, [meta, docId, targetPage])
-
-  if (loading) return <div className="flex justify-center py-20"><Loader2 className="w-6 h-6 animate-spin text-slate-400" /></div>
-  if (error) return <div className="text-center py-20 text-red-500">{error}</div>
-  if (!meta) return <div className="text-center py-20 text-slate-500">文档不存在</div>
-
-  const showE1 = layout.error === 'not-found' && !!highlight
-  const showE2 = layout.error === 'other' && !!highlight
+  const showE1 = layout.error === 'not-found' && (!!highlight || !!blockRange)
+  const showE2 = layout.error === 'other' && (!!highlight || !!blockRange)
 
   return (
-    <div className="min-h-screen bg-slate-100">
+    <div data-testid="pdf-viewer" className="min-h-screen bg-slate-100">
       {/* Header */}
       <div className="sticky top-0 z-10 bg-white border-b border-slate-200 px-4 py-3 flex items-center justify-between shadow-sm">
         <div>
@@ -314,36 +472,28 @@ export function PdfViewer() {
           <p className="text-xs text-slate-400">{meta.file_type.toUpperCase()} · {meta.page_count || '?'} 页</p>
         </div>
         <div className="flex items-center gap-3 text-sm">
-          {numPages > 0 && (
-            <div className="flex items-center gap-2 text-xs text-slate-500">
-              <span>跳至</span>
-              <input
-                type="number"
-                className="w-14 px-2 py-1 border rounded text-center text-xs"
-                min={1}
-                max={numPages}
-                defaultValue={targetPage}
-                onKeyDown={e => {
-                  if (e.key === 'Enter') {
-                    handleJumpToPage(parseInt((e.target as HTMLInputElement).value))
-                  }
-                }}
-              />
-              <span>页 / 共 {numPages} 页</span>
-            </div>
+          {meta.file_type === 'pdf' && !engineLoading && !engineError && engine && (
+            <PdfHeaderStatus
+              meta={meta}
+              targetPage={targetPage}
+              onJump={n => updateSearchParam(setSearchParams, 'page', String(n))}
+            />
           )}
-          {!numPages && textTotalPages > 0 && (
-            <>
-              <button className="px-2 py-1 rounded hover:bg-slate-100 disabled:opacity-30"
-                disabled={targetPage <= 1}
-                onClick={() => setSearchParams({ page: String(targetPage - 1) })}>←</button>
-              <span className="text-slate-600 tabular-nums text-sm">{targetPage} / {textTotalPages}</span>
-              <button className="px-2 py-1 rounded hover:bg-slate-100 disabled:opacity-30"
-                disabled={targetPage >= textTotalPages}
-                onClick={() => setSearchParams({ page: String(targetPage + 1) })}>→</button>
-            </>
+          {!engineLoading && engineError && (
+            <span className="text-xs text-red-500">引擎错误：{engineError.message}</span>
+          )}
+          {engineLoading && (
+            <span className="text-xs text-slate-400">PDF 引擎加载中…</span>
+          )}
+          {meta.file_type !== 'pdf' && textTotalPages > 0 && (
+            <TextNav
+              targetPage={targetPage}
+              textTotalPages={textTotalPages}
+              onJump={n => updateSearchParam(setSearchParams, 'page', String(n))}
+            />
           )}
           {highlight && <span className="text-xs text-amber-600 ml-2">🔍 高亮: {highlight.slice(0, 50)}</span>}
+          {blockRange && <span className="text-xs text-amber-600 ml-2">📍 block_range: {blockRange.join(',')}</span>}
           {showE1 && (
             <div className="flex items-center gap-2 ml-2 text-xs text-slate-400">
               <span>该文档未解析，无法定位引用位置</span>
@@ -366,53 +516,56 @@ export function PdfViewer() {
 
       {/* Content */}
       {meta.file_type === 'pdf' ? (
-        <div style={{ height: 'calc(100vh - 57px)' }}>
-          {pdfUrl && (
-            <Document
-              className="h-full"
-              file={pdfUrl}
-              onLoadSuccess={handleDocumentLoadSuccess}
-              loading={
-                <div className="flex justify-center py-20">
-                  <Loader2 className="w-6 h-6 animate-spin text-slate-400" />
-                </div>
-              }
-              error={
-                <div className="text-center py-20 text-red-500">
-                  PDF 加载失败，请刷新重试
-                </div>
-              }
-            >
-              <Virtuoso
-                ref={virtuosoRef}
-                totalCount={numPages}
-                defaultItemHeight={1100}
-                increaseViewportBy={{ top: 800, bottom: 800 }}
-                style={{ height: '100%' }}
-                itemContent={index => {
-                  const pageNumber = index + 1
+        <div style={{ height: 'calc(100vh - 57px)' }} className="relative">
+          {engineLoading && (
+            <div data-testid="engine-loading" className="flex justify-center py-20">
+              <Loader2 className="w-6 h-6 animate-spin text-slate-400" />
+            </div>
+          )}
+          {engineError && (
+            <div className="text-center py-20 text-red-500">
+              PDF 引擎初始化失败：{engineError.message}
+            </div>
+          )}
+          {engine && (
+            <EmbedPDF engine={engine} plugins={plugins}>
+              {({ activeDocumentId }) => {
+                if (!activeDocumentId) {
                   return (
-                    <div
-                      key={`page_${pageNumber}`}
-                      data-page-number={pageNumber}
-                      className="flex justify-center py-2"
-                    >
-                      <Page
-                        pageNumber={pageNumber}
-                        canvasRef={registerCanvas(pageNumber)}
-                        onRenderSuccess={() => handlePageRenderSuccess(pageNumber)}
-                        renderTextLayer={false}
-                        className="bg-white shadow-lg rounded"
-                      />
+                    <div data-testid="no-active-doc" className="p-4 text-slate-500 text-sm">
+                      等待文档加载…
                     </div>
                   )
-                }}
-              />
-            </Document>
+                }
+                return (
+                  <DocumentContent documentId={activeDocumentId}>
+                    {({ isLoaded }) => {
+                      if (!isLoaded) {
+                        return (
+                          <div className="flex justify-center py-20">
+                            <Loader2 className="w-6 h-6 animate-spin text-slate-400" />
+                          </div>
+                        )
+                      }
+                      return (
+                        <EmbedContent
+                          documentId={activeDocumentId}
+                          layout={layout.data}
+                          blockRange={blockRange}
+                          highlight={highlight}
+                          urlPage={targetPage}
+                          onJump={n => updateSearchParam(setSearchParams, 'page', String(n))}
+                        />
+                      )
+                    }}
+                  </DocumentContent>
+                )
+              }}
+            </EmbedPDF>
           )}
         </div>
       ) : (
-        <div className="flex justify-center py-6">
+        <div className="flex justify-center py-6" data-testid="text-fallback">
           <div className="bg-white shadow-lg rounded p-8 max-w-3xl w-full">
             <pre className="text-sm text-slate-700 whitespace-pre-wrap font-sans leading-relaxed">
               {textContent || '（该页无文本内容）'}
@@ -427,3 +580,55 @@ export function PdfViewer() {
   )
 }
 
+// ── 子组件 ────────────────────────────────────────────────────────────────
+
+/** 顶层 header 上的 PDF 状态(只能在 <EmbedPDF> 外的 React 树渲染)。
+ *  这里只显示 doc 元信息(后端的 page_count)+ URL 目标页。
+ *  实时 currentPage / 跳转输入框由 EmbedContent 在 <EmbedPDF> 内渲染。
+ */
+function PdfHeaderStatus(props: {
+  meta: DocMeta
+  targetPage: number
+  onJump: (page: number) => void
+}) {
+  const { meta, targetPage, onJump } = props
+  return (
+    <div className="flex items-center gap-2 text-xs text-slate-500">
+      <span>目标页 {targetPage}</span>
+      <span>共 {meta.page_count || '?'} 页</span>
+      <button
+        className="px-2 py-1 rounded border border-slate-300 hover:bg-slate-50"
+        onClick={() => onJump(Math.max(targetPage - 1, 1))}
+        data-testid="header-prev-page"
+      >←</button>
+      <button
+        className="px-2 py-1 rounded border border-slate-300 hover:bg-slate-50"
+        onClick={() => onJump(targetPage + 1)}
+        data-testid="header-next-page"
+      >→</button>
+    </div>
+  )
+}
+
+function TextNav(props: {
+  targetPage: number
+  textTotalPages: number
+  onJump: (page: number) => void
+}) {
+  const { targetPage, textTotalPages, onJump } = props
+  return (
+    <>
+      <button
+        className="px-2 py-1 rounded hover:bg-slate-100 disabled:opacity-30"
+        disabled={targetPage <= 1}
+        onClick={() => onJump(targetPage - 1)}
+      >←</button>
+      <span className="text-slate-600 tabular-nums text-sm">{targetPage} / {textTotalPages}</span>
+      <button
+        className="px-2 py-1 rounded hover:bg-slate-100 disabled:opacity-30"
+        disabled={targetPage >= textTotalPages}
+        onClick={() => onJump(targetPage + 1)}
+      >→</button>
+    </>
+  )
+}
