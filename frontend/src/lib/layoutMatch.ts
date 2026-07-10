@@ -243,3 +243,41 @@ export function matchHighlightToBlocks(
   }
   return hits
 }
+
+
+/**
+ * 单 block 的 highlight 判定(T1 includes + P2 LCS 兜底),与
+ * ``matchHighlightToBlocks`` 内部用的判定语义一致。
+ *
+ * 用途:调用方已经知道一个 ``Block``,只想判定它是否命中某个 highlight 串,
+ * 而不需要 ``HighlightRect`` 输出。例如 spike 后端用 annotation plugin
+ * ``importAnnotations`` 路径,关心"哪些 block 命中"而不是"画布像素矩形
+ * 顶点坐标"。把判定抽出来避免 spike 复制一份 N3+includes+LCS。
+ *
+ * 退化路径(spike 端不再需要):
+ * - ``bbox_norm`` 不合格:仍判 true,只跳过画 rect 这一步(本函数无 rect)。
+ *
+ * @param block  输入的 layout block
+ * @param highlight  URL 参数 ``highlight`` 字符串(原始,未归一化)
+ * @returns  true = 命中 / false = 不命中
+ */
+export function blockMatchesHighlight(block: Block, highlight: string): boolean {
+  const normHighlight = norm(highlight)
+  if (!normHighlight) return false
+  const content = block.block_content || ''
+  if (!content) return false
+  const normContent = norm(content)
+  if (!normContent) return false
+  // T1: 双向 includes(block 是 highlight 子串也算,OCR 拆散场景)
+  if (
+    normContent.includes(normHighlight) ||
+    normHighlight.includes(normContent)
+  ) {
+    return true
+  }
+  // P2: 短串 < MIN_LCS_LEN 不跑 LCS,>= 时跑 LCS 兜底
+  const minLen = Math.min(normContent.length, normHighlight.length)
+  if (minLen < MIN_LCS_LEN) return false
+  const ratio = lcsLen(normHighlight, normContent) / Math.max(normContent.length, normHighlight.length)
+  return ratio >= LCS_RATIO_THRESHOLD
+}

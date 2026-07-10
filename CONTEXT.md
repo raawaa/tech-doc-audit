@@ -58,3 +58,25 @@
 - `node.metadata.block_range`（`(start_block_order, end_block_order)`） — chunk 在该页覆盖的 layout block 区间。
 - `IssueResponse.standard_block_range`（`(start, end)`） — API 暴露给前端，拷贝自 `issue.standard_reference.block_range`。
 - `PdfViewer` URL 参数 `highlight=chunk_text`（保留） — 当 `block_range` 不可用时，`PdfViewer` 走原 `matchHighlightToBlocks` 字符串模糊匹配路线。
+
+## QA 引用体验（V9 PRD #67）
+
+- **内联引用 (Inline Citation)** — QA 回答中"依据来源"不是位于消息末尾，而是作为 `source-document` UIMessage parts 与 `text` parts 按出现顺序交错在 message.parts 中，由前端按顺序渲染成 inline chip。每个 chip 携带 `sourceId`（格式 `src_<doc_id_short>_p<page>`），AI SDK 用它跨 message 去重相同 doc 的多次引用。同一 chat stream 中同一 doc_id 只产生一次 chip（后端按 doc_id 首次出现 emit `source-document`）。
+- **进度指示器 (Progress Indicator)** — 流式渲染中，`tool-*` parts 的 `input-available` / `input-streaming` 状态展现为带 spinner 的轻量提示条（"🧠 搜索中…"），与未来的 source-document 同位置、同 DOM 锚。当 `tool-output-available` 紧跟着 `source-document` 到达后，提示条**就地升级为 chip**（同 React key 复用 DOM，不重排），不展示 input/output JSON。
+  _Avoid_: 当前遗留的 `QA.tsx` 中 `parts.map(...) startsWith('tool-')` 渲染成 `<details>` 折叠块（展开显示 input/output）——QA 页面**不应渲染**该形态。audit 场景可参考该形态但仅作 review。
+- **Preview-on-hover** — chip 的悬浮展示取自 `QASource.content_snippet`；点击行为保持现状：新标签页打开 `/pdf-viewer/<doc_id>?block_range=…`。
+
+## PDF viewer architecture（V9 PRD #68）
+
+- **生产 PDF viewer** — `frontend/src/pages/PdfViewer.tsx` 基于 `@embedpdf/react-pdf-viewer` 的 `<PDFViewer>` drop-in 组件，由 `frontend/src/App.tsx` 用 `React.lazy` 挂在 `/pdf-viewer/:docId`（懒加载，embedpdf 独立成 chunk）。这是 auditor 点击审核结果 chip 后打开的页面，URL 契约 `?page=` / `?block_range=` / `?highlight=`。演进史（headless → drop-in）见 `docs/adr/0006-pdf-viewer-embedpdf-dropin.md`。
+  _Avoid_: 高亮走 annotation plugin，不再有 headless 时代的 `[data-testid="highlight-rect"]` 百分比 div；测试断言改用 registry 句柄拿 `getAnnotations()`。
+- **annotation rect 坐标** — drop-in Highlight 组件:CSS **顶原点**,`scale` prop 把 rect 当 PDF pt 转 CSS px。**不要 Y-flip**(`bbox_norm.y1 × pageH` 直接当 origin.y,不是 `pageH - y2×pageH`)。**必须预除 effectiveDPR** —— embedpdf 的 `scale` 是 `renderScale = cssScale × effectiveDPR`,直接传 PDF-pt rect 会被多乘 DPR(X/Y 偏 2x)。`PdfViewer.tsx` 的 `getEffectiveDpr()` 从 `scroll.getMetrics()` 读 `pageVisibilityMetrics[].scaled.scale / (visibleWidth / pdfPageW)`,在 import 时除 rect 校正。
+  _Avoid_: 别用 `window.devicePixelRatio` —— 实测物理 DPR=1.25 但 embedpdf effectiveDPR=2,不相等(可能含 browser zoom 或其他倍率)。必须从 embedpdf 自己的 metrics 读。
+  _Avoid_: 别把 `matchBlockRangeToBlocks` 的输出当 annotation rect 起点 — #66 复盘踩过的坑(它是画布像素坐标,不是 PDF pt)。`matchBlockRangeToBlocks` 现为死函数(无 caller),保留 `lib/layoutMatch.ts` 是因为 `blockMatchesHighlight` / `matchHighlightToBlocks` 仍在用。
+- **annotation 必须显式 `commit()`** — `importAnnotations()` 灌进去的 annotation 默认 `commitState: 'new'`,默认不渲染(`Highlight` 组件的 paint 路径只画 `dirty` / `synced` 状态)。snippet 的 `autoCommit: true` 只对 `CREATE_ANNOTATION` reducer 生效,import 路径不走那条。修法:`importAnnotations(...)` 之后立刻 `commit()`,把状态推到 `synced`。
+- **annotation z-index 要手动提到 page 之上** — embedpdf Highlight 默认 `zIndex: 0`(或 `onClick ? 1 : undefined`),与 page canvas 同级,按 DOM 顺序 annotation 会被 page 盖住(用户看到"高亮在页面后面")。`PdfViewer.tsx` 头部 `<style>` 把 `[data-embedpdf-managed="true"] > div:last-child` 拉到 `zIndex: 3` 常驻可见。
+- **drop-in `documentId` 配置路径** — `PDFViewerConfig` 顶层**没有** `documentId` 字段。要让 embedpdf 用 URL docId(而不是自动生成 `doc-<ts>-<rand>`)标识文档,必须走 `documentManager.initialDocuments[].documentId`。否则 `onLayoutReady` 的 `evt.documentId` 跟我们的 docId 永远不等,所有 import 路径被 early-return 跳过。
+- **onLayoutReady 闭包竞态** — `handleReady` 订阅 `onLayoutReady` 时形成闭包,捕获当时的 `annotationsToImport`(layout API 还没回时是空数组)。修法:`annotationsRef` 镜像 `annotationsToImport`,`onLayoutReady` 回调里读 ref 而非闭包变量,配合一个 `useEffect` 兜底(viewerStatus === 'ready' 且 annotations 非空时再 import 一次)。
+- **E2E annotation 断言钩子** — `PdfViewer.onReady` 在 `import.meta.env.DEV` 下把 `PluginRegistry` 挂在 `window.__pdfViewerRegistry: Promise<PluginRegistry>`。playwright 跑 `npm run dev` 时可用,生产 build (`import.meta.env.DEV === false`) 不挂 window,不泄露。`frontend/e2e/pdf-viewer.spec.ts` 用 `page.evaluate` 调 `annotation.getAnnotations()` 断言数 / rect / color / commitState。`getRectPositionForPage(rect)` 是验真实渲染位置的官方 API。
+- **体积与 code-split** — `@embedpdf/react-pdf-viewer` 把所有 plugin 打 bundle。`PdfViewer` 经 `React.lazy` 拆成独立 chunk,主 `index-*.js` 不再含 embedpdf。复测渠道 `npm run bundle:report`(读 `frontend/dist/assets/*` 与 `frontend/scripts/bundle-size-baseline.json` 对比 delta)。当前 delta +278 KB gzip(>+200 KB 验收线),build 同时打包 `worker-engine` + `direct-engine`,但 `worker: false` 下 `worker-engine` 是死重 → 拆 **#69** code-split 子 issue。
+- **`?highlight=` 判定来源** — `PdfViewer.scanAllPagesByText` 复用 `lib/layoutMatch.blockMatchesHighlight(block, highlight)` predicate(与 `matchHighlightToBlocks` 同 T1+P2 / N3+includes+LCS 语义,只返回 boolean),与生产字符串匹配同阈值,不引入语义分叉。该 predicate 在 `frontend/src/lib/layoutMatch.test.ts` 有 9 条覆盖。
