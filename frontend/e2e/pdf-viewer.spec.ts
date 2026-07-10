@@ -555,4 +555,61 @@ test.describe('PDF viewer (embedpdf drop-in)', () => {
       return m ? Number(m[1]) : -1
     }, { timeout: 10_000, intervals: [200, 500] }).toBe(5)
   })
+
+  // ── #71 — 外层页面 scrollbar 不出现(PDF 模式)─────────────────────────
+  //   修复前:<main class="flex-1 overflow-y-auto"> + PdfViewer 根容器
+  //   min-h-screen → 视口外额外多出 100vh → 外层出现 scroll bar,
+  //   同时 embedpdf viewer 也内嵌 scroll → 双层。
+  //   修复后:PdfViewer 在 PDF 模式下把 <main> 切到 overflow-hidden。
+
+  test('PDF 模式:<main> overflowY === hidden(无外层 scrollbar)', async ({ page }) => {
+    await mockMeta(page)
+    await mockPdfFile(page)
+    await page.goto(`/pdf-viewer/${PDF_DOC_ID}?page=1`)
+    await expect(page.getByTestId('pdf-viewer-container')).toBeVisible({
+      timeout: 30_000,
+    })
+
+    // 给 ScrollMode context 时间把 'hidden' 推到 <main>
+    await expect
+      .poll(
+        async () =>
+          await page.evaluate(
+            () =>
+              window
+                .getComputedStyle(document.querySelector('main') as Element)
+                .overflowY,
+          ),
+        { timeout: 10_000, intervals: [100, 200, 500] },
+      )
+      .toBe('hidden')
+  })
+
+  //   DOCX/MD 行为不变:外层 <main> 仍可滚(min-h-screen 根容器撑出来的高度)
+
+  test('DOCX text-fallback:<main> overflowY === auto(行为不变)', async ({ page }) => {
+    await page.route('**/api/v1/kb-documents/*/page/*', route =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ text: '这是 DOCX 第 1 页正文内容', total_pages: 5 }),
+      }),
+    )
+    await mockMeta(page, { file_type: 'docx', page_count: 5, name: 'report.docx' })
+    await page.goto(`/pdf-viewer/${PDF_DOC_ID}?page=2`)
+    await expect(page.getByTestId('text-fallback')).toBeVisible({ timeout: 10_000 })
+
+    await expect
+      .poll(
+        async () =>
+          await page.evaluate(
+            () =>
+              window
+                .getComputedStyle(document.querySelector('main') as Element)
+                .overflowY,
+          ),
+        { timeout: 5_000, intervals: [100, 200] },
+      )
+      .toBe('auto')
+  })
 })

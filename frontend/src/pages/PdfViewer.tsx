@@ -43,6 +43,7 @@ import {
   blockMatchesHighlight,
   type Block as LayoutBlock,
 } from '../lib/layoutMatch'
+import { useScrollMode } from '../contexts/ScrollMode'
 
 // ── URL 解析 helpers ──────────────────────────────────────────────────────
 
@@ -312,6 +313,22 @@ export function PdfViewer() {
   const [reparsing, setReparsing] = useState(false)
   const [textContent, setTextContent] = useState('')
   const [textTotalPages, setTextTotalPages] = useState(0)
+
+  // ── scroll 模式驱动 ─────────────────────────────────────
+  // 把 `meta.file_type` 反映到外层 <main> overflow:
+  //   'pdf' → 'hidden'  (embedpdf viewer 内嵌滚,占满 viewport 高度)
+  //   其他  → 'default' (外层 overflow-y-auto 行为不变)
+  // meta 加载前保持 default(loading spinner 自身短,不必特殊处理)。
+  // 卸载时 reset 避免残留。
+  const { setMode: setScrollMode } = useScrollMode()
+  useEffect(() => {
+    if (!meta) {
+      setScrollMode('default')
+      return
+    }
+    setScrollMode(meta.file_type === 'pdf' ? 'hidden' : 'default')
+  }, [meta?.file_type, setScrollMode])
+  useEffect(() => () => setScrollMode('default'), [setScrollMode])
 
   // Drop-in viewer 给的实时状态 — 通过 onPageChange 订阅
   const [currentPage, setCurrentPage] = useState(targetPage)
@@ -589,7 +606,17 @@ export function PdfViewer() {
     : { tabBar: 'never' as const, worker: false as const }
 
   return (
-    <div data-testid="pdf-viewer" className="min-h-screen bg-slate-100">
+    // PDF 模式:由外层 <main>(ScrollMode=hidden)提供高度,根容器 h-full flex-col 占满,
+    // PDF 子容器继续 flex-1 拿掉 sticky header 后的剩余高度。
+    // text-fallback 模式:保留 min-h-screen 维持原 "外层页面 scroll" 行为(#71 brief)。
+    <div
+      data-testid="pdf-viewer"
+      className={
+        meta.file_type === 'pdf'
+          ? 'h-full bg-slate-100 flex flex-col'
+          : 'min-h-screen bg-slate-100'
+      }
+    >
       {/* 强制 embedpdf annotation 画层在 page canvas 之上。
          embedpdf 默认 annotation zIndex=0,跟 page canvas 同级时按 DOM 顺序,
          annotation 先渲染 → 视觉上被 page 盖住。点击触发 zIndex:1 才浮到上面。
@@ -670,8 +697,7 @@ export function PdfViewer() {
       {meta.file_type === 'pdf' ? (
         <div
           data-testid="pdf-viewer-container"
-          style={{ height: 'calc(100vh - 57px)' }}
-          className="relative"
+          className="relative flex-1 min-h-0"
         >
           <PDFViewer
             config={dropinConfig}
