@@ -245,19 +245,24 @@ const DISABLED_CATEGORIES: string[] = [
  * embedpdf Highlight 的 `scale` prop 是渲染 scale(含 DPR),不是 CSS scale。
  * 直接传 PDF-pt rect 会被多乘 DPR → 高亮位置/尺寸翻倍。
  * 必须在 import 时从 scroll.getMetrics() 拿(构造时 viewer 还没 ready)。
+ *
+ * DPR 是 embedpdf 全局渲染参数,与"哪页在 viewport"无关(PRD #72 — 早期
+ * 实现只查 page 1 的 metrics,非首页命中时 cssScale 拿 page 1 width 算,
+ * 比例错 → effectiveDPR 估成 1,annotation rect 不被除 DPR,X/Y/尺寸翻倍)。
+ * 修:用 pageVisibilityMetrics 第一个可见页的 metric 推 effectiveDPR,
+ * pdfPageW 按该可见页的 pageNumber 反查 layout 拿(width 会随页变)。
  */
 function getEffectiveDpr(
   scroll: ScrollCapability | null,
-  pageIdx0: number,
-  pdfPageW: number,
+  layout: LayoutDoc | null,
 ): number {
   if (!scroll) return 1
   try {
     const metrics = scroll.getMetrics()
-    const pm = metrics.pageVisibilityMetrics.find(
-      (p: any) => p.pageNumber === pageIdx0 + 1,
-    )
+    const pm = metrics.pageVisibilityMetrics[0]
     if (!pm || pm.scaled.visibleWidth <= 0) return 1
+    const pdfPageW =
+      layout?.layout.find(p => p.page === pm.pageNumber - 1)?.width ?? 1
     const cssScale = pm.scaled.visibleWidth / pdfPageW
     if (cssScale <= 0) return 1
     return pm.scaled.scale / cssScale
@@ -466,8 +471,7 @@ export function PdfViewer() {
         try {
           // DPR 校正:embedpdf scale prop 是 renderScale = cssScale × effectiveDPR,
           // 我们传的是 PDF-pt rect,得除 effectiveDPR 才落到 CSS px。
-          const pdfPageW = layout.data?.layout.find(p => p.page === 0)?.width ?? 1
-          const dpr = getEffectiveDpr(scroll, 0, pdfPageW)
+          const dpr = getEffectiveDpr(scroll, layout.data)
           const corrected = applyEffectiveDpr(toImport, dpr)
           ann.forDocument(docId).importAnnotations(corrected)
           // importAnnotations 的 annotation 默认 commitState='new',默认不渲染;
@@ -515,8 +519,7 @@ export function PdfViewer() {
       importedRef.current = true
       // DPR 校正(同 onLayoutReady 路径)
       const scroll = (registry.getPlugin('scroll')?.provides?.() as ScrollCapability | undefined) ?? null
-      const pdfPageW = layout.data?.layout.find(p => p.page === 0)?.width ?? 1
-      const dpr = getEffectiveDpr(scroll, 0, pdfPageW)
+      const dpr = getEffectiveDpr(scroll, layout.data)
       const corrected = applyEffectiveDpr(list, dpr)
       ann.forDocument(docId).importAnnotations(corrected)
       // 显式 commit() 让 import 路径的 annotation 也能渲染

@@ -400,6 +400,31 @@ test.describe('PDF viewer (embedpdf drop-in)', () => {
     expect(pages).not.toContain(2)
   })
 
+  // ── URL 契约 — 非首页 block_range(PRD #72 回归)───────────────────────
+  //   旧实现 getEffectiveDpr 只查 page 1 metric + page 1 width,scrollToPage(N≥2)
+  //   后 page 1 不在 viewport,find 返回 undefined → dpr fallback 1 → annotation
+  //   rect 不被除 effectiveDPR → X/Y/尺寸翻倍。修后用首个可见页 metric + 该页
+  //   width,任意页都正确。这条断言不依赖 pdfium 渲染(registry 的 annotation
+  //   state 是 JS 层可直接读到的),本地 headless 跑得起来。视觉 rect 像素
+  //   断言需要 pdfium-capable 浏览器,留 CI。
+
+  test('?page=N(N≥2)&block_range=…:annotation 落在正确 pageIndex(11,非首页 bug 回归)', async ({ page }) => {
+    await page.goto(
+      `/pdf-viewer/${REAL_DOC_ID}?page=12&block_range=${encodeURIComponent('8,8')}`,
+    )
+    await waitForViewerRegistry(page)
+
+    await expect.poll(
+      async () => (await getAnnotationPageIndexes(page, REAL_DOC_ID)).length,
+      { timeout: 30_000, intervals: [500, 1000, 2000] },
+    ).toBeGreaterThan(0)
+
+    // block_order=8 应在 0-based page 11(1-based page 12),不能落在 10。
+    const pages = await getAnnotationPageIndexes(page, REAL_DOC_ID)
+    expect(pages).toContain(11)
+    expect(pages).not.toContain(10)
+  })
+
   // ── block_range 多 block / 单 block ────────────────────────────────────
 
   test('block_range=3,3 单 block:1 个 annotation', async ({ page }) => {
