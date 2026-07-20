@@ -497,7 +497,6 @@ export function PdfViewer() {
       // 不同,这就是 #72 #76 修的 race)。
       const dpr = getEffectiveDpr(scroll, layoutRef.current)
       const corrected = applyEffectiveDpr(toImport, dpr)
-      ann.forDocument(docId).importAnnotations(corrected)
       // importAnnotations 的 annotation 默认 commitState='new',默认不渲染;
       // 显式 commit() 把它们转到 'synced' 才会画上屏(spec §3 step 9 +
       // §5.3 + #75/#76 acceptance)。
@@ -506,11 +505,19 @@ export function PdfViewer() {
       // createPageAnnotation resolve 后才 dispatch commitPendingChanges。
       // 我们显式再 commit() + await 让 import 后状态稳定在 'synced'
       // (issue #76 acceptance:regression lock for contract)。
-      void ann
-        .forDocument(docId)
-        .commit()
-        .toPromise()
-        .catch(e => console.warn('[PdfViewer] commit task rejected', e))
+      try {
+        ann.forDocument(docId).importAnnotations(corrected)
+        void ann
+          .forDocument(docId)
+          .commit()
+          .toPromise()
+          .catch(e => console.warn('[PdfViewer] commit task rejected', e))
+      } catch (e) {
+        // 与 fallback useEffect 对称:同步异常解锁 latch,允许下次 onScroll
+        // / 兜底 useEffect 重试。否则 latch 锁死,annotation 永远卡在 'new'。
+        console.warn('[PdfViewer] importAnnotations failed', e)
+        importedRef.current = false
+      }
     }
 
     // 订阅 page-change — 头部 page-counter 实时更新;import 触发走 onScroll。

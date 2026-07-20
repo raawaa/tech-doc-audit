@@ -651,21 +651,22 @@ test.describe('PDF viewer (embedpdf drop-in)', () => {
     expect(pages).toContain(expectedPageIndex)
   }
 
-  // 循环 reload N 次,每轮重等 registry + annotation 命中
-  async function reloadStableAssert(
+  // 循环 reload N 次,每轮重等 registry + annotation 命中。
+  // 初始 goto + waitForViewerRegistry 由 caller 负责;此 helper 专门
+  // 跑 N 次 page.reload(),不做 "首轮 no-op" 之类的折叠 — N 就是
+  // 真实 reload 次数,跟 test name / issue acceptance ("≥ 10 次 reload")
+  // 一一对应,避免 review #1 的命名漂移。
+  async function reloadN(
     page: Page,
     docId: string,
     expectedPageIndex: number,
     nReloads: number,
   ) {
     for (let i = 0; i < nReloads; i++) {
-      // reload 在首轮是 no-op(page 已 goto),后续每轮重置 page state
-      if (i > 0) {
-        await page.reload()
-        // reload 后 window.__pdfViewerRegistry 重置为 undefined,等它
-        // 重新出现(DEV only 暴露,playwright 跑 `npm run dev` 故可用)
-        await waitForViewerRegistry(page)
-      }
+      await page.reload()
+      // reload 后 window.__pdfViewerRegistry 重置为 undefined,等它
+      // 重新出现(DEV only 暴露,playwright 跑 `npm run dev` 故可用)
+      await waitForViewerRegistry(page)
       await waitForAnnotationAfterReload(page, docId, expectedPageIndex)
     }
   }
@@ -676,8 +677,9 @@ test.describe('PDF viewer (embedpdf drop-in)', () => {
     const url = `/pdf-viewer/${REAL_DOC_ID}?page=11&block_range=${encodeURIComponent('8,8')}`
     await page.goto(url)
     await waitForViewerRegistry(page)
-    // 首轮 goto(等价一次 reload,一起算进 N)
-    await reloadStableAssert(page, REAL_DOC_ID, 10, RELOAD_N)
+    // 初始 navigation 之后,再跑 RELOAD_N 次 page.reload()
+    await waitForAnnotationAfterReload(page, REAL_DOC_ID, 10)
+    await reloadN(page, REAL_DOC_ID, 10, RELOAD_N)
   })
 
   test(`reload-stable: ?page=1&highlight=应急救援指挥中心 在 ${RELOAD_N} 次 reload 内都 auto-jump + 命中 pageIndex=3`, async ({ page }) => {
@@ -687,6 +689,7 @@ test.describe('PDF viewer (embedpdf drop-in)', () => {
     // auto-jump 路径依赖 firstHitPage0 计算 + scrollToPage;reload 后
     // 这条链重新跑,期待跟初次 goto 行为一致(pageIndex=3,见
     // "off-by-one 回归"测试 line 386 的同一断言)
-    await reloadStableAssert(page, REAL_DOC_ID, 3, RELOAD_N)
+    await waitForAnnotationAfterReload(page, REAL_DOC_ID, 3)
+    await reloadN(page, REAL_DOC_ID, 3, RELOAD_N)
   })
 })
