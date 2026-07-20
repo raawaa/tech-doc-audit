@@ -531,8 +531,17 @@ test.describe('PDF viewer (embedpdf drop-in)', () => {
     const color = payload!.strokeColor ?? payload!.color
     expect(color).toBe('#FFFF00')
     expect(payload!.opacity).toBeCloseTo(0.4, 5)
-    // 没调 commit 时,commitState 应该是 'new' 而不是 'dirty'/'synced'
-    expect(payload!.commitState).toBe('new')
+    // contract §3 step 9 + §5.3 + issue #76 acceptance:regression lock
+    // 显式 commit() + await 后,commitState 必须落到 'synced'。commi­t
+    // 自身 async,等 pdfium createPageAnnotation resolve 后才 dispatch
+    // commitPendingChanges。用 expect.poll 等到状态翻过去。
+    await expect
+      .poll(
+        async () =>
+          (await getFirstAnnotationPayload(page, PDF_DOC_ID))?.commitState,
+        { timeout: 5_000, intervals: [50, 100, 200, 500] },
+      )
+      .toBe('synced')
   })
 
   // ── header 跳页输入框 + Enter(user story 12)────────────────────────────

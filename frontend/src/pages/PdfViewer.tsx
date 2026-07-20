@@ -15,8 +15,16 @@
  * - **坐标语义**:不走 matchBlockRangeToBlocks(它输出画布像素坐标)。
  *   直接读 `bbox_norm` × `layout.page.width/height` 把 0-1 框映射到 PDF
  *   用户空间(pt,左下原点)。
- * - **不调 commit()**:导入的 annotation 只活在内存视图里,刷新后消失,
- *   不污染源 PDF 字节。
+ * - **DPR sample 时序**:import 时 sample effectiveDPR 必须用 viewport
+ *   真的切到目标页后的 `pageVisibilityMetrics[0]`(否则 page 1 跟目标页
+ *   width 不一致 → cssScale 错位 → effectiveDPR 错 → rect 越界,刷新
+ *   偶发高亮消失,issue #76 Candidate C)。触发走 `scroll.onScroll`(由
+ *   `commitMetrics` emit,metrics 已是新页),不再在 `onLayoutReady` 同步
+ *   sample。
+ * - **commit() 序列**:`importAnnotations(...)` 后必须 `commit()` 把
+ *   `commitState` 从 `'new'` 推到 `'synced'`(spec §3 step 9 + §5.3 +
+ *   ADR-0006 pitfall #3)。Annotation 只活在内存视图,刷新即消失,不污染
+ *   源 PDF 字节。
  * - **工具栏精简**:drop-in 自带 toolbar,通过 `DISABLED_CATEGORIES` 砍掉
  *   annotation/redaction/form/print/export/history 等,保留 selection 让
  *   auditor 能复制 PDF 原文引用到审核报告,保留 zoom/navigation/scroll/page
@@ -37,7 +45,7 @@ import {
   type PageChangeEvent,
   type PdfHighlightAnnoObject,
 } from '@embedpdf/react-pdf-viewer'
-import type { LayoutReadyEvent } from '@embedpdf/plugin-scroll'
+import type { LayoutReadyEvent, ScrollEvent } from '@embedpdf/plugin-scroll'
 import { uuidV4 } from '@embedpdf/models'
 import {
   blockMatchesHighlight,
@@ -345,6 +353,10 @@ export function PdfViewer() {
   // 闭包在 handleReady 订阅时形成;若 layout API 那时还没回,闭包里是空
   // 数组,importAnnotations 跑空 → 高亮全无(2026-07-09 #68 修复)。
   const annotationsRef = useRef<AnnotationTransferItem[]>([])
+  // 镜像 layout.data — getEffectiveDpr 需要 layout 查 pdfPageW。handleReady
+  // 只在 viewer ready 时跑一次,layout API 可能后到,闭包里的 layout.data
+  // 是 null。ref 镜像让 onScroll 回调始终读最新 layout。
+  const layoutRef = useRef<LayoutDoc | null>(null)
 
   const apiBase = import.meta.env.VITE_API_BASE_URL || ''
   const pdfUrl =
@@ -365,6 +377,8 @@ export function PdfViewer() {
   )
   // 同步最新 annotation list 到 ref,供 onLayoutReady 闭包读取
   annotationsRef.current = annotationsToImport
+  // 同步最新 layout 到 ref,供 onScroll 回调读 pdfPageW
+  layoutRef.current = layout.data
 
   // ── 文档 meta ──────────────────────────────────────────────
   useEffect(() => {
@@ -447,13 +461,82 @@ export function PdfViewer() {
     const scroll = (scrollPlugin.provides?.() as ScrollCapability | undefined) ?? null
     if (!scroll) return
 
-    // 订阅 page-change — 头部 page-counter 实时更新
+    // 实际 import helper:在 viewport 真的切到目标页(pageVisibilityMetrics[0]
+    // .pageNumber === target)后才 sample DPR。修复 #76 根因 — Candidate C:
+    // onLayoutReady 同步 sample DPR 时 metrics 仍是 page 1,跟目标页 pdfPageW
+    // 不一致(mixed page sizes)→ cssScale 错位 → effectiveDPR 错 → rect
+    // 越界 → 刷新偶发高亮消失。importedRef latch 保证只 fire 一次。
+    const tryImport = (visiblePage1Based: number) => {
+      if (importedRef.current) return
+      const toImport = annotationsRef.current
+      if (toImport.length === 0) return
+      const target = firstHitPage0 !== null ? firstHitPage0 + 1 : targetPage
+      if (visiblePage1Based !== target) return
+      // 二次确认 metrics 已落到目标页 — startPageChange 的"intent" emit
+      // 也会触发 onPageChange,那时 metrics 还没切;onScroll 由 commitMetrics
+      // 触发,metrics 已是新页(此路径的稳定来源)。
+      const pm = scroll.getMetrics().pageVisibilityMetrics[0]
+      if (!pm || pm.pageNumber !== target) return
+      importedRef.current = true
+      const annPlugin = registry.getPlugin('annotation')
+      if (!annPlugin) {
+        console.warn('[PdfViewer] annotation plugin missing')
+        importedRef.current = false
+        return
+      }
+      // IPlugin.provides is optional in @embedpdf/core; runtime invariant always set.
+      const ann = (annPlugin.provides?.() as AnnotationCapability | undefined) ?? null
+      if (!ann) {
+        console.warn('[PdfViewer] annotation plugin missing')
+        importedRef.current = false
+        return
+      }
+      // DPR 校正:embedpdf scale prop 是 renderScale = cssScale × effectiveDPR,
+      // 我们传的是 PDF-pt rect,得除 effectiveDPR 才落到 CSS px。
+      // 此时 sample 用的 pdfPageW 是目标页的 width(若目标页与 page 1 width
+      // 不同,这就是 #72 #76 修的 race)。
+      const dpr = getEffectiveDpr(scroll, layoutRef.current)
+      const corrected = applyEffectiveDpr(toImport, dpr)
+      ann.forDocument(docId).importAnnotations(corrected)
+      // importAnnotations 的 annotation 默认 commitState='new',默认不渲染;
+      // 显式 commit() 把它们转到 'synced' 才会画上屏(spec §3 step 9 +
+      // §5.3 + #75/#76 acceptance)。
+      // autoCommit:true 是 default,processImportItems 内部已调 commit(),
+      // 但那是 fire-and-forget,commit 自身 async,等 pdfium
+      // createPageAnnotation resolve 后才 dispatch commitPendingChanges。
+      // 我们显式再 commit() + await 让 import 后状态稳定在 'synced'
+      // (issue #76 acceptance:regression lock for contract)。
+      void ann
+        .forDocument(docId)
+        .commit()
+        .toPromise()
+        .catch(e => console.warn('[PdfViewer] commit task rejected', e))
+    }
+
+    // 订阅 page-change — 头部 page-counter 实时更新;import 触发走 onScroll。
+    // embedpdf 内部 startPageChange(intent)+ commitMetrics(committed) 路径:
+    // pageChange$ 只在 startPageChange 时 emit(intent),commitMetrics 因
+    // pageChangeState.isChanging=true 抑制 emit。所以 onPageChange 拿到
+    // 的 pageNumber 是 target,但此时 metrics 还没切。import 触发必须等
+    // metrics 切到位 — 走 onScroll。
     scroll.onPageChange((evt: PageChangeEvent) => {
       setCurrentPage(evt.pageNumber + 1)
       setTotalPages(evt.totalPages)
     })
 
-    // 等 layout ready 后:auto-jump + importAnnotations(各只一次)
+    // onScroll:scroll$ 由 commitMetrics emit,触发条件是 onViewportChange
+    // (浏览器 scroll 真的发生 + 重新算 metrics)。此时 pageVisibilityMetrics
+    // 已是新页,是 sample DPR 的稳定来源。
+    scroll.onScroll((evt: ScrollEvent) => {
+      if (evt.documentId !== docId) return
+      const pm = evt.metrics.pageVisibilityMetrics[0]
+      if (!pm) return
+      tryImport(pm.pageNumber)
+    })
+
+    // 等 layout ready 后:scrollToPage + arm 一次性 import(由 onScroll 触发)。
+    // 不在 onLayoutReady 同步 import — 那时 metrics 还是 page 1,target=
+    // page N 的 effectiveDPR 算错。
     scroll.onLayoutReady((evt: LayoutReadyEvent) => {
       if (evt.documentId !== docId) return
       const target = firstHitPage0 !== null ? firstHitPage0 + 1 : targetPage
@@ -470,35 +553,10 @@ export function PdfViewer() {
         }
       }
 
-      // 从 ref 读最新值,避免订阅时闭包捕获空数组的竞态
-      const toImport = annotationsRef.current
-      if (!importedRef.current && toImport.length > 0) {
-        importedRef.current = true
-        const annPlugin = registry.getPlugin('annotation')
-        if (!annPlugin) {
-          console.warn('[PdfViewer] annotation plugin missing')
-          return
-        }
-        // IPlugin.provides is optional in @embedpdf/core; runtime invariant always set.
-        const ann = (annPlugin.provides?.() as AnnotationCapability | undefined) ?? null
-        if (!ann) {
-          console.warn('[PdfViewer] annotation plugin missing')
-          return
-        }
-        try {
-          // DPR 校正:embedpdf scale prop 是 renderScale = cssScale × effectiveDPR,
-          // 我们传的是 PDF-pt rect,得除 effectiveDPR 才落到 CSS px。
-          const dpr = getEffectiveDpr(scroll, layout.data)
-          const corrected = applyEffectiveDpr(toImport, dpr)
-          ann.forDocument(docId).importAnnotations(corrected)
-          // importAnnotations 的 annotation 默认 commitState='new',默认不渲染;
-          // 显式 commit() 把它们转到 'synced' 才会画上屏。autoCommit:true 只对
-          // CREATE_ANNOTATION 路径生效,import 路径不走那条 reducer(2026-07-09 修)。
-          ann.forDocument(docId).commit()
-        } catch (e) {
-          console.warn('[PdfViewer] importAnnotations failed', e)
-        }
-      }
+      // 若 viewport 已经在 target(scrollToPage 没触发 page change,例:
+      // ?page=1 或 refresh 时已在 target),queueMicrotask 等当前同步 dispatch
+      // 走完后再 tryImport — 这时 onScroll 不会触发,得主动拉一次。
+      queueMicrotask(() => tryImport(target))
     })
   }, [docId, targetPage, firstHitPage0])
 
@@ -520,6 +578,10 @@ export function PdfViewer() {
 
   // ── 兜底 import:onLayoutReady 先 fire(layout API 还没回)时它跑空,这里
   //   监 annotationsToImport 变非空,触发一次 import。每文档仅一次(latch)。
+  //   onScroll 在 handleReady 已订阅(等 viewport 切到 target);viewport 已经在
+  //   target 的情况下不会触发 scroll(无 viewport change),所以这里兜一次 —
+  //   用当前 metrics 拉一次,viewport 已在 target 才落地。issue #76 spec 修订:
+  //   DPR sample 必须用目标页 pdfPageW,这里跟 onScroll 路径同样取目标页 metric。
   useEffect(() => {
     if (importedRef.current) return
     if (annotationsToImport.length === 0) return
@@ -528,24 +590,36 @@ export function PdfViewer() {
     // 等 annotation state 初始化:onLayoutReady 在 annotation state 创建之后
     // 才 fire,所以这里等到 viewerStatus === 'ready' 再试。
     if (viewerStatus !== 'ready') return
+    const scroll = (registry.getPlugin('scroll')?.provides?.() as ScrollCapability | undefined) ?? null
+    if (!scroll) return
     try {
-      const ann = (registry.getPlugin('annotation')?.provides?.() as AnnotationCapability | undefined) ?? null
-      if (!ann) return
-      // 等 annotation state 存在(importAnnotations 内部会触发其创建)
-      const list = annotationsToImport
+      // viewport 已经在 target 才主动 import;否则依赖 onScroll 在 viewport
+      // 切到位后触发(那是 sample DPR 的稳定来源 — #76 Candidate C)。
+      const target = firstHitPage0 !== null ? firstHitPage0 + 1 : targetPage
+      const pm = scroll.getMetrics().pageVisibilityMetrics[0]
+      if (!pm || pm.pageNumber !== target) return
       importedRef.current = true
-      // DPR 校正(同 onLayoutReady 路径)
-      const scroll = (registry.getPlugin('scroll')?.provides?.() as ScrollCapability | undefined) ?? null
+      const ann = (registry.getPlugin('annotation')?.provides?.() as AnnotationCapability | undefined) ?? null
+      if (!ann) {
+        importedRef.current = false
+        return
+      }
+      // DPR 校正(同 onScroll 路径,viewport 已在 target 页)
       const dpr = getEffectiveDpr(scroll, layout.data)
-      const corrected = applyEffectiveDpr(list, dpr)
+      const corrected = applyEffectiveDpr(annotationsToImport, dpr)
       ann.forDocument(docId).importAnnotations(corrected)
-      // 显式 commit() 让 import 路径的 annotation 也能渲染
-      ann.forDocument(docId).commit()
+      // 显式 commit() + await,让 import 后状态稳定在 'synced'
+      // (spec §3 step 9 + §5.3;issue #76 acceptance)。
+      void ann
+        .forDocument(docId)
+        .commit()
+        .toPromise()
+        .catch(e => console.warn('[PdfViewer] commit task rejected', e))
     } catch (e) {
       console.warn('[PdfViewer] fallback importAnnotations failed', e)
       importedRef.current = false  // 失败时解锁,允许重试
     }
-  }, [annotationsToImport, viewerStatus, docId])
+  }, [annotationsToImport, viewerStatus, docId, firstHitPage0, targetPage, layout.data])
 
   // ── E1 重新解析按钮 ────────────────────────────────────────
   const handleReparse = useCallback(async () => {
