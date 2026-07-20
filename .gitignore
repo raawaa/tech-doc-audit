@@ -54,3 +54,6 @@ benchmark/_cache/frontend/dist/
 # Tooling artifacts (committed by accident in past as untracked)
 node_modules/
 test-results/
+
+# Agent session metadata (settings, worktrees, hook output)
+/.claude/
