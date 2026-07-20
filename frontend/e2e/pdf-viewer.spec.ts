@@ -531,8 +531,17 @@ test.describe('PDF viewer (embedpdf drop-in)', () => {
     const color = payload!.strokeColor ?? payload!.color
     expect(color).toBe('#FFFF00')
     expect(payload!.opacity).toBeCloseTo(0.4, 5)
-    // 没调 commit 时,commitState 应该是 'new' 而不是 'dirty'/'synced'
-    expect(payload!.commitState).toBe('new')
+    // contract §3 step 9 + §5.3 + issue #76 acceptance:regression lock
+    // 显式 commit() + await 后,commitState 必须落到 'synced'。commi­t
+    // 自身 async,等 pdfium createPageAnnotation resolve 后才 dispatch
+    // commitPendingChanges。用 expect.poll 等到状态翻过去。
+    await expect
+      .poll(
+        async () =>
+          (await getFirstAnnotationPayload(page, PDF_DOC_ID))?.commitState,
+        { timeout: 5_000, intervals: [50, 100, 200, 500] },
+      )
+      .toBe('synced')
   })
 
   // ── header 跳页输入框 + Enter(user story 12)────────────────────────────
@@ -611,5 +620,76 @@ test.describe('PDF viewer (embedpdf drop-in)', () => {
         { timeout: 5_000, intervals: [100, 200] },
       )
       .toBe('auto')
+  })
+
+  // ── reload-stable regression(issue #77)────────────────────────
+  //   锁住 #76 修的「URL → 高亮恢复」在 refresh 路径下的稳定性,阻止 future
+  //   regression。必须真 PDF fixture(REAL_DOC_ID),不可 mock layout — e2e
+  //   覆盖的是真实 embedpdf 时序,不是 mock 时序(Candidate C 的 race 只在
+  //   真实 pdfium 渲染 + viewport scroll 真实发生时出现)。N=10 reload 以
+  //   稳定捕获间歇失败(对应 diagnose 的 repro 频率),单 test +30s 内
+  //   完成;issue acceptance 的 50 reload 走 CI 复核。
+  //   两条用例:block_range 坐标高亮路径 + highlight auto-jump 路径,spec
+  //   §1.2/§1.3 各自锁一行。
+
+  async function waitForAnnotationAfterReload(
+    page: Page,
+    docId: string,
+    expectedPageIndex: number,
+    timeoutMs = 10_000,
+  ) {
+    // 等 count > 0 — reload 后 annotation 重新进入状态窗口
+    await expect
+      .poll(
+        async () => (await getAnnotationPageIndexes(page, docId)).length,
+        { timeout: timeoutMs, intervals: [100, 200, 500] },
+      )
+      .toBeGreaterThan(0)
+    // 再确认 pageIndex 命中(避免 count > 0 但落到错页 — 那是另一种
+    // regression,先于 #76 的"完全消失"暴露)
+    const pages = await getAnnotationPageIndexes(page, docId)
+    expect(pages).toContain(expectedPageIndex)
+  }
+
+  // 循环 reload N 次,每轮重等 registry + annotation 命中。
+  // 初始 goto + waitForViewerRegistry 由 caller 负责;此 helper 专门
+  // 跑 N 次 page.reload(),不做 "首轮 no-op" 之类的折叠 — N 就是
+  // 真实 reload 次数,跟 test name / issue acceptance ("≥ 10 次 reload")
+  // 一一对应,避免 review #1 的命名漂移。
+  async function reloadN(
+    page: Page,
+    docId: string,
+    expectedPageIndex: number,
+    nReloads: number,
+  ) {
+    for (let i = 0; i < nReloads; i++) {
+      await page.reload()
+      // reload 后 window.__pdfViewerRegistry 重置为 undefined,等它
+      // 重新出现(DEV only 暴露,playwright 跑 `npm run dev` 故可用)
+      await waitForViewerRegistry(page)
+      await waitForAnnotationAfterReload(page, docId, expectedPageIndex)
+    }
+  }
+
+  const RELOAD_N = 10  // ≥ 10 per #77 test plan;issue acceptance 50 走 CI 复核
+
+  test(`reload-stable: ?page=11&block_range=8,8 在 ${RELOAD_N} 次 reload 内都命中 pageIndex=10`, async ({ page }) => {
+    const url = `/pdf-viewer/${REAL_DOC_ID}?page=11&block_range=${encodeURIComponent('8,8')}`
+    await page.goto(url)
+    await waitForViewerRegistry(page)
+    // 初始 navigation 之后,再跑 RELOAD_N 次 page.reload()
+    await waitForAnnotationAfterReload(page, REAL_DOC_ID, 10)
+    await reloadN(page, REAL_DOC_ID, 10, RELOAD_N)
+  })
+
+  test(`reload-stable: ?page=1&highlight=应急救援指挥中心 在 ${RELOAD_N} 次 reload 内都 auto-jump + 命中 pageIndex=3`, async ({ page }) => {
+    const url = `/pdf-viewer/${REAL_DOC_ID}?page=1&highlight=${encodeURIComponent('应急救援指挥中心')}`
+    await page.goto(url)
+    await waitForViewerRegistry(page)
+    // auto-jump 路径依赖 firstHitPage0 计算 + scrollToPage;reload 后
+    // 这条链重新跑,期待跟初次 goto 行为一致(pageIndex=3,见
+    // "off-by-one 回归"测试 line 386 的同一断言)
+    await waitForAnnotationAfterReload(page, REAL_DOC_ID, 3)
+    await reloadN(page, REAL_DOC_ID, 3, RELOAD_N)
   })
 })
