@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url'
 // 是纯 React DOM overlay(不依赖 PDF 加载),故当年用占位 `%PDF-1.4 dummy`
 // 就够;annotation 断言必须喂真 PDF。round-trip 的 rect 期望值仍来自 mock
 // layout 的 page dims(1000×2000),与该 PDF 的真实尺寸无关。
-const FIXTURE_PDF = path.join(
+export const FIXTURE_PDF = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   'fixtures',
   'sample.pdf',
@@ -29,14 +29,14 @@ const FIXTURE_PDF = path.join(
  * 4. round-trip:annotation 落在 PDF 用户空间 + color/opacity/commitState
  */
 
-const PDF_DOC_ID = '01KW10F4SD4BZG6SQFNQ42JDTH'
-const AUDIT_DOC_ID = '01KVY36VHQGD6S3SBH5JWRF7ZS'
-const AUDIT_TASK_ID = '01KWK9SR726Q57SXK9V7NVC9GB'
-const REAL_DOC_ID = '01KW1QXZ5AKBGK34BDJRV1X4JZ'
+export const PDF_DOC_ID = '01KW10F4SD4BZG6SQFNQ42JDTH'
+export const AUDIT_DOC_ID = '01KVY36VHQGD6S3SBH5JWRF7ZS'
+export const AUDIT_TASK_ID = '01KWK9SR726Q57SXK9V7NVC9GB'
+export const REAL_DOC_ID = '01KW1QXZ5AKBGK34BDJRV1X4JZ'
 
 // ── drop-in registry 句柄:annotation 断言渠道 ─────────────────────────────
 
-async function waitForViewerRegistry(page: Page, timeoutMs = 30_000) {
+export async function waitForViewerRegistry(page: Page, timeoutMs = 30_000) {
   await expect
     .poll(
       async () =>
@@ -49,7 +49,7 @@ async function waitForViewerRegistry(page: Page, timeoutMs = 30_000) {
     .toBe(true)
 }
 
-async function getAnnotationCount(page: Page, docId: string): Promise<number> {
+export async function getAnnotationCount(page: Page, docId: string): Promise<number> {
   return (await page.evaluate(async (id) => {
     const reg = (window as unknown as {
       __pdfViewerRegistry?: Promise<{
@@ -76,7 +76,7 @@ async function getAnnotationCount(page: Page, docId: string): Promise<number> {
   }, docId)) as number
 }
 
-async function getAnnotationPageIndexes(page: Page, docId: string): Promise<number[]> {
+export async function getAnnotationPageIndexes(page: Page, docId: string): Promise<number[]> {
   return (await page.evaluate(async (id) => {
     const reg = (window as unknown as {
       __pdfViewerRegistry?: Promise<{
@@ -101,7 +101,7 @@ async function getAnnotationPageIndexes(page: Page, docId: string): Promise<numb
   }, docId)) as number[]
 }
 
-async function getFirstAnnotationPayload(page: Page, docId: string): Promise<{
+export async function getFirstAnnotationPayload(page: Page, docId: string): Promise<{
   pageIndex: number
   strokeColor: string | null
   color: string | null
@@ -167,7 +167,7 @@ async function getFirstAnnotationPayload(page: Page, docId: string): Promise<{
 
 // ── mock helpers ──────────────────────────────────────────────────────────
 
-async function mockLayoutWith(page: Page, layout: object) {
+export async function mockLayoutWith(page: Page, layout: object) {
   await page.route('**/api/v1/kb-documents/*/layout', route =>
     route.fulfill({
       status: 200,
@@ -177,7 +177,23 @@ async function mockLayoutWith(page: Page, layout: object) {
   )
 }
 
-async function mockMeta(
+// mockLayoutWithDelay:与上面相同,但先 sleep `delayMs` 再 fulfill — 用于
+// 强制 §5 fallback path。在 page.route 注册后,layout fetch 在浏览器实际
+// 发请求时开始计时,delay 必须长于 embedpdf onReady + onLayoutReady 触发
+// 时间,这样 primary path 在拿到 layout 数据前已经 fire 且 `annotationsRef.current === []`
+// → primary 跳过 import → fallback useEffect 是唯一能跑到 import + commit() 的路径。
+export async function mockLayoutWithDelay(page: Page, layout: object, delayMs: number) {
+  await page.route('**/api/v1/kb-documents/*/layout', async route => {
+    await new Promise(r => setTimeout(r, delayMs))
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(layout),
+    })
+  })
+}
+
+export async function mockMeta(
   page: Page,
   overrides: Partial<{ name: string; page_count: number; file_type: string }> = {},
 ) {
@@ -201,7 +217,7 @@ async function mockMeta(
   })
 }
 
-async function mockLayoutNotFound(page: Page) {
+export async function mockLayoutNotFound(page: Page) {
   await page.route('**/api/v1/kb-documents/*/layout', route =>
     route.fulfill({
       status: 404,
@@ -211,7 +227,7 @@ async function mockLayoutNotFound(page: Page) {
   )
 }
 
-async function mockPdfFile(page: Page) {
+export async function mockPdfFile(page: Page) {
   await page.route('**/api/v1/kb-documents/*/file', route =>
     route.fulfill({
       status: 200,
@@ -221,7 +237,7 @@ async function mockPdfFile(page: Page) {
   )
 }
 
-function makeLayout(blocks: Array<{ content: string; y1: number; y2: number; order: number }>) {
+export function makeLayout(blocks: Array<{ content: string; y1: number; y2: number; order: number }>) {
   return {
     has_layout: true,
     layout: [{
@@ -486,6 +502,44 @@ test.describe('PDF viewer (embedpdf drop-in)', () => {
     }).toBe(1)
   })
 
+// ── §5 fallback path + reload(#79,docs/specs/pdf-viewer-url-contract.md §5/§9.1) ──
+  //   关闭 §9 矩阵当前唯一的 "Implicit" 缺口:用 page.route 延迟 layout JSON
+  //   5 s,延时足够让 embedpdf onLayoutReady 在 layout 返回前触发,primary
+  //   path 闭包里 annotationsRef.current === [] → primary 跳过 import → fallback
+  //   useEffect 是唯一 import 走得通的路径。reload 后整页 remount,同一时序
+  //   在新 mount 上重演 — 必须仍能还原。
+  //   唯一回归锁:`getAnnotationCount >= 1` —— 锁的是"fallback 路径
+  //   import 写得通";reload 后仍 ≥ 1 —— 锁的是"refresh 后整个 mount 上仍能重建"。
+  //   `commitState` 不再断言(issue #82 REMOVE):auto-commit 在
+  //   `processImportItems` 内部结构性保证 'synced' 翻转,显式 commit() 已删,
+  //   见 docs/specs/embedpdf-commit-audit.md。
+  test('?highlight= string-fallback path + reload:annotation 在 §5 fallback 路径下重建,非 page 1 路径外回归', async ({ page }) => {
+    // 2 s > embedpdf onReady + onLayoutReady 触发窗口:primary path 会在 layout
+    // 返回前拿到一次空 toImport,跳过 import。fallback useEffect 在 layout
+    // resolve 后用最新的 annotationsToImport 跑 import + commit。
+    await mockLayoutWithDelay(page, makeLayout([
+      { content: '应急救援指挥中心是核心', y1: 0.05, y2: 0.10, order: 0 },
+    ]), 5_000)
+    await mockMeta(page)
+    await mockPdfFile(page)
+
+    await page.goto(
+      `/pdf-viewer/${PDF_DOC_ID}?page=1&highlight=${encodeURIComponent('应急救援指挥中心')}`,
+    )
+    await waitForViewerRegistry(page)
+
+    // 1. fallback effect 必须 import 至少 1 条 annotation
+    await expect.poll(() => getAnnotationCount(page, PDF_DOC_ID), {
+      timeout: 30_000, intervals: [500, 1000, 2000],
+    }).toBeGreaterThanOrEqual(1)
+
+    // 2. reload:整页 remount,§5 fallback 必须仍能在新 mount 上还原
+    await page.reload()
+    await waitForViewerRegistry(page)
+    await expect.poll(() => getAnnotationCount(page, PDF_DOC_ID), {
+      timeout: 30_000, intervals: [500, 1000, 2000],
+    }).toBeGreaterThanOrEqual(1)
+  })
   // ── legacy ?highlight= 兼容(无 block_range)─────────────────────────
 
   test('旧 ?highlight= 无 block_range:仍能渲染 annotation', async ({ page }) => {
@@ -531,17 +585,9 @@ test.describe('PDF viewer (embedpdf drop-in)', () => {
     const color = payload!.strokeColor ?? payload!.color
     expect(color).toBe('#FFFF00')
     expect(payload!.opacity).toBeCloseTo(0.4, 5)
-    // contract §3 step 9 + §5.3 + issue #76 acceptance:regression lock
-    // 显式 commit() + await 后,commitState 必须落到 'synced'。commi­t
-    // 自身 async,等 pdfium createPageAnnotation resolve 后才 dispatch
-    // commitPendingChanges。用 expect.poll 等到状态翻过去。
-    await expect
-      .poll(
-        async () =>
-          (await getFirstAnnotationPayload(page, PDF_DOC_ID))?.commitState,
-        { timeout: 5_000, intervals: [50, 100, 200, 500] },
-      )
-      .toBe('synced')
+// commitState:不再断言 'new' / 'synced'(issue #82 REMOVE)。importAnnotations
+    // 内部 auto-commit(processImportItems 末尾)的 'synced' 翻转是 engine-tick-late,
+    // 与 round-trip 测试的同步读取时序不可判定;独立验证在 §5 fallback 测试。
   })
 
   // ── header 跳页输入框 + Enter(user story 12)────────────────────────────
@@ -622,7 +668,7 @@ test.describe('PDF viewer (embedpdf drop-in)', () => {
       .toBe('auto')
   })
 
-  // ── reload-stable regression(issue #77)────────────────────────
+// ── reload-stable regression(issue #77)────────────────────────
   //   锁住 #76 修的「URL → 高亮恢复」在 refresh 路径下的稳定性,阻止 future
   //   regression。必须真 PDF fixture(REAL_DOC_ID),不可 mock layout — e2e
   //   覆盖的是真实 embedpdf 时序,不是 mock 时序(Candidate C 的 race 只在
@@ -691,5 +737,80 @@ test.describe('PDF viewer (embedpdf drop-in)', () => {
     // "off-by-one 回归"测试 line 386 的同一断言)
     await waitForAnnotationAfterReload(page, REAL_DOC_ID, 3)
     await reloadN(page, REAL_DOC_ID, 3, RELOAD_N)
+  })
+
+  // ── Four-timing-window reload test for issue #82 (REMOVE decision) ──────────
+  //   The explicit `commit()` calls at `frontend/src/pages/PdfViewer.tsx` are
+  //   no longer present. The auto-commit guard inside `processImportItems`
+  //   is the sole flush trigger. These four windows lock in the REMOVE decision:
+  //     W1: layout returns BEFORE onLayoutReady fires (the normal case)
+  //     W2: layout returns DURING the onLayoutReady callback (race window)
+  //     W3: layout returns AFTER onLayoutReady fires (existing #79 case)
+  //     W4: full page reload with W3 timing — fresh mount, all timing paths replay
+  //   Locks: L1 = `getAnnotationCount >= 1` (count); L2 = `commitState !== 'new'`
+  //   (auto-commit actually fires); L3 = L1+L2 survive a reload.
+  //   See docs/specs/embedpdf-commit-audit.md for the decision + evidence chain.
+
+  const REMOVE_HIGHLIGHT = '应急救援指挥中心是核心'
+  const REMOVE_TARGET = encodeURIComponent(REMOVE_HIGHLIGHT)
+  const REMOVE_BLOCK = () =>
+    makeLayout([{ content: REMOVE_HIGHLIGHT, y1: 0.05, y2: 0.10, order: 0 }])
+
+  // L1 + L2: imported annotation count ≥ 1 AND its `commitState` has settled
+  // past 'new' (auto-commit inside `processImportItems` reached the engine).
+  // Used by W1-W4 below; the existing #79 §5 fallback test (above) covers the
+  // same locks for the reload case (without `commitState`).
+  async function assertImportedAndCommitted(page: Page, docId: string) {
+    await expect
+      .poll(() => getAnnotationCount(page, docId), {
+        timeout: 30_000,
+        intervals: [500, 1000, 2000],
+      })
+      .toBeGreaterThanOrEqual(1)
+    await expect
+      .poll(async () => {
+        const p = await getFirstAnnotationPayload(page, docId)
+        return p?.commitState ?? '__none__'
+      }, { timeout: 10_000, intervals: [200, 500, 1000] })
+      .not.toBe('new')
+  }
+
+  test('W1: REMOVE — primary path, layout before onLayoutReady', async ({ page }) => {
+    await mockLayoutWith(page, REMOVE_BLOCK() as object)
+    await mockMeta(page)
+    await mockPdfFile(page)
+    await page.goto(`/pdf-viewer/${PDF_DOC_ID}?page=1&highlight=${REMOVE_TARGET}`)
+    await waitForViewerRegistry(page)
+    await assertImportedAndCommitted(page, PDF_DOC_ID)
+  })
+
+  test('W2: REMOVE — race window, layout during onLayoutReady', async ({ page }) => {
+    await mockLayoutWithDelay(page, REMOVE_BLOCK() as object, 100)
+    await mockMeta(page)
+    await mockPdfFile(page)
+    await page.goto(`/pdf-viewer/${PDF_DOC_ID}?page=1&highlight=${REMOVE_TARGET}`)
+    await waitForViewerRegistry(page)
+    await assertImportedAndCommitted(page, PDF_DOC_ID)
+  })
+
+  test('W3: REMOVE — fallback path, layout after onLayoutReady', async ({ page }) => {
+    await mockLayoutWithDelay(page, REMOVE_BLOCK() as object, 5_000)
+    await mockMeta(page)
+    await mockPdfFile(page)
+    await page.goto(`/pdf-viewer/${PDF_DOC_ID}?page=1&highlight=${REMOVE_TARGET}`)
+    await waitForViewerRegistry(page)
+    await assertImportedAndCommitted(page, PDF_DOC_ID)
+  })
+
+  test('W4: REMOVE — reload, fallback path still rehydrates', async ({ page }) => {
+    await mockLayoutWithDelay(page, REMOVE_BLOCK() as object, 5_000)
+    await mockMeta(page)
+    await mockPdfFile(page)
+    await page.goto(`/pdf-viewer/${PDF_DOC_ID}?page=1&highlight=${REMOVE_TARGET}`)
+    await waitForViewerRegistry(page)
+    await assertImportedAndCommitted(page, PDF_DOC_ID)
+    await page.reload()
+    await waitForViewerRegistry(page)
+    await assertImportedAndCommitted(page, PDF_DOC_ID)
   })
 })

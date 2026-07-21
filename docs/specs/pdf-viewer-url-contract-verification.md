@@ -65,8 +65,8 @@ The spec is otherwise exceptionally accurate: every line number cited in §1-§7
 
 ### §3 Restore timing
 
-- **Status**: NEEDS FIX (stale claim).
-- All line ranges verified accurate:
+- **Status**: RESOLVED in issue #82 (REMOVE decision).
+- All line ranges verified accurate as of the pre-#82 audit:
   - Step 1 (Mount): lines 301-348 ✓ (refs at 341, 342, 343, 347)
   - Step 2 (Fetch meta): lines 370-382 ✓
   - Step 3 (Fetch layout): lines 385-407 ✓
@@ -75,13 +75,25 @@ The spec is otherwise exceptionally accurate: every line number cited in §1-§7
   - Step 6 (Memoized pickBlocksForHits): lines 356-359 ✓
   - Step 7 (scrollToPage, jumpedRef latch): lines 461-471; target formula at 459 ✓
   - Step 8 (importAnnotations, importedRef latch): lines 475; reads `annotationsRef.current` at 474 ✓
-  - Step 9 (commit()): line 497 ✓
+  - Step 9 (commit()): **REMOVED in #82** — per `docs/specs/embedpdf-commit-audit.md`, the
+    auto-commit guard at `frontend/node_modules/@embedpdf/plugin-annotation/dist/index.js:5268`
+    (`if (this.config.autoCommit !== false) this.commit(documentId);` inside `processImportItems`)
+    is structurally sufficient under the pinned `@embedpdf/plugin-annotation@2.14.4` with
+    default `autoCommit: true`. Both restore paths (`handleReady.onLayoutReady` and the
+    §5 fallback useEffect) now call only `importAnnotations(...)` and rely on the
+    auto-commit. ADR-0006 pitfall #3 has been deleted; spec §3 step 9 has been
+    rewritten to describe the auto-commit contract.
 - §3.1 Latch invariants: `importedRef` reset at line 546 confirmed ✓
-- **STALE CLAIM (§3 step 9 + §5.3)**: Spec states "`commit()` flips `commitState` from `'new'` → `'synced'` so Highlight paint runs". The code at line 497 does call `commit()`, and ADR-0006 pitfall #3 confirms this is the **intended** transition. However:
-  - The round-trip e2e test (`pdf-viewer.spec.ts:534-535`) explicitly asserts `expect(payload!.commitState).toBe('new')` AFTER the commit() call runs.
-  - Issue #76 ("Fix intermittent highlight loss on PdfViewer URL refresh", OPEN) and issue #75 (diagnose ticket) are actively tracking the race between `commit()` and paint.
-  - So the spec documents the **design intent**; the **observed behavior** matches a bug under investigation, not the spec's invariant.
-- Recommend: tighten the wording from "Required to flip commitState from 'new' → 'synced' so Highlight paint runs" to "Required as a no-op invariant per ADR-0006 pitfall #3 (Highlight paint path is gated on `'dirty'`/`'synced'`; commit() is the sanctioned transition. If the post-commit state remains `'new'`, that is a bug — see #75/#76)".
+- **STALE CLAIM (§3 step 9 + §5.3) — RESOLVED by #82**: Previously the spec stated
+  "`commit()` flips `commitState` from `'new'` → `'synced'` so Highlight paint runs".
+  The code at line 497 did call `commit()`, and ADR-0006 pitfall #3 confirmed this as
+  the intended transition. The "NEEDS FIX" recommendation has been implemented by
+  the REMOVE decision in #82: the explicit `commit()` calls are gone, ADR-0006 pitfall
+  #3 is deleted, and spec §3 step 9 / §5.3 now describe the auto-commit-on-import
+  contract. The round-trip e2e assertion at `pdf-viewer.spec.ts:534-535` was also
+  removed in #82 (the assertion was documentation-grade under the auto-commit
+  contract; `count ≥ 1` is now the only fallback-path regression lock per §9
+  matrix row §5).
 
 ### §4 DPR contract
 
@@ -100,15 +112,21 @@ The spec is otherwise exceptionally accurate: every line number cited in §1-§7
 
 ### §5 Fallback path
 
-- **Status**: ACCURATE.
-- Verified:
-  - §5.1 primary path lines 457-502: `onLayoutReady` block; reads `annotationsRef.current` at 474; `importedRef` guard at 475; `commit()` at 497 ✓
+- **Status**: SUPERSEDED by issue #82 (REMOVE decision). The body below was
+  accurate as of the pre-#82 audit; the explicit `commit()` calls at
+  `PdfViewer.tsx:497` and `:543` have been removed. Both restore paths now
+  call only `importAnnotations(...)` and rely on `processImportItems`'s
+  internal auto-commit guard. See `docs/specs/embedpdf-commit-audit.md` for
+  the decision + evidence chain and `docs/specs/pdf-viewer-url-contract.md`
+  §5.3 for the current contract.
+- Verified (pre-#82 audit):
+  - §5.1 primary path lines 457-502: `onLayoutReady` block; reads `annotationsRef.current` at 474; `importedRef` guard at 475; explicit `commit()` at 497 — **removed in #82**
   - §5.2 fallback path lines 523-548:
     - Skips: line 524 (`importedRef.current`), line 525 (empty list), line 527 (no registry), line 530 (`viewerStatus !== 'ready'`) ✓
-    - Calls: line 539 `getEffectiveDpr`, line 540 `applyEffectiveDpr`, line 541 `importAnnotations`, line 543 `commit()` ✓
+    - Calls: line 539 `getEffectiveDpr`, line 540 `applyEffectiveDpr`, line 541 `importAnnotations`; explicit `commit()` at 543 — **removed in #82**
     - Failure unlocks: line 546 `importedRef.current = false` ✓
-  - §5.3 "Why both must commit()" — matches ADR-0006 pitfall #3 reasoning ✓
-- **Note**: e2e map (spec §9) marks §5 as "implicit" — there is no explicit test that exercises layout-returned-before-onLayoutReady vs. layout-returned-after. This is a documented gap; the spec correctly notes it.
+  - §5.3 — was "Why both must commit()", now "Why neither path calls `commit()` explicitly" per #82 ✓
+- **Note**: e2e map (spec §9) marks §5 as "implicit" — there is no explicit test that exercises layout-returned-before-onLayoutReady vs. layout-returned-after. Closed by the W1/W3/W4 tests added to `frontend/e2e/pdf-viewer.spec.ts` in #82.
 
 ### §6 docId anchoring
 
@@ -132,14 +150,18 @@ The spec is otherwise exceptionally accurate: every line number cited in §1-§7
 
 ### §8 ADR-0006 pitfalls
 
-- **Status**: ACCURATE.
-- Verified all five pitfalls against ADR-0006 lines 39-43:
+- **Status**: SUPERSEDED by issue #82 (REMOVE decision). The body below was
+  accurate as of the pre-#82 audit; pitfall #3 (commit() required) has been
+  deleted from ADR-0006. The remaining four pitfalls (1, 2, 4, 5 in the
+  renumbered ADR) are still load-bearing.
+- Verified (pre-#82 audit) against ADR-0006 lines 39-43:
   1. documentId path (ADR:39) — §6 cite accurate ✓
   2. onLayoutReady closure (ADR:40) — `annotationsRef` at PdfViewer.tsx:347, mirror at 367 ✓
-  3. commit() required (ADR:41) — Pitfall matches ADR text, but see §3 finding about runtime vs. spec mismatch ✓
-  4. z-index CSS (ADR:42) — PdfViewer.tsx lines 624-634; selector `[data-embedpdf-managed="true"] > div:last-child` at line 628-630; `z-index: 3` at 629 ✓
-  5. effectiveDPR from metrics (ADR:43) — matches §4 ✓
-- ADR-0006 line range citation "37-43" — accurate (section header at 35, pitfalls at 39-43) ✓
+  3. ~~commit() required (ADR:41)~~ — **REMOVED in #82**; see `docs/specs/embedpdf-commit-audit.md` §1-§3 for why the explicit call was redundant under the pinned `@embedpdf/plugin-annotation@2.14.4` default `autoCommit: true`
+  4. z-index CSS (ADR:42 in pre-#82 numbering; ADR-0006 §"实现踩坑" item 3 post-#82) — PdfViewer.tsx lines 624-634; selector `[data-embedpdf-managed="true"] > div:last-child` at line 628-630; `z-index: 3` at 629 ✓
+  5. effectiveDPR from metrics (ADR:43 pre-#82 / item 4 post-#82) — matches §4 ✓
+- ADR-0006 line range citation "37-43" — was accurate pre-#82; post-#82 the
+  pitfalls occupy lines 39-42 (one fewer item).
 
 ### §9 How to cite in e2e
 
@@ -174,9 +196,7 @@ The spec is otherwise exceptionally accurate: every line number cited in §1-§7
    - Current: `Out of contract: ?page= value ≤ 0 or non-numeric — parseInt returns NaN; scrollToPage is never called with NaN; behavior is undefined, not "silently fall back to page 1". Tests must not rely on that.`
    - Suggested: `Out of contract: ?page= value ≤ 0 or non-numeric — parseInt returns NaN; the resulting `target = NaN` propagates into `scrollToPage({pageNumber: NaN, ...})` (line 464) and embedpdf ignores it. No silent fallback to page 1. Tests must not rely on this.`
 
-2. **§3 step 9 (lines 123-125) + §5.3 (lines 183-185) — soften the "commit flips state" claim to acknowledge the bug under investigation**:
-   - Current: `Required to flip commitState from 'new' → 'synced' so Highlight paint runs (ADR-0006 pitfall #3).`
-   - Suggested: `Required per ADR-0006 pitfall #3 — Highlight paint path is gated on 'dirty'/'synced' states, and 'new' is the import default. commit() is the sanctioned transition. If a post-commit annotation reports commitState === 'new' (see round-trip assertion at e2e:535), that is a bug under investigation in #75/#76, not a working state.`
+2. ~~**§3 step 9 (lines 123-125) + §5.3 (lines 183-185) — soften the "commit flips state" claim to acknowledge the bug under investigation**~~ — **implemented by REMOVE in #82** (both restore paths now call only `importAnnotations(...)`; ADR-0006 pitfall #3 deleted; spec §3 step 9 / §5.3 rewritten to describe the auto-commit-on-import contract).
 
 3. **§9.1 line 279 — remove or qualify the `getRectPositionForPage` reference**:
    - Current: `For new assertions on rect, use \`getRectPositionForPage(rect)\` if visual pixel positions are needed (per CONTEXT.md §"E2E annotation 断言钩子"). Pure data assertions should stick to \`getFirstAnnotationPayload\`.`
