@@ -2,9 +2,12 @@
 
 monkeypatch 底层检索（vec_search / _get_kb_search_paths / _run_rga），
 覆盖结果格式化、来源单一性警告、空结果、失败建议文案——不加载任何模型。
+
+V9 PRD #67：parse_search_kb_tool_output 是 search_kb 文本格式的事实定义，
+由 api/routers/qa.py 与 services/agentic_qa.py 复用，本文件末尾补其单测。
 """
 import services.vector_search as vector_search
-from services.agent_tools import search_kb, search_kb_text
+from services.agent_tools import parse_search_kb_tool_output, search_kb, search_kb_text
 
 
 def _result(**kw):
@@ -172,3 +175,67 @@ def test_search_kb_text_failure_advice(monkeypatch):
     out = search_kb_text(["kb1"], "q")
     assert "文本搜索失败" in out
     assert "建议" in out
+
+
+# ── V9 PRD #67 — parse_search_kb_tool_output（共享解析）─────────────────────
+
+class TestParseSearchKbToolOutput:
+    """search_kb 文本格式的事实定义。修改 search_kb() 输出格式时，
+    必须同步更新本测试与所有消费方（qa.py、agentic_qa.py）。"""
+
+    def test_empty_or_none_returns_empty(self):
+        assert parse_search_kb_tool_output("") == []
+        assert parse_search_kb_tool_output(None) == []  # type: ignore[arg-type]
+
+    def test_search_kb_text_is_rejected(self):
+        # search_kb_text 输出无结构化 doc_id → 返回空
+        out = "【知识库文本搜索结果（精确匹配: GB）】\n【doc=xxx / page=0】..."
+        assert parse_search_kb_tool_output(out) == []
+
+    def test_extracts_doc_id_page_block_range(self):
+        tool_out = (
+            "【知识库搜索结果（搜索词: 质保期，共 2 条）】\n"
+            "\n"
+            "1. 【GB/T 12345】第3.2条\n"
+            "   相关度: 0.92 | doc_id: doc-aaa | 页码: 第5页 | block_range: (2, 5)\n"
+            "   质保期 24 个月。\n"
+            "\n"
+            "2. 【JB/T 9999】第1条\n"
+            "   相关度: 0.81 | doc_id: doc-bbb | 页码: 第2页\n"
+            "   备品备件应满足最低要求。\n"
+        )
+        sources = parse_search_kb_tool_output(tool_out)
+        assert [s["doc_id"] for s in sources] == ["doc-aaa", "doc-bbb"]
+        assert sources[0]["page_number"] == 4  # 1-based 第5页 → 0-based page 4
+        assert sources[0]["block_range"] == [2, 5]
+        assert sources[0]["relevance"] == 0.92
+        assert sources[1]["block_range"] is None
+
+    def test_skips_source_diversity_warning_lines(self):
+        # "⚠️ 来源单一性警告" 行不应被吞进 content_snippet
+        tool_out = (
+            "1. 【A】第1条\n"
+            "   相关度: 0.9 | doc_id: doc-a | 页码: 第1页\n"
+            "   真实内容\n"
+            "\n⚠️ 来源单一性警告：所有结果均来自同一份标准文档（A）。\n"
+        )
+        sources = parse_search_kb_tool_output(tool_out)
+        assert len(sources) == 1
+        assert "真实内容" in sources[0]["content_snippet"]
+        assert "⚠️" not in sources[0]["content_snippet"]
+        assert "来源单一性警告" not in sources[0]["content_snippet"]
+
+    def test_dedup_within_one_tool_output(self):
+        # 同一 tool 输出里若出现重复 doc_id，仅留首条
+        tool_out = (
+            "1. 【A】第1条\n   相关度: 0.9 | doc_id: doc-x | 页码: 第1页\n   t1\n"
+            "2. 【A】第2条\n   相关度: 0.8 | doc_id: doc-x | 页码: 第2页\n   t2\n"
+        )
+        assert len(parse_search_kb_tool_output(tool_out)) == 1
+
+    def test_block_without_doc_id_is_dropped(self):
+        # 缺 doc_id 的块（理论上 search_kb 不会产出，旧 KB 兼容）不被保留
+        tool_out = (
+            "1. 【无名】第1条\n   相关度: 0.9 | 页码: 第1页\n   内容\n"
+        )
+        assert parse_search_kb_tool_output(tool_out) == []

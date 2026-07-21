@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { buildQASourcePreviewUrl } from './qaSource'
+import {
+  buildQASourcePreviewUrl,
+  buildQASourcePayload,
+  buildQASourceId,
+  extractQASourceFromPart,
+} from './qaSource'
 import type { QASource } from '../api/types'
 
 function src(over: Partial<QASource>): QASource {
@@ -89,5 +94,140 @@ describe('buildQASourcePreviewUrl', () => {
     const url = buildQASourcePreviewUrl(src({ doc_id: 'd1', page_number: 0 }))
     expect(url).not.toContain('block_range=')
     expect(url).not.toContain('highlight=')
+  })
+})
+
+// ── V9 PRD #67: buildQASourcePayload / buildQASourceId / extract ───────────────
+
+describe('buildQASourceId', () => {
+  it('format is src_<8hex>_p<page-1-based>', () => {
+    // 0-based page 4 → p5
+    const id = buildQASourceId(src({ doc_id: 'abc123', page_number: 4 }))
+    expect(id).toMatch(/^src_[0-9a-f]{8}_p5$/)
+  })
+
+  it('uses p0 when page_number is null', () => {
+    const id = buildQASourceId(src({ doc_id: 'abc123', page_number: null }))
+    expect(id).toMatch(/^src_[0-9a-f]{8}_p0$/)
+  })
+
+  it('uses p0 when page_number is undefined', () => {
+    const id = buildQASourceId(src({ doc_id: 'abc123' }))
+    expect(id).toMatch(/^src_[0-9a-f]{8}_p0$/)
+  })
+
+  it('uses src_empty_p0 for empty doc_id', () => {
+    const id = buildQASourceId(src({ doc_id: '' }))
+    expect(id).toBe('src_empty_p0')
+  })
+
+  it('is stable across calls (same input → same sourceId)', () => {
+    const a = buildQASourceId(src({ doc_id: 'X', page_number: 2 }))
+    const b = buildQASourceId(src({ doc_id: 'X', page_number: 2 }))
+    expect(a).toBe(b)
+  })
+
+  it('differs between distinct doc_ids', () => {
+    const a = buildQASourceId(src({ doc_id: 'A', page_number: 0 }))
+    const b = buildQASourceId(src({ doc_id: 'B', page_number: 0 }))
+    expect(a).not.toBe(b)
+  })
+})
+
+describe('buildQASourcePayload', () => {
+  it('returns null when doc_id is empty (search_kb_text 场景)', () => {
+    expect(buildQASourcePayload(src({ doc_id: '', page_number: 0 }))).toBeNull()
+  })
+
+  it('emits a source-document part with title=doc_source and mediaType=application/pdf', () => {
+    const part = buildQASourcePayload(src({
+      doc_id: 'd1', doc_source: 'GB/T 12345', page_number: 4,
+    }))
+    expect(part).not.toBeNull()
+    expect(part!.type).toBe('source-document')
+    expect(part!.mediaType).toBe('application/pdf')
+    expect(part!.title).toBe('GB/T 12345')
+    expect(part!.filename).toBe('d1')
+  })
+
+  it('falls back to "未知来源" title when doc_source empty', () => {
+    const part = buildQASourcePayload(src({ doc_id: 'd1', doc_source: '', page_number: 0 }))
+    expect(part!.title).toBe('未知来源')
+  })
+
+  it('omits filename when doc_id empty (already null path)', () => {
+    // 双重保险：doc_id 缺失时整个 payload 为 null，不存在"无 filename 的 part"
+    expect(buildQASourcePayload(src({ doc_id: '' }))).toBeNull()
+  })
+
+  it('embeds the original QASource in providerMetadata.qaSource (single source of truth)', () => {
+    const original = src({
+      doc_id: 'd1', doc_source: '标准 A', page_number: 3,
+      content_snippet: '原文片段', relevance: 0.87, block_range: [1, 2],
+    })
+    const part = buildQASourcePayload(original)
+    expect(part!.providerMetadata.qaSource).toEqual(original)
+  })
+
+  it('sourceId is stable and matches buildQASourceId()', () => {
+    const source = src({ doc_id: 'd1', page_number: 2 })
+    const part = buildQASourcePayload(source)!
+    expect(part.sourceId).toBe(buildQASourceId(source))
+  })
+
+  // 四种情形：doc_id 存在 vs 空 × page_number null vs 非 null
+  it('doc_id present + page_number null → payload with p0 sourceId', () => {
+    const part = buildQASourcePayload(src({ doc_id: 'd1', page_number: null }))!
+    expect(part.sourceId).toMatch(/_p0$/)
+    expect(part.filename).toBe('d1')
+  })
+
+  it('doc_id present + page_number 0 → payload with p1 sourceId', () => {
+    const part = buildQASourcePayload(src({ doc_id: 'd1', page_number: 0 }))!
+    expect(part.sourceId).toMatch(/_p1$/)
+  })
+
+  it('doc_id empty + page_number null → null', () => {
+    expect(buildQASourcePayload(src({ doc_id: '', page_number: null }))).toBeNull()
+  })
+
+  it('doc_id empty + page_number present → null (doc_id 优先)', () => {
+    expect(buildQASourcePayload(src({ doc_id: '', page_number: 5 }))).toBeNull()
+  })
+
+  it('with block_range → qaSource.block_range 透传', () => {
+    const part = buildQASourcePayload(src({
+      doc_id: 'd1', page_number: 0, block_range: [4, 9],
+    }))!
+    expect(part.providerMetadata.qaSource.block_range).toEqual([4, 9])
+  })
+
+  it('without block_range → qaSource.block_range 为 undefined', () => {
+    const part = buildQASourcePayload(src({ doc_id: 'd1', page_number: 0 }))!
+    expect(part.providerMetadata.qaSource.block_range).toBeUndefined()
+  })
+})
+
+describe('extractQASourceFromPart', () => {
+  it('extracts qaSource from a source-document part', () => {
+    const original = src({ doc_id: 'd1', page_number: 0 })
+    const part = buildQASourcePayload(original)!
+    expect(extractQASourceFromPart(part)).toEqual(original)
+  })
+
+  it('returns null for non-source-document parts', () => {
+    expect(extractQASourceFromPart({ type: 'text', text: 'hello' })).toBeNull()
+    expect(extractQASourceFromPart({ type: 'reasoning', text: 'thinking' })).toBeNull()
+  })
+
+  it('returns null when providerMetadata.qaSource missing', () => {
+    expect(extractQASourceFromPart({ type: 'source-document', sourceId: 'x' })).toBeNull()
+  })
+
+  it('returns null for null / non-object input', () => {
+    expect(extractQASourceFromPart(null)).toBeNull()
+    expect(extractQASourceFromPart(undefined)).toBeNull()
+    expect(extractQASourceFromPart('source-document')).toBeNull()
+    expect(extractQASourceFromPart(42)).toBeNull()
   })
 })
