@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import queue
@@ -9,6 +10,7 @@ from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
+from services.agent_tools import parse_search_kb_tool_output
 from services.qa_service import ask as qa_ask
 from services.qa_service import chat as qa_chat
 from services.qa_service import chat_stream as qa_chat_stream
@@ -16,6 +18,81 @@ from services.qa_service import chat_stream as qa_chat_stream
 router = APIRouter(prefix="/api/v1/qa", tags=["qa"])
 
 _AGENTIC_QA = os.environ.get("USE_AGENTIC_QA", "true").lower() in ("true", "1", "yes")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# V9 PRD #67 — 内联 source-document chip 支撑
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 把 "N 个来源" 末尾折叠列表替换为流式内联 source-document parts（AI SDK v6
+# 原生 type），以 sourceId 去重。同一 chat stream 中同一 doc_id 仅首次 emit。
+#
+# sourceId 格式：src_<doc_id_short>_p<page>，doc_id_short 取 md5(doc_id) 前 8 位
+# hex（避免长 KB doc_id 污染标识符），page 为 1-based（None 时为 0）。
+#
+# search_kb 工具输出的结构化解析在 services.agent_tools.parse_search_kb_tool_output
+# （V9 PRD #67 把它定为事实定义），本模块只负责把解析结果包成 SSE 事件。
+
+def _short_doc_id(doc_id: str) -> str:
+    if not doc_id:
+        return "empty"
+    return hashlib.md5(doc_id.encode("utf-8")).hexdigest()[:8]
+
+
+def build_source_id(source: dict) -> str:
+    """根据 QASource 构造稳定的 sourceId。"""
+    doc_id = source.get("doc_id", "") or ""
+    page = source.get("page_number")
+    page_token = f"p{(page + 1) if isinstance(page, int) else 0}"
+    return f"src_{_short_doc_id(doc_id)}_{page_token}"
+
+
+def build_source_document_payload(source: dict) -> dict:
+    """构造 AI SDK v6 source-document SSE 事件 payload。
+
+    原始 QASource 落在 providerMetadata.qaSource，前端据此调用既有的
+    buildQASourcePreviewUrl() 生成预览 URL（前后端共用 URL 生成器）。
+    """
+    doc_id = source.get("doc_id", "") or ""
+    payload = {
+        "type": "source-document",
+        "sourceId": build_source_id(source),
+        "mediaType": "application/pdf",
+        "title": source.get("doc_source") or "未知来源",
+        "providerMetadata": {
+            "qaSource": {
+                "kb_id": source.get("kb_id", "") or "",
+                "doc_id": doc_id,
+                "doc_source": source.get("doc_source", "") or "",
+                "content_snippet": (source.get("content_snippet") or "")[:300],
+                "page_number": source.get("page_number"),
+                "relevance": source.get("relevance", 0.0),
+                "block_range": source.get("block_range"),
+            },
+        },
+    }
+    if doc_id:
+        payload["filename"] = doc_id
+    return payload
+
+
+def _build_source_document_events(
+    sources: list[dict],
+    seen_doc_ids: set[str],
+) -> list[dict]:
+    """生成 source-document 事件 payload；同 doc_id 跳过（后端 dedupe 屏障）。
+
+    返回值是事件 payload 列表（调用方负责 SSE 序列化）。空 doc_id 也跳过，
+    让"无 chip"成为 search_kb_text / 旧 KB 的自然结果（spec: 不留孤儿进度条）。
+    """
+    events = []
+    for s in sources:
+        doc_id = s.get("doc_id") or ""
+        if not doc_id or doc_id in seen_doc_ids:
+            continue
+        seen_doc_ids.add(doc_id)
+        events.append(build_source_document_payload(s))
+    return events
 
 
 class QARequest(BaseModel):
@@ -162,6 +239,11 @@ def chat_stream(req: ChatRequest):
         return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     def event_generator():
+        # PRD #67: 跨 agentic / RAG 两条分支共用同一 dedupe 屏障。
+        # 本端发 source-document 时按 doc_id 首次出现时唯一 emit，AI SDK 再用
+        # sourceId 跨 message 去重；两边 dedupe 是独立的。
+        seen_doc_ids: set[str] = set()
+
         if _AGENTIC_QA:
             from services.agentic_qa import run_agentic_qa
             import uuid
@@ -258,11 +340,18 @@ def chat_stream(req: ChatRequest):
                 elif t == "tool_result":
                     func_name = event.get("tool", "unknown")
                     call_id = pending_tool_calls.pop(func_name, f"call-{step_counter}")
+                    tool_content = event.get("content", "")
                     yield _sse("tool-output-available", {
                         "type": "tool-output-available",
                         "toolCallId": call_id,
-                        "output": event.get("content", ""),
+                        "output": tool_content,
                     })
+                    # PRD #67: tool-output-available 紧随其后下发 source-document
+                    # （仅该 doc_id 首次出现时），保持流顺序与文本交错。
+                    for src_event in _build_source_document_events(
+                        parse_search_kb_tool_output(tool_content), seen_doc_ids
+                    ):
+                        yield _sse("source-document", src_event)
 
                 elif t == "error":
                     yield _sse("error", {
@@ -279,22 +368,6 @@ def chat_stream(req: ChatRequest):
                 yield _sse("text-delta", {"type": "text-delta", "id": TEXT_PART_ID, "delta": answer_text})
                 yield _sse("text-end", {"type": "text-end", "id": TEXT_PART_ID})
             yield _sse("finish-step", {"type": "finish-step"})
-            if result.get("sources"):
-                yield _sse("data-sources", {
-                    "type": "data-sources",
-                    "data": {"sources": [
-                        {"kb_id": s.get("kb_id", ""),
-                         "doc_id": s.get("doc_id", ""),
-                         "doc_source": s.get("doc_source", "未知来源"),
-                         "content_snippet": s.get("content_snippet", ""),
-                         "page_number": s.get("page_number"),
-                         "relevance": s.get("relevance", 1.0),
-                         # V8: 透传 block_range 到 SSE 客户端;非空时前端走
-                         # 坐标高亮主路径,缺失/None 时 fallback 到 highlight。
-                         "block_range": s.get("block_range")}
-                        for s in result["sources"]
-                    ]},
-                })
             yield _sse("finish", {"type": "finish", "finishReason": "stop"})
 
         else:
@@ -316,8 +389,12 @@ def chat_stream(req: ChatRequest):
                 elif t == "done":
                     if text_started_rag:
                         yield _sse("text-end", {"type": "text-end", "id": TEXT_PART_ID})
-                    if event.get("sources"):
-                        yield _sse("data-sources", {"type": "data-sources", "data": {"sources": event["sources"]}})
+                    # PRD #67: 用 source-document parts 替换 data-sources。
+                    # RAG 路径在 done 时一次性拿到 sources；按流顺序 emit。
+                    for src_event in _build_source_document_events(
+                        event.get("sources") or [], seen_doc_ids
+                    ):
+                        yield _sse("source-document", src_event)
                     if event.get("suggestions"):
                         yield _sse("data-suggestions", {"type": "data-suggestions", "data": {"suggestions": event["suggestions"]}})
                     yield _sse("data-session", {"type": "data-session", "data": {"session_id": event["session_id"]}})

@@ -1,34 +1,152 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { Fragment, useState, useRef, useEffect, useCallback } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useChat } from '@ai-sdk/react'
 import { DefaultChatTransport } from 'ai'
-import { Send, Loader2, MessageSquare, ChevronDown, ChevronRight, Copy, RefreshCw, Square } from 'lucide-react'
+import { Send, Loader2, MessageSquare, Copy, RefreshCw, Square, FileText } from 'lucide-react'
 import { kbApi } from '../api/endpoints'
 import { Card, CardBody } from '../components/Card'
 import { Markdown } from '../components/Markdown'
 
 import type { QASource } from '../api/types'
-import { buildQASourcePreviewUrl } from '../lib/qaSource'
+import {
+  buildQASourcePreviewUrl,
+  extractQASourceFromPart,
+} from '../lib/qaSource'
 
 /** 从 AI SDK v6 的 UIMessage 中提取文本内容 */
 function getMessageText(msg: { parts?: Array<{ type: string; text?: string }>; content?: string }): string {
   // v6 用 parts: [{ type: 'text', text: '...' }]
   let text = ''
   if (msg.parts && msg.parts.length > 0) {
-    text = msg.parts.filter(p => p.type === 'text').map(p => p.text).join('')
+    text = msg.parts.filter(p => p.type === 'text').map(p => (p as { text?: string }).text || '').join('')
   } else {
-    text = msg.content || ''
+    text = (msg as { content?: string }).content || ''
   }
   // 过滤掉追问建议行（以【追问】开头），它们由专用区块渲染为 chip 按钮
   return text.split('\n').filter(line => !line.trim().startsWith('【追问】')).join('\n')
 }
 
+// ── V9 PRD #67 — 内联 source-document chip & 进度指示器 ────────────────────────
+//
+// 设计要点（见 CONTEXT.md "QA 引用体验（V9 PRD #67）"）：
+// - 工具调用 `input-*` 状态渲染 <AgentStepIndicator>（同位置占位，spinner）
+// - 工具调用 `output-available` + 紧随 source-document：进度条就地升级为
+//   <SourceChip>，两者复用同一个 React key（toolCallId），DOM 节点不重建。
+// - 工具调用 `output-available` 但无 source-document（search_kb_text / 无 doc_id
+//   / 空结果）：进度条**直接消失**，不留下孤儿元素。
+// - source-document part 本身不渲染（其 chip 由对应 tool-* part 触发渲染）。
+// - 无工具调用的回答自然无 chip / 进度条。
+
+/** 计算某消息内 source-document part 与 toolCallId 的归属关系（流顺序）。 */
+function indexSourceDocsByToolCall(
+  parts: ReadonlyArray<{ type: string; toolCallId?: string }> | undefined,
+): Record<string, QASource[]> {
+  const map: Record<string, QASource[]> = {}
+  if (!parts) return map
+  let currentCallId: string | null = null
+  for (const part of parts) {
+    const type = part.type
+    // AI SDK 工具 part 跨状态共享同一个 toolCallId；
+    // toolCallId 一旦出现（含 input-streaming / input-available / output-available）
+    // 就锁定为后续 source-document 的归属。
+    if (type.startsWith('tool-') && (part as { toolCallId?: string }).toolCallId) {
+      currentCallId = (part as { toolCallId?: string }).toolCallId || null
+    }
+    if (type === 'source-document') {
+      const qa = extractQASourceFromPart(part)
+      if (currentCallId && qa) {
+        if (!map[currentCallId]) map[currentCallId] = []
+        // 同 doc_id 在同一 tool call 内已由后端 _emit_source_documents 去重；
+        // 前端再保险一道，避免 React key 重复。
+        if (!map[currentCallId].some((s) => s.doc_id === qa.doc_id)) {
+          map[currentCallId].push(qa)
+        }
+      }
+    }
+  }
+  return map
+}
+
+function AgentStepIndicator({ name }: { name?: string }) {
+  // 与 SourceChip 同高度、同内边距，确保"就地升级"无视觉跳变
+  return (
+    <span className="qa-chip qa-chip--loading inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs border border-slate-200 bg-white/70 text-slate-500 align-middle">
+      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+      <span>🧠 {name ? `${name} 搜索中…` : '搜索中…'}</span>
+    </span>
+  )
+}
+
+function SourceChip({ source }: { source: QASource }) {
+  const url = buildQASourcePreviewUrl(source)
+  const tooltip = (source.content_snippet || '').trim()
+  const label = (source.doc_source || '未知来源').trim() || '未知来源'
+
+  if (!url) {
+    // doc_id 缺失（理论上 buildQASourcePayload 已过滤，这里再兜底）
+    return (
+      <span
+        className="qa-chip qa-chip--disabled inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs border border-slate-200 bg-slate-100 text-slate-400 align-middle cursor-not-allowed"
+        title={tooltip || '该来源无文档 ID，无法预览'}
+      >
+        <FileText className="w-3.5 h-3.5" />
+        <span className="truncate max-w-[12rem]">{label}</span>
+      </span>
+    )
+  }
+
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={tooltip || label}
+      className="qa-chip qa-chip--source inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs border border-slate-200 bg-blue-50 text-blue-700 hover:bg-blue-100 hover:border-blue-300 transition-colors align-middle"
+    >
+      <FileText className="w-3.5 h-3.5 shrink-0" />
+      <span className="truncate max-w-[12rem]">{label}</span>
+    </a>
+  )
+}
+
+/** 渲染某消息内一个 tool-* part（按 state 切换 indicator ↔ chip）。 */
+function renderToolPart(
+  part: { type: string; toolCallId?: string; toolName?: string; state: string },
+  sourceDocsByToolCall: Record<string, QASource[]>,
+): React.ReactNode {
+  const toolCallId = part.toolCallId
+  const name = part.toolName || part.type.replace(/^tool-/, '')
+  const isLoading = part.state === 'input-streaming' || part.state === 'input-available'
+
+  if (isLoading) {
+    // 进度条 → chip 升级路径：React key 锁定为 toolCallId。
+    return <AgentStepIndicator key={toolCallId || name} name={name} />
+  }
+
+  // state === 'output-available'（AI SDK 已知 tool-* 的终态仅此一种）。
+  const sources = toolCallId ? sourceDocsByToolCall[toolCallId] : undefined
+  if (!sources || sources.length === 0) {
+    // search_kb_text / 空结果 / 无 doc_id：进度条直接消失，不渲染任何元素。
+    return null
+  }
+
+  // 升级：第一个 chip 复用 toolCallId 作为 React key，DOM 锚不重建；
+  // 同一 tool call 产生的后续 chip 用 sourceId 区分。
+  const first = sources[0]
+  return (
+    <Fragment key={toolCallId || first.doc_id}>
+      <SourceChip source={first} />
+      {sources.slice(1).map((s) => (
+        <SourceChip key={s.doc_id + '_' + (s.page_number ?? 0)} source={s} />
+      ))}
+    </Fragment>
+  )
+}
+
 export function QA() {
   const [selectedKBs, setSelectedKBs] = useState<string[]>([])
   const [sessionId, setSessionId] = useState<string | undefined>()
-  const [sourcesMap, setSourcesMap] = useState<Map<string, QASource[]>>(new Map())
   const [suggestionsMap, setSuggestionsMap] = useState<Map<string, string[]>>(new Map())
-  const [expandedSources, setExpandedSources] = useState<Set<string>>(new Set())
   const [input, setInput] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
 
@@ -54,18 +172,18 @@ export function QA() {
     }),
     experimental_throttle: 50,
     onFinish: ({ message }) => {
-      const dataParts = message.parts?.filter(p => p.type.startsWith('data-')) as Array<{ data: { sources?: QASource[]; session_id?: string; suggestions?: string[] } }> | undefined
-      const src = dataParts?.find(p => p.data?.sources)
-      if (src?.data?.sources) {
-        setSourcesMap(prev => new Map(prev).set(message.id, src.data.sources!))
-      }
-      const sess = dataParts?.find(p => p.data?.session_id)
+      // PRD #67: data-sources 已下线；data-session / data-suggestions 仍保留
+      // （session_id 维护追问；suggestions 渲染为底部追问 chip 按钮）。
+      const dataParts = message.parts?.filter((p) => p.type.startsWith('data-')) as
+        | Array<{ data: { session_id?: string; suggestions?: string[] } }>
+        | undefined
+      const sess = dataParts?.find((p) => p.data?.session_id)
       if (sess?.data?.session_id) {
         setSessionId(sess.data.session_id)
       }
-      const sug = dataParts?.find(p => p.data?.suggestions)
+      const sug = dataParts?.find((p) => p.data?.suggestions)
       if (sug?.data?.suggestions) {
-        setSuggestionsMap(prev => new Map(prev).set(message.id, sug.data!.suggestions!))
+        setSuggestionsMap((prev) => new Map(prev).set(message.id, sug.data!.suggestions!))
       }
     },
   })
@@ -97,9 +215,7 @@ export function QA() {
     chat.setMessages([])
     setSelectedKBs((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id])
     setSessionId(undefined)
-    setSourcesMap(new Map())
     setSuggestionsMap(new Map())
-    setSourcesMap(new Map())
     setInput('')
   }
 
@@ -137,6 +253,9 @@ export function QA() {
           ) : (
             <>
               {chat.messages.map((msg, i) => {
+                const sourceDocsByToolCall = indexSourceDocsByToolCall(
+                  msg.parts as ReadonlyArray<{ type: string; toolCallId?: string }> | undefined,
+                )
                 return (
                   <div key={msg.id || i} className="space-y-1.5">
                     <div className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
@@ -144,32 +263,48 @@ export function QA() {
                         msg.role === 'user' ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-900'
                       }`}>
                         {msg.parts && msg.parts.length > 0 ? (
-                          msg.parts.map((part, pi) => {
-                            if (part.type === 'text') {
-                              const text = (part as { text: string }).text || ''
-                              return <div key={pi} className="markdown-body"><Markdown content={text.split('\n').filter(line => !line.trim().startsWith('【追问】')).join('\n')} /></div>
-                            }
-                            if (part.type === 'reasoning') {
-                              const reasoningText = (part as { text: string }).text || ''
-                              return <details key={pi} className="mb-2"><summary className="text-xs text-slate-400 cursor-pointer">💭 推理过程</summary><div className="mt-1 text-xs text-slate-500 whitespace-pre-wrap">{reasoningText}</div></details>
-                            }
-                            if ((part.type as string).startsWith('tool-')) {
-                              const toolPart = part as { type: string; toolCallId?: string; toolName?: string; state: string; input?: unknown; output?: unknown }
-                              const name = toolPart.toolName || toolPart.type.replace('tool-', '')
-                              return (
-                                <details key={pi} className="mb-2">
-                                  <summary className="text-xs text-slate-400 cursor-pointer">
-                                    🔍 {name}
-                                    {toolPart.state === 'input-streaming' || toolPart.state === 'input-available' ? ' (搜索中…)' : ' (完成)'}
-                                  </summary>
-                                  <div className="mt-1 text-xs text-slate-500 whitespace-pre-wrap max-h-32 overflow-y-auto">
-                                    {toolPart.output ? String(toolPart.output).slice(0, 500) : (toolPart.input ? JSON.stringify(toolPart.input, null, 2) : '')}
-                                  </div>
-                                </details>
-                              )
-                            }
-                            return null
-                          })
+                          // 内联 flex 布局：文本与 chip 按流顺序交错；
+                          // `flex-wrap` 保证 chip 与文本自然衔接（不强制每段独占一行）。
+                          <div className="markdown-body inline-flex flex-wrap items-baseline gap-x-1.5 gap-y-1.5">
+                            {msg.parts.map((part, pi) => {
+                              const type = (part as { type: string }).type
+                              if (type === 'text') {
+                                const text = ((part as { text?: string }).text || '')
+                                  .split('\n')
+                                  .filter((line) => !line.trim().startsWith('【追问】'))
+                                  .join('\n')
+                                if (!text) return null
+                                return (
+                                  <span key={`t-${pi}`} className="inline">
+                                    <Markdown content={text} />
+                                  </span>
+                                )
+                              }
+                              if (type === 'reasoning') {
+                                const reasoningText = (part as { text?: string }).text || ''
+                                return (
+                                  <details key={`r-${pi}`} className="mb-2 w-full">
+                                    <summary className="text-xs text-slate-400 cursor-pointer">💭 推理过程</summary>
+                                    <div className="mt-1 text-xs text-slate-500 whitespace-pre-wrap">{reasoningText}</div>
+                                  </details>
+                                )
+                              }
+                              if (type.startsWith('tool-')) {
+                                return (
+                                  <span key={`tp-${(part as { toolCallId?: string }).toolCallId || pi}`} className="inline-flex">
+                                    {renderToolPart(
+                                      part as { type: string; toolCallId?: string; toolName?: string; state: string },
+                                      sourceDocsByToolCall,
+                                    )}
+                                  </span>
+                                )
+                              }
+                              // source-document 由 renderToolPart 触发渲染（tool-* 同位置升级），
+                              // 此处直接吞掉，避免重复 chip。
+                              if (type === 'source-document') return null
+                              return null
+                            })}
+                          </div>
                         ) : (
                           <div className="markdown-body"><Markdown content={getMessageText(msg)} /></div>
                         )}
@@ -180,49 +315,7 @@ export function QA() {
                             <span className="text-xs text-slate-400">正在生成回答…</span>
                           </div>
                         )}
-                        {msg.role === 'assistant' && sourcesMap.has(msg.id) && (
-                        <div className="mt-2 pt-2 border-t border-slate-200/60">
-                          <button
-                            className="flex items-center gap-1 text-xs text-slate-500 hover:text-slate-700"
-                            onClick={() => setExpandedSources((prev) => {
-                              const next = new Set(prev)
-                              next.has(msg.id) ? next.delete(msg.id) : next.add(msg.id)
-                              return next
-                            })}
-                          >
-                            {expandedSources.has(msg.id) ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-                            {sourcesMap.get(msg.id)!.length} 个来源
-                          </button>
-                          {expandedSources.has(msg.id) && (
-                            <div className="mt-2 space-y-2">
-                              {sourcesMap.get(msg.id)!.map((s, j) => {
-                                const previewUrl = buildQASourcePreviewUrl(s)
-                                return (
-                                <div key={j} className="text-xs text-slate-500 bg-white/80 rounded p-2 border border-slate-200/60">
-                                  <div className="flex items-center gap-2 mb-1">
-                                    <span className="font-medium text-slate-600">{s.doc_source}</span>
-                                    <span className="text-slate-400">{(s.relevance * 100).toFixed(0)}%</span>
-                                    {previewUrl && (
-                                      <a
-                                        href={previewUrl}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        className="ml-auto text-blue-600 hover:underline inline-flex items-center gap-0.5"
-                                        title="在新标签页预览来源"
-                                      >
-                                        📄 预览
-                                      </a>
-                                    )}
-                                  </div>
-                                  <p className="line-clamp-2">{s.content_snippet}</p>
-                                </div>
-                                )
-                              })}
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
+                      </div>
                     </div>
                     {/* 助手消息操作按钮 */}
                     {msg.role === 'assistant' && (
@@ -259,11 +352,11 @@ export function QA() {
                           >
                             {suggestion}
                           </button>
-                        ))}
+                          ))}
                       </div>
                     )}
                   </div>
-              )
+                )
               })}
 
               {/* 错误提示 */}

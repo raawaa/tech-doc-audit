@@ -15,7 +15,16 @@ from pathlib import Path
 from typing import Callable
 
 from core.logger import get_logger
-from services.agent_tools import search_kb, search_kb_text
+from services.agent_tools import (
+    _SEARCH_KB_BLOCK_RANGE,
+    _SEARCH_KB_BLOCK_START,
+    _SEARCH_KB_DOC_ID,
+    _SEARCH_KB_NAME,
+    _SEARCH_KB_PAGE,
+    _SEARCH_KB_RELEVANCE,
+    search_kb,
+    search_kb_text,
+)
 from services.agent_trace import save_trace
 from services.agentic_audit import (
     StreamingLLMStep,
@@ -228,22 +237,25 @@ def run_agentic_qa(
     return {"answer": loop_out.raw_analysis, "sources": sources}
 
 
-# search_kb 结果文本的结构化解析模式（格式见 agent_tools.search_kb）
-_SRC_BLOCK_START = re.compile(r"^(\d+)\.\s+(.*)$")
-_SRC_NAME = re.compile(r"【(.+?)】")
-_SRC_RELEVANCE = re.compile(r"相关度:\s*([\d.]+)")
-_SRC_DOC_ID = re.compile(r"doc_id:\s*(\S+)")
-_SRC_PAGE = re.compile(r"页码:\s*第(\d+)页")
-# V8: search_kb 工具输出追加 "block_range: (x, y)" 时解析;非空闭区间
-# (0-based block_order) 用于前端 PdfViewer 坐标高亮主路径。
-_SRC_BLOCK_RANGE = re.compile(r"block_range:\s*\(?(\d+)\s*,\s*(\d+)\)?")
+# search_kb 结果文本的结构化解析模式复用自 services.agent_tools（V9 PRD #67
+# 将其定为 search_kb 输出格式的事实定义）。这里只 import 用得到的正则，
+# 不复用 parse_search_kb_tool_output 是因为 _extract_sources 的语义不同：
+# - 跨多 tool message 累积；
+# - search_kb_text 回退到"按 name 提取"的向后兼容路径；
+# - 跨消息去重基于 doc_source（旧 KB 无 doc_id 时也能去重）。
+_SRC_BLOCK_START = _SEARCH_KB_BLOCK_START
+_SRC_NAME = _SEARCH_KB_NAME
+_SRC_RELEVANCE = _SEARCH_KB_RELEVANCE
+_SRC_DOC_ID = _SEARCH_KB_DOC_ID
+_SRC_PAGE = _SEARCH_KB_PAGE
+_SRC_BLOCK_RANGE = _SEARCH_KB_BLOCK_RANGE
 _SRC_SKIP_MARKERS = ("搜索结果", "文本搜索", "精确匹配")
 
 
 def _extract_sources(messages: list[dict]) -> list[dict]:
     """从消息历史中提取知识库来源引用。
 
-    解析 search_kb 工具返回的结构化文本（格式见 agent_tools.search_kb），
+    解析 search_kb 工具返回的结构化文本（格式见 services.agent_tools.search_kb），
     回填完整字段：doc_source / doc_id / page_number(0-based) / content_snippet / relevance。
     而非旧实现那样仅保留文档名。
 

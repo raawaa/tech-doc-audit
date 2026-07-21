@@ -5,10 +5,94 @@
 - search_kb_text：精确文本搜索（ripgrep-all，via _run_rga）
 
 read_chapter / flag_issue 是审核文档域、仅审核用，留在 agentic_audit.py，不在此处。
+
+V9 PRD #67：search_kb 输出格式被 SSE 层（api/routers/qa.py）inline 解析，
+本模块还提供 `parse_search_kb_tool_output` 作为该格式的事实定义，
+agentic_qa._extract_sources 与 qa._parse_tool_sources 都从这里导入。
 """
+import re
+
 from core.logger import get_logger
 
 _logger = get_logger(__name__)
+
+
+# ── V9 PRD #67 — search_kb 输出格式（事实定义）────────────────────────────────
+# search_kb 工具返回的格式化文本（见本文件下方 search_kb 实现），以下正则
+# 解析该格式。文本按"块（block）"组织：每个编号条目对应一条检索结果，块内
+# 包含【名称】、相关度、doc_id、页码（1-based）、block_range（可选）、正文。
+# 任何修改都会同时影响 SSE 层（qa.py）与 agentic_qa._extract_sources 的解析。
+
+_SEARCH_KB_BLOCK_START = re.compile(r"^(\d+)\.\s+(.*)$")
+_SEARCH_KB_NAME = re.compile(r"【(.+?)】")
+_SEARCH_KB_RELEVANCE = re.compile(r"相关度:\s*([\d.]+)")
+_SEARCH_KB_DOC_ID = re.compile(r"doc_id:\s*(\S+)")
+_SEARCH_KB_PAGE = re.compile(r"页码:\s*第(\d+)页")
+_SEARCH_KB_BLOCK_RANGE = re.compile(r"block_range:\s*\(?(\d+)\s*,\s*(\d+)\)?")
+
+
+def parse_search_kb_tool_output(tool_output: str) -> list[dict]:
+    """从 search_kb 工具返回的格式化文本解析 sources 列表。
+
+    仅解析 search_kb 的结构化输出；search_kb_text 文本搜索结果（含
+    "文本搜索结果" / "精确匹配" 标记）返回空（无结构化 doc_id）。
+
+    返回每条 source 的字段：kb_id / doc_id / doc_source / content_snippet /
+    page_number（0-based）/ relevance / block_range。doc_id 为空者会被保留，
+    调用方按需过滤（qa.py 要求 doc_id 非空才 emit source-document chip；
+    agentic_qa._extract_sources 兼容旧 KB 无 doc_id 的情况）。
+    """
+    if not tool_output:
+        return []
+    if "文本搜索结果" in tool_output or "精确匹配" in tool_output:
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    current: dict | None = None
+    for line in tool_output.split("\n"):
+        bs = _SEARCH_KB_BLOCK_START.match(line)
+        if bs:
+            if current and current.get("doc_id") and current["doc_id"] not in seen:
+                seen.add(current["doc_id"])
+                out.append(current)
+            label = bs.group(2)
+            name_m = _SEARCH_KB_NAME.search(label)
+            doc_source = name_m.group(1) if name_m else (label.strip() or "未知来源")
+            current = {
+                "kb_id": "",
+                "doc_id": "",
+                "doc_source": doc_source,
+                "content_snippet": "",
+                "page_number": None,
+                "relevance": 0.0,
+                "block_range": None,
+            }
+            continue
+        if current is None:
+            continue
+        if "相关度" in line:
+            rel_m = _SEARCH_KB_RELEVANCE.search(line)
+            if rel_m:
+                current["relevance"] = float(rel_m.group(1))
+            did_m = _SEARCH_KB_DOC_ID.search(line)
+            if did_m:
+                current["doc_id"] = did_m.group(1)
+            pg_m = _SEARCH_KB_PAGE.search(line)
+            if pg_m:
+                current["page_number"] = int(pg_m.group(1)) - 1  # 1-based → 0-based
+            br_m = _SEARCH_KB_BLOCK_RANGE.search(line)
+            if br_m:
+                current["block_range"] = [int(br_m.group(1)), int(br_m.group(2))]
+        elif line.strip() and "⚠️" not in line and "来源单一性警告" not in line:
+            snippet = line.strip()
+            current["content_snippet"] = (
+                (current["content_snippet"] + "\n" + snippet).strip()
+                if current["content_snippet"]
+                else snippet
+            )
+    if current and current.get("doc_id") and current["doc_id"] not in seen:
+        out.append(current)
+    return out
 
 
 def search_kb(
