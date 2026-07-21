@@ -122,13 +122,16 @@ Sequence in `PdfViewer.tsx`, anchored to line numbers:
 8. **`importAnnotations`** — once per document (`importedRef` latch at line 475).
    Reads latest list from `annotationsRef.current` (line 474) to dodge the
    closure-capture race (ADR-0006 pitfall #2).
-9. **`commit()`** — `ann.forDocument(docId).commit()` at line 497. Required per
-   ADR-0006 pitfall #3 — the Highlight paint path is gated on
-   `'dirty'` / `'synced'` states, and `'new'` is the default for imported
-   annotations. `commit()` is the sanctioned transition. If a post-commit
-   annotation reports `commitState === 'new'` (round-trip assertion at
-   `frontend/e2e/pdf-viewer.spec.ts:535`), that is a bug under investigation
-   in #75/#76, not a working state.
+9. **Auto-commit inside `importAnnotations`** — under the pinned
+   `@embedpdf/plugin-annotation@2.14.4` with default `autoCommit: true`,
+   `processImportItems` (`node_modules/@embedpdf/plugin-annotation/dist/index.js:5268`)
+   dispatches `commit(documentId)` synchronously after every `importAnnotations`
+   call, which is the same flush path an explicit `commit()` would have taken.
+   No explicit `commit()` is needed at the call site — both `handleReady.onLayoutReady`
+   (`frontend/src/pages/PdfViewer.tsx:497`) and the §5 fallback useEffect
+   (`frontend/src/pages/PdfViewer.tsx:543`) call only `importAnnotations(...)` and
+   rely on the auto-commit guard. See `docs/specs/embedpdf-commit-audit.md` §1-§3
+   for the dispositive evidence and §5 for the future-upgrade surveillance signal.
 
 ### 3.1 Latch invariants
 
@@ -164,13 +167,16 @@ Sequence in `PdfViewer.tsx`, anchored to line numbers:
 ## 5. Fallback path
 
 The two-step restore admits a race: `onLayoutReady` can fire before
-`/layout` returns. Both paths must `commit()`.
+`/layout` returns. Neither path calls `commit()` explicitly — the
+`importAnnotations` auto-commit guard inside `processImportItems` carries
+the flush (see §5.3).
 
 ### 5.1 Primary path (`onLayoutReady` in `handleReady`)
 
 - `frontend/src/pages/PdfViewer.tsx:457-502`. Imports inside the
   `onLayoutReady` callback, reads `annotationsRef.current`, guards on
-  `importedRef` + `toImport.length > 0`. Closes with `commit()`.
+  `importedRef` + `toImport.length > 0`. Relies on `importAnnotations`'s
+  internal auto-commit guard (see §5.3); no explicit `commit()` follows.
 
 ### 5.2 Fallback path (`useEffect` over `annotationsToImport`)
 
@@ -179,19 +185,25 @@ The two-step restore admits a race: `onLayoutReady` can fire before
   && registryRef.current && viewerStatus === 'ready'`.
 - Skips when: layout API hasn't returned yet (no registry yet → returns
   line 527), or viewer not ready (line 530), or already imported (line 524).
-- Calls `applyEffectiveDpr(...)` and `ann.forDocument(docId).commit()`
-  exactly like the primary path (lines 538-543).
+- Calls `applyEffectiveDpr(...)` then `ann.forDocument(docId).importAnnotations(corrected)`
+  exactly like the primary path (lines 539-541). No explicit `commit()` —
+  the auto-commit guard inside `importAnnotations` handles the flush (see §5.3).
 - Failure path unlocks `importedRef` (line 546) so the next `annotationsToImport`
   change can retry.
 
-### 5.3 Why both must `commit()`
+### 5.3 Why neither path calls `commit()` explicitly
 
-`importAnnotations` produces annotations in `commitState: 'new'`. The Highlight
-component's paint path renders only `'dirty'` / `'synced'` states.
-`commit()` is the only sanctioned transition. See ADR-0006 pitfall #3. If a
-post-commit annotation reports `commitState === 'new'` (round-trip assertion
-at `frontend/e2e/pdf-viewer.spec.ts:535`), that is a bug under investigation
-in #75/#76, not a working state — the spec does not retroactively bless it.
+Under the currently pinned `@embedpdf/plugin-annotation@2.14.4` with the default
+`autoCommit: true` config, `importAnnotations(...)` already dispatches an
+internal `commit()` (`processImportItems` →
+`commit(documentId)` → `executeCommitBatch` →
+`commitPendingChanges` reducer), so the explicit `commit()` call that
+preceded this audit is redundant; a future upstream change to the `autoCommit`
+default or to the `processImportItems` guard is the only scenario in which the
+explicit call becomes load-bearing again, and the changelog at
+`https://github.com/embedpdf/embed-pdf-viewer/blob/main/packages/plugin-annotation/CHANGELOG.md`
+is the surveillance signal. Full evidence chain and version-history review:
+`docs/specs/embedpdf-commit-audit.md`.
 
 ## 6. docId anchoring
 
@@ -230,7 +242,7 @@ Layout fetch returns one of three outcomes; UI reacts
 
 ## 8. ADR-0006 pitfalls (non-negotiable)
 
-These five pitfalls are locked by ADR-0006
+These four pitfalls are locked by ADR-0006
 (`docs/adr/0006-pdf-viewer-embedpdf-dropin.md:37-43`). They are **not**
 whitewashable into "normal behavior" by future tickets. Any fix that
 silently tolerates a violation of these — e.g. by patching one symptom
@@ -245,17 +257,12 @@ while leaving the root cause — is a bug.
    `handleReady` subscribes once; the closure captures the value of
    `annotationsToImport` at subscription time. Use `annotationsRef` to mirror
    the latest value (line 347, 367). Pair with the §5 fallback effect.
-3. **`importAnnotations` must be followed by an explicit `commit()`.**
-   `commitState: 'new'` is the default for imported annotations; the
-   Highlight paint path renders only `'dirty'` / `'synced'`. The
-   `autoCommit: true` snippet option only applies to the
-   `CREATE_ANNOTATION` reducer, not the `import` path. See §5.3.
-4. **Annotation z-index must be manually raised above page canvas.**
+3. **Annotation z-index must be manually raised above page canvas.**
    The drop-in's `<style>` block at `frontend/src/pages/PdfViewer.tsx:624-634`
    forces `[data-embedpdf-managed="true"] > div:last-child` to
    `z-index: 3` so the highlight layer is not buried under the page canvas.
    Removing this CSS re-introduces the "highlight behind page" bug.
-5. **effectiveDPR must be derived from `scroll.getMetrics()`, not
+4. **effectiveDPR must be derived from `scroll.getMetrics()`, not
    `window.devicePixelRatio`.** Physical DPR and effectiveDPR can differ
    (browser zoom etc.). See §4 and CONTEXT.md `Avoid` note.
 
@@ -272,10 +279,10 @@ surface. Mapping spec sections → test files:
 | §2 coordinate semantics                    | "round-trip" (line 510): asserts `rectOriginY ≈ 1600` (Y-up), `rectOriginX ≈ 50`, `rectWidth ≈ 900`, `rectHeight ≈ 200`                    |
 | §3 restore timing                           | All "waitForViewerRegistry" + `expect.poll(getAnnotationCount)` patterns                                                                 |
 | §4 DPR contract                             | "?page=N(N≥2)&block_range=…" (line 411) — the #72 regression assertion                                                                  |
-| §5 fallback path                            | Implicit: the "?page=1&highlight=" tests cover both layout-returned-before and layout-returned-after race                                   |
+| §5 fallback path                            | "?highlight= string-fallback path + reload" (#79): `frontend/e2e/pdf-viewer.spec.ts` — `page.route` 延迟 layout JSON 5 s 强制走 §5.2 fallback useEffect,断言 annotation count ≥ 1;reload 后重演同一时序,二轮断言仍成立。`count ≥ 1 + reload replay` 是 fallback 路径的唯一回归锁。 |
 | §6 docId anchoring                          | Implicit in `waitForViewerRegistry` + any `getAnnotationCount` test that resolves to a positive count                                    |
 | §7 E1 / E2                                  | "未 reparse doc + 带 highlight:E1 fallback UI 出现" (line 298)                                                                            |
-| §8 pitfalls                                 | Each pitfall is regression-locked by at least one named test above; failure to reproduce the original bug ⇒ pitfall regression              |
+| §8 pitfalls                                 | Each pitfall is regression-locked by at least one named test above; failure to reproduce the original bug ⇒ pitfall regression (the four ADR-0006 redlines that remain after #82 removed pitfall #3 — the explicit-`commit()` pitfall — are the load-bearing invariants; see `docs/specs/embedpdf-commit-audit.md` for the upgrade-surveillance signal) |
 
 ### 9.1 New spec assertions must
 

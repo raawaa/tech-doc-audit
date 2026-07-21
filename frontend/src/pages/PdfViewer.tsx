@@ -497,21 +497,12 @@ export function PdfViewer() {
       // 不同,这就是 #72 #76 修的 race)。
       const dpr = getEffectiveDpr(scroll, layoutRef.current)
       const corrected = applyEffectiveDpr(toImport, dpr)
-      // importAnnotations 的 annotation 默认 commitState='new',默认不渲染;
-      // 显式 commit() 把它们转到 'synced' 才会画上屏(spec §3 step 9 +
-      // §5.3 + #75/#76 acceptance)。
-      // autoCommit:true 是 default,processImportItems 内部已调 commit(),
-      // 但那是 fire-and-forget,commit 自身 async,等 pdfium
-      // createPageAnnotation resolve 后才 dispatch commitPendingChanges。
-      // 我们显式再 commit() + await 让 import 后状态稳定在 'synced'
-      // (issue #76 acceptance:regression lock for contract)。
+      // importAnnotations 内置 auto-commit(processImportItems 末尾的
+      // `if (autoCommit !== false) this.commit(documentId)`)在当前 embedpdf
+      // pinned 版本下已足以把状态推到 'synced';显式 commit() 是冗余的。
+      // 详见 docs/specs/embedpdf-commit-audit.md(#82 决议:REMOVE explicit commit)。
       try {
         ann.forDocument(docId).importAnnotations(corrected)
-        void ann
-          .forDocument(docId)
-          .commit()
-          .toPromise()
-          .catch(e => console.warn('[PdfViewer] commit task rejected', e))
       } catch (e) {
         // 与 fallback useEffect 对称:同步异常解锁 latch,允许下次 onScroll
         // / 兜底 useEffect 重试。否则 latch 锁死,annotation 永远卡在 'new'。
@@ -560,9 +551,10 @@ export function PdfViewer() {
         }
       }
 
-      // 若 viewport 已经在 target(scrollToPage 没触发 page change,例:
+// 若 viewport 已经在 target(scrollToPage 没触发 page change,例:
       // ?page=1 或 refresh 时已在 target),queueMicrotask 等当前同步 dispatch
       // 走完后再 tryImport — 这时 onScroll 不会触发,得主动拉一次。
+      // tryImport 内部不再显式 commit() — 见 docs/specs/embedpdf-commit-audit.md(#82)
       queueMicrotask(() => tryImport(target))
     })
   }, [docId, targetPage, firstHitPage0])
@@ -613,15 +605,12 @@ export function PdfViewer() {
       }
       // DPR 校正(同 onScroll 路径,viewport 已在 target 页)
       const dpr = getEffectiveDpr(scroll, layout.data)
+      // importAnnotations 内置 auto-commit(processImportItems 末尾的
+      // `if (autoCommit !== false) this.commit(documentId)`)在当前 embedpdf
+      // pinned 版本下已足以把状态推到 'synced';显式 commit() 是冗余的。
+      // 详见 docs/specs/embedpdf-commit-audit.md(#82)。
       const corrected = applyEffectiveDpr(annotationsToImport, dpr)
       ann.forDocument(docId).importAnnotations(corrected)
-      // 显式 commit() + await,让 import 后状态稳定在 'synced'
-      // (spec §3 step 9 + §5.3;issue #76 acceptance)。
-      void ann
-        .forDocument(docId)
-        .commit()
-        .toPromise()
-        .catch(e => console.warn('[PdfViewer] commit task rejected', e))
     } catch (e) {
       console.warn('[PdfViewer] fallback importAnnotations failed', e)
       importedRef.current = false  // 失败时解锁,允许重试

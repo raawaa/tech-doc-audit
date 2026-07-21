@@ -13,7 +13,7 @@
 生产 PDF viewer = `@embedpdf/react-pdf-viewer` 的 `<PDFViewer>` drop-in。理由：
 
 - **UI parity 几乎白送**。drop-in 自带工具栏（zoom / navigation / page / selection），覆盖 #48"缺缩放/浏览模式"的原始诉求，还带来 headless 版没有的**文本选择**（auditor 可复制 PDF 原文进审核报告）。headless 版这些都得手写。
-- **高亮改走 annotation**。不再是 headless 的百分比 div overlay，而是 annotation plugin 的 highlight annotation。坐标是 PDF 用户空间（pt，左下原点，Y-up），由 `bbox_norm × page.width/height` 转换；**不调 `commit()`**，annotation 只活在内存，刷新即消失，不污染源 PDF 字节。
+- **高亮改走 annotation**。不再是 headless 的百分比 div overlay，而是 annotation plugin 的 highlight annotation。坐标是 PDF 用户空间（pt，左下原点，Y-up），由 `bbox_norm × page.width/height` 转换；**不显式 `commit()`**——`@embedpdf/plugin-annotation` 默认 `autoCommit: true`，`importAnnotations` 内部 `processImportItems` 末尾会自行 flush(`if (autoCommit !== false) this.commit(documentId)`，详见 `docs/specs/embedpdf-commit-audit.md`)。annotation 只活在内存 pdfium 文档的 AP stream，刷新即消失，不污染源 PDF 字节。
 - **滚动条稳定性保持**。#62 的核心 bug（react-virtuoso 重测量抖动）在 drop-in 上不复现——embedpdf 一次 layout commit。e2e 在 drop-in 上重新验证。
 
 ## 被弃用 / 删除的东西（别找回来）
@@ -34,12 +34,11 @@
 
 ## 实现踩坑（2026-07-09 真实调试产物）
 
-5 个非显而易见的坑，每个都让高亮"不画 / 画错位 / 位置/尺寸翻倍":
+4 个非显而易见的坑，每个都让高亮"不画 / 画错位 / 位置/尺寸翻倍":
 
 1. **`documentId` 不在 `PDFViewerConfig` 顶层**——必须走 `documentManager.initialDocuments[].documentId`，否则 embedpdf 自动生成 `doc-<ts>-<rand>` 临时 id，`onLayoutReady` 的 `evt.documentId` 跟 URL docId 永远不等，所有 import 路径被 early-return 跳过。
 2. **`onLayoutReady` 闭包竞态**——`handleReady` 订阅时形成闭包，捕获当时的 `annotationsToImport`（layout API 还没回时是 `[]`）。修法：`annotationsRef` 镜像、`onLayoutReady` 内读 ref 拿最新值，配合一个 `useEffect` 兜底 import。
-3. **`commitState: 'new'` 的 annotation 不渲染**——`importAnnotations()` 灌进去的 annotation 默认 `new` 状态，Highlight 组件 paint 路径只画 `dirty` / `synced`。snippet 的 `autoCommit: true` 只对 `CREATE_ANNOTATION` reducer 生效，import 路径不走那条。修法：`importAnnotations(...)` 之后立刻 `commit()`。
-4. **annotation 默认 `zIndex: 0`，被 page canvas 盖住**——需 CSS 把 `[data-embedpdf-managed="true"] > div:last-child` 拉到 `zIndex: 3` 常驻可见。
-5. **embedpdf `scale` prop 是 `renderScale = cssScale × effectiveDPR`**，不是 `cssScale`——传 PDF-pt rect 会被多乘 DPR（实测 2x）。修法：从 `scroll.getMetrics().pageVisibilityMetrics[].scaled.scale / (visibleWidth / pdfPageW)` 读 `effectiveDPR`，import 时除 rect 校正。**不能用 `window.devicePixelRatio`**——物理 DPR 与 effectiveDPR 不一定相等（含 browser zoom 等倍率）。
+3. **annotation 默认 `zIndex: 0`，被 page canvas 盖住**——需 CSS 把 `[data-embedpdf-managed="true"] > div:last-child` 拉到 `zIndex: 3` 常驻可见。
+4. **embedpdf `scale` prop 是 `renderScale = cssScale × effectiveDPR`**，不是 `cssScale`——传 PDF-pt rect 会被多乘 DPR（实测 2x）。修法：从 `scroll.getMetrics().pageVisibilityMetrics[].scaled.scale / (visibleWidth / pdfPageW)` 读 `effectiveDPR`，import 时除 rect 校正。**不能用 `window.devicePixelRatio`**——物理 DPR 与 effectiveDPR 不一定相等（含 browser zoom 等倍率）。
 
 完整坐标契约（**顶原点，不 Y-flip**，预除 effectiveDPR）见 `CONTEXT.md` 的 "annotation rect 坐标" 段。
