@@ -189,14 +189,14 @@ def test_reparse_passes_by_layout_to_index_document(
     不需要 PaddleOCR token：通过 mock parse_document / index_document 同步验证调用契约。
     """
     from unittest.mock import MagicMock, patch
-    from core.parse_document import Block, PageLayout, ParseResult
+    from core.parse_document import Block, PageLayout, PageText, ParseResult
 
     kb, doc, _ = reparse_target_kb
 
     # 准备一份带 layout 的 mock parse_result
     fake_layout = [PageLayout(page=0, blocks=[Block(block_order=0), Block(block_order=1)])]
     fake_parse_result = ParseResult(
-        by_page=[],
+        by_page=[PageText(page=0, text="x" * 50)],  # 满足 #100 by_page 守卫
         full_text="x" * 50,  # >20 字符避开稀疏文本 raise
         layout=fake_layout,
     )

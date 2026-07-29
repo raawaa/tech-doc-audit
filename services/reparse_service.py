@@ -75,6 +75,13 @@ def _reparse_async(kb_id: str, doc_id: str) -> None:
             parse_result = parse_document(doc.file_path)
             if not parse_result.full_text or len(parse_result.full_text) < 20:
                 raise RuntimeError("parse_document returned empty/sparse text")
+            # 防御 #94 假成功指纹：full_text ≥ 20 chars 但 layout/by_page 为空
+            # 意味着无高亮坐标，chip 预览会显示"未解析"；显式抛错走 _mark_failed
+            # 而非继续走"embedded"路径。
+            if not parse_result.layout:
+                raise RuntimeError(f"empty layout for {doc_id}")
+            if not parse_result.by_page:
+                raise RuntimeError(f"empty by_page for {doc_id}")
 
             # 2) 落 pages/{doc_id}.json
             save_pages(
