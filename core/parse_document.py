@@ -177,13 +177,16 @@ def _paddleocr_parse(file_path: str) -> tuple[ParseResult, str]:
 
     try:
         result = _paddleocr_call(file_path)
+        if not result.full_text or len(result.full_text) < 20:
+            _logger.info("paddleocr returned empty for %s, retrying with orientation classify", file_path)
+            result = _paddleocr_call(file_path, orientation_classify=True)
         return result, "paddleocr"
     except Exception as e:
         _logger.warning("paddleocr_parse failed for %s: %s", file_path, e)
         return _pdf_fallback(file_path), "fallback_pdfplumber"
 
 
-def _paddleocr_call(file_path: str) -> ParseResult:
+def _paddleocr_call(file_path: str, orientation_classify: bool = False) -> ParseResult:
     """实际的 PaddleOCR-VL-1.6 调用流程。失败时抛 Exception。"""
     import requests  # 延迟 import，允许离线测试
 
@@ -193,7 +196,7 @@ def _paddleocr_call(file_path: str) -> ParseResult:
     data = {
         "model": _PADDLEOCR_MODEL,
         "optionalPayload": json.dumps({
-            "useDocOrientationClassify": False,
+            "useDocOrientationClassify": orientation_classify,
             "useDocUnwarping": False,
             "useChartRecognition": False,
         }),
