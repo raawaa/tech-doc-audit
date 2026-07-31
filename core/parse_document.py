@@ -114,6 +114,14 @@ def _paddleocr_available() -> bool:
     return bool(_PADDLEOCR_API_TOKEN and _PADDLEOCR_API_URL)
 
 
+def _pymupdf_available() -> bool:
+    try:
+        import pymupdf  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
 def parse_document(file_path: str, *, use_cache: bool = True) -> ParseResult:
     """解析单份文档，返回 ParseResult。
 

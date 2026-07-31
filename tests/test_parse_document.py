@@ -18,6 +18,16 @@ from core.parse_document import (
 )
 
 
+# ── marker 声明（与 test_reparse_service.py / test_kb_reparse_e2e.py 对齐）────────
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "requires_pymupdf: 需要 pymupdf wheel 才跑（默认 CI 跳过，留给 #99 实施）",
+    )
+
+
 # ── ParseResult 数据类 round-trip ───────────────────────────────────────────────
 
 
@@ -442,3 +452,52 @@ def test_paddleocr_call_raises_when_api_missing(monkeypatch):
     monkeypatch.setattr(pd_module, "_PADDLEOCR_API_URL", "", raising=False)
     monkeypatch.setattr(pd_module, "_PADDLEOCR_API_TOKEN", "", raising=False)
     assert pd_module._paddleocr_available() is False
+
+
+# ── _pymupdf_available: issue #99 / #103 ──────────────────────────────────────
+
+
+def test_pymupdf_available_true_when_module_imports():
+    """wheel 装好时：``import pymupdf`` 成功 → 返回 True。
+
+    若 wheel 不可用则 skip（CI 默认没装就走 skip 分支）。
+    """
+    try:
+        import pymupdf  # noqa: F401
+    except Exception:
+        pytest.skip("pymupdf wheel not installed in this env")
+
+    assert pd_module._pymupdf_available() is True
+
+
+def test_pymupdf_available_false_when_import_raises(monkeypatch):
+    """``import pymupdf`` 抛 ImportError → 返回 False（不抛）。"""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "pymupdf" or name.startswith("pymupdf."):
+            raise ImportError("simulated missing wheel")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert pd_module._pymupdf_available() is False
+
+
+def test_pymupdf_available_swallows_non_import_errors(monkeypatch):
+    """非 ImportError（如 wheel 损坏触发 RuntimeError）→ 也返回 False，不传播。
+
+    验证 ``except Exception`` 选择的正确性：避免任何 wheel 问题穿透到调用方。
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "pymupdf" or name.startswith("pymupdf."):
+            raise RuntimeError("simulated wheel corruption")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert pd_module._pymupdf_available() is False
