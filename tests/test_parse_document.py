@@ -24,7 +24,7 @@ from core.parse_document import (
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "requires_pymupdf: 需要 PyMuPDF wheel 才跑（默认 CI 跳过，留给 #99 实施）",
+        "requires_pymupdf: 需要 pymupdf wheel 才跑（默认 CI 跳过，留给 #99 实施）",
     )
 
 
