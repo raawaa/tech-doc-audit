@@ -23,7 +23,13 @@ from typing import Callable, Optional
 from llama_index.core.llms import ChatMessage, MessageRole
 
 from core.logger import get_logger
-from core.settings import get_llm, make_deepseek_client
+from core.settings import (
+    CHAPTER_MAX_CHARS,
+    PROMPT_FULL_THRESHOLD,
+    PROMPT_PREVIEW_CHARS,
+    get_llm,
+    make_deepseek_client,
+)
 from core.text_norm import lcs_len, norm
 from services.agent_tools import search_kb, search_kb_text
 from services.agent_trace import save_trace
@@ -44,7 +50,6 @@ _TRACE_DIR = Path(
 ) / "audits"
 
 MAX_TURNS = 30
-CHAPTER_MAX_CHARS = 8000
 MAX_CONSECUTIVE_FAILURES = 3
 
 # per-task 共享事件日志：audit 线程写入，SSE 连接读取
@@ -597,32 +602,47 @@ def _build_system_msg() -> ChatMessage:
     return ChatMessage(role=MessageRole.SYSTEM, content=SYSTEM_PROMPT)
 
 
+def _build_user_content(
+    doc_name: str,
+    structure: DocumentStructure | None,
+    parsed_content: str,
+    kb_ids: list[str] | None,
+) -> str:
+    """构造审核初始 user 消息的内容字符串。
+
+    阈值由 ``core.settings.PROMPT_FULL_THRESHOLD``（全文/预览分支决策点）与
+    ``core.settings.PROMPT_PREVIEW_CHARS``（预览分支下嵌入的字符数）控制。
+    structured_llm（``_build_init_msg``）与 native function calling
+    （``_build_native_initial_messages``）两条路径共用此函数，确保模板逐字相同。
+    """
+    kb_summary = _get_kb_docs_summary(kb_ids or [])
+    structure_text = _tool_get_structure(structure, doc_name)
+
+    if len(parsed_content) <= PROMPT_FULL_THRESHOLD:
+        return (
+            f"{kb_summary}\n\n"
+            f"请审核文档《{doc_name}》。\n\n"
+            f"文档结构：\n{structure_text}\n\n"
+            f"=== 文档全文 ===\n{parsed_content}"
+        )
+    return (
+        f"{kb_summary}\n\n"
+        f"请审核文档《{doc_name}》。\n\n"
+        f"文档结构：\n{structure_text}\n\n"
+        f"=== 文档开头（共{len(parsed_content)}字）===\n"
+        f"{parsed_content[:PROMPT_PREVIEW_CHARS]}\n"
+        f"\n（文档较长，如需查看更多内容请使用 read_chapter 工具）"
+    )
+
+
 def _build_init_msg(
     doc_name: str,
     structure: DocumentStructure | None,
     parsed_content: str = "",
     kb_ids: list[str] | None = None,
 ) -> ChatMessage:
-    DOC_FULL_THRESHOLD = 30000
-    structure_text = _tool_get_structure(structure, doc_name)
-    kb_summary = _get_kb_docs_summary(kb_ids or [])
-
-    if len(parsed_content) <= DOC_FULL_THRESHOLD:
-        content = (
-            f"{kb_summary}\n\n"
-            f"请审核文档《{doc_name}》。\n\n"
-            f"文档结构：\n{structure_text}\n\n"
-            f"=== 文档全文 ===\n{parsed_content}"
-        )
-    else:
-        content = (
-            f"{kb_summary}\n\n"
-            f"请审核文档《{doc_name}》。\n\n"
-            f"文档结构：\n{structure_text}\n\n"
-            f"=== 文档开头（共{len(parsed_content)}字）===\n"
-            f"{parsed_content[:8000]}\n"
-            f"\n（文档较长，如需查看更多内容请使用 read_chapter 工具）"
-        )
+    """构造 structured_llm 路径的初始 user 消息（ChatMessage）。"""
+    content = _build_user_content(doc_name, structure, parsed_content, kb_ids)
     return ChatMessage(role=MessageRole.USER, content=content)
 
 
@@ -1430,25 +1450,8 @@ def _build_native_initial_messages(
     kb_ids: list[str],
     doc_name: str,
 ) -> list[dict]:
-    kb_summary = _get_kb_docs_summary(kb_ids)
-    DOC_FULL_THRESHOLD = 30000
-    structure_text = _tool_get_structure(structure, doc_name)
-    if len(parsed_content) <= DOC_FULL_THRESHOLD:
-        user_content = (
-            f"{kb_summary}\n\n"
-            f"请审核文档《{doc_name}》。\n\n"
-            f"文档结构：\n{structure_text}\n\n"
-            f"=== 文档全文 ===\n{parsed_content}"
-        )
-    else:
-        user_content = (
-            f"{kb_summary}\n\n"
-            f"请审核文档《{doc_name}》。\n\n"
-            f"文档结构：\n{structure_text}\n\n"
-            f"=== 文档开头（共{len(parsed_content)}字）===\n"
-            f"{parsed_content[:8000]}\n"
-            f"\n（文档较长，如需查看更多内容请使用 read_chapter 工具）"
-        )
+    """构造 native function calling 路径的初始消息列表。"""
+    user_content = _build_user_content(doc_name, structure, parsed_content, kb_ids)
     return [
         {"role": "system", "content": NATIVE_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},

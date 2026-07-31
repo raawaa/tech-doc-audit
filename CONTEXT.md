@@ -17,6 +17,12 @@
 - **Agentic ReAct 审核** — LLM 在 ReAct 循环中自主调用工具完成审核。入口 `services/agentic_audit.py: run_agentic_audit()`。两条实现路径（native function calling / structured_llm）由 `LLM_PROVIDER` 选择。
 - **四个 agent 工具** — `search_kb`（语义搜索）/ `search_kb_text`（精确文本搜索）/ `read_chapter`（章节阅读）/ `flag_issue`（记录问题）。前两个是 KB 查找工具，审核与问答共用（实现将集中在 `services/agent_tools.py`）；后两个是审核文档域、仅审核用，留在 `agentic_audit.py`。
 - **对话跟踪 (Trace)** — 一次 agent 运行的完整对话记录（系统提示、每轮 tool_calls 及其结果、reasoning），运行结束 best-effort 持久化到 `data/audits/{doc_id}/tasks/traces/`（审核）或 `data/qa_traces/`（问答），用于事后诊断 agent 行为；写入失败不影响运行结果。
+- **LLM prompt 字符阈值**（Wayfinder #114 / #119，由 `core.settings` 提供，`.env` 可覆盖；**单 provider 标量，无 provider 维度**）：
+  - **`PROMPT_FULL_THRESHOLD`**（`LLM_PROMPT_FULL_THRESHOLD`，默认 30000）— 初始 user prompt 的全文/预览分支决策点：`len(parsed_content) ≤` 该值时嵌入文档全文，`>` 时改用预览+`read_chapter` 翻页。structured_llm 与 native function calling 两条路径共用 `_build_user_content()` 拼接模板。
+  - **`PROMPT_PREVIEW_CHARS`**（`LLM_PROMPT_PREVIEW_CHARS`，默认 8000）— 走预览分支时，初始 user prompt 嵌入的字符数（`parsed_content[:PROMPT_PREVIEW_CHARS]`）。仅当 `>` `PROMPT_FULL_THRESHOLD` 时生效。
+  - **`CHAPTER_MAX_CHARS`**（`CHAPTER_MAX_CHARS`，默认 8000）— `read_chapter` 工具单次返回的章节文本上限（`_format_chapter_text`）。与 `PROMPT_PREVIEW_CHARS` 默认同值但语义独立——前者约束工具输出，后者约束初始 user prompt 嵌入量。
+  - **值之间的依赖关系**：把 `PROMPT_FULL_THRESHOLD` 调到 ≤ `len(parsed_content)`（如设为 0）会关掉全文分支；把 `PROMPT_PREVIEW_CHARS` 调大/调小不影响分支决策点；`CHAPTER_MAX_CHARS` 与前两者无函数依赖，但调小会让 read_chapter 工具返回更短、需要更多轮翻页。
+  - **现状值 30000/8000/8000** 对 deepseek 128K context 窗口极度保守——如需放宽，改 `.env` 即可观察试验，不必发版。
 
 ## 后处理
 

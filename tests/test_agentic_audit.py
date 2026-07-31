@@ -857,3 +857,100 @@ class TestUnifiedLoop:
                     max_turns=5,
                 )
         assert result.raw_analysis == "survived tool error"
+
+
+# ── Wayfinder #114 / #119：LLM prompt 字符阈值搬到 settings.py + 两段 _build_init_msg 合并 ──
+
+
+class TestPromptThresholdSettings:
+    """三个 prompt 拼接字符阈值从硬编码搬到 core.settings，.env 可覆盖。"""
+
+    def test_settings_default_values(self):
+        """默认值 30000 / 8000 / 8000 与重构前一致（Wayfinder #118 决定的\"值不动\"）。"""
+        from core.settings import (
+            CHAPTER_MAX_CHARS,
+            PROMPT_FULL_THRESHOLD,
+            PROMPT_PREVIEW_CHARS,
+        )
+        assert PROMPT_FULL_THRESHOLD == 30000
+        assert PROMPT_PREVIEW_CHARS == 8000
+        assert CHAPTER_MAX_CHARS == 8000
+
+    def test_no_provider_threshold_mapping_in_settings(self):
+        """settings.py 不应有 provider→阈值 的映射结构（Wayfinder #118：单 provider 模式）。"""
+        from core import settings as _settings_mod
+        src = _settings_mod.__file__
+        text = open(src).read()
+        # 禁词：per-provider dict / 嵌套 mapping / "预留缝" 注释
+        forbidden_markers = [
+            "PROMPT_FULL_THRESHOLDS",
+            "PROMPT_PREVIEW_BY_PROVIDER",
+            "THRESHOLDS_BY_PROVIDER",
+        ]
+        for marker in forbidden_markers:
+            assert marker not in text, f"settings.py 不应含 provider 映射结构 {marker!r}"
+
+
+class TestBuildUserContent:
+    """_build_user_content: structured_llm 与 native 路径共享的 user prompt 模板。"""
+
+    def test_small_doc_uses_full_text_branch(self):
+        """len(content) ≤ PROMPT_FULL_THRESHOLD → 嵌入全文，无 read_chapter 提示。"""
+        from services.agentic_audit import _build_user_content
+        content = _build_user_content("doc.pdf", None, "a" * 100, [])
+        assert "=== 文档全文 ===" in content
+        assert "请审核文档《doc.pdf》" in content
+        assert "文档较长" not in content  # 未走预览分支
+
+    def test_large_doc_uses_preview_branch(self):
+        """len(content) > PROMPT_FULL_THRESHOLD → 嵌入 PROMPT_PREVIEW_CHARS 字 + read_chapter 提示。"""
+        from services.agentic_audit import (
+            PROMPT_FULL_THRESHOLD,
+            PROMPT_PREVIEW_CHARS,
+            _build_user_content,
+        )
+        text = "b" * (PROMPT_FULL_THRESHOLD + 100)
+        content = _build_user_content("doc.pdf", None, text, [])
+        assert "=== 文档开头（共" in content
+        assert f"字）===" in content
+        assert "如需查看更多内容请使用 read_chapter 工具" in content
+        # 预览切片严格 == PROMPT_PREVIEW_CHARS 字符
+        previewed = content.split("===\n", 1)[1].split("\n\n", 1)[0]
+        assert len(previewed) == PROMPT_PREVIEW_CHARS
+
+    def test_two_paths_share_same_template(self):
+        """structured_llm (_build_init_msg) 与 native (_build_native_initial_messages) 输出字符串必须相同。"""
+        from services.agentic_audit import _build_init_msg, _build_native_initial_messages
+
+        # 小文档
+        m1 = _build_init_msg("d.pdf", None, "short", [])
+        m2 = _build_native_initial_messages("short", None, [], "d.pdf")
+        assert m1.content == m2[1]["content"]
+
+        # 大文档
+        big = "x" * 50000
+        m1b = _build_init_msg("d.pdf", None, big, [])
+        m2b = _build_native_initial_messages(big, None, [], "d.pdf")
+        assert m1b.content == m2b[1]["content"]
+
+    def test_no_string_literals_in_builders(self):
+        """_build_init_msg / _build_native_initial_messages 不应再含字符串字面量（仅转发到 _build_user_content）。"""
+        import ast
+        from services.agentic_audit import _build_init_msg, _build_native_initial_messages
+
+        for fn in (_build_init_msg, _build_native_initial_messages):
+            tree = ast.parse(open(fn.__code__.co_filename).read())
+            target = next(
+                n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == fn.__name__
+            )
+            strings = [
+                v.value for v in ast.walk(target)
+                if isinstance(v, ast.Constant) and isinstance(v.value, str) and v.value
+            ]
+            # 允许空字符串（docstring 等），但不应含 f-string 模板
+            long_strings = [s for s in strings if len(s) > 30]
+            assert long_strings == [], (
+                f"{fn.__name__} 仍含字符串字面量 {long_strings!r} — "
+                f"应只调用 _build_user_content"
+            )
