@@ -209,3 +209,51 @@ def test_get_cached_returns_legacy_fallback_source_when_present(
 
     loaded = paddleocr_cache.get_cached(str(pdf))
     assert loaded == legacy_entry["result"]
+
+
+# ── 8. 按已知 hash 回读来源（issue #110 实测 OCR 计数的地面真相）───────────────
+
+
+def _write_entry_by_hash(cache_dir: Path, content_hash: str, *, source: str, version=None) -> Path:
+    """手工写一条 ``(content_hash, model_version)`` 缓存条目。"""
+    import json
+
+    version = version or paddleocr_cache._MODEL_VERSION
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"{content_hash}_{version}.json"
+    path.write_text(
+        json.dumps({"version": version, "source": source, "result": {}}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_cache_source_by_hash_returns_the_recorded_source(cache_dir):
+    """条目存在且版本一致 → 回读它的 ``source``（真烧配额 vs 走了别的解析器）。"""
+    _write_entry_by_hash(cache_dir, "h1", source="pymupdf")
+
+    assert paddleocr_cache.cache_source_by_hash("h1") == "pymupdf"
+
+
+def test_cache_source_by_hash_is_none_when_no_entry(cache_dir):
+    """无条目 → None。调用方据此记 ``unknown``，不得默认算成 OCR。"""
+    assert paddleocr_cache.cache_source_by_hash("h_missing") is None
+    assert paddleocr_cache.cache_source_by_hash("") is None
+
+
+def test_cache_source_by_hash_follows_the_same_invalidation_rule_as_cache_state(cache_dir):
+    """判废口径与 ``cache_state_by_hash`` 同源：版本不符 / JSON 损坏都读不到来源。
+
+    两个函数问的是同一条条目 —— 规则一旦分叉，预检与实测就会互相矛盾。
+    """
+    _write_entry_by_hash(cache_dir, "h_stale", source="paddleocr", version="OLD-MODEL")
+    (cache_dir / f"h_corrupt_{paddleocr_cache._MODEL_VERSION}.json").write_text(
+        "{not json", encoding="utf-8"
+    )
+
+    for content_hash in ("h_stale", "h_corrupt"):
+        assert paddleocr_cache.cache_source_by_hash(content_hash) is None
+        assert (
+            paddleocr_cache.cache_state_by_hash(content_hash)
+            == paddleocr_cache.CACHE_STATE_MISS
+        )

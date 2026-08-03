@@ -61,6 +61,12 @@
 - **待重解析文档 (Reparse Target)** — 满足三条选取规则**任一**的 KB 文档：① 未向量化（`embedding_status != "embedded"`）；② 缺按页文本文件；③ 按页文本存在但 `layout == []`（历史的 `_pdf_fallback()` 假成功残留；`force` 模式绕过三条规则，整库皆为目标）。`force` 模式绕过三条规则，整库皆为目标（换解析器后的整库重建入口）。
 - **OCR 成本预检 (Preflight)** — 批量重新解析触发前的**无副作用**估算：命中 / 未命中缓存的篇数与页数、超单文件页数上限（`PAGE_LIMIT = 100`，issue #87）的清单。命中判定只有一份实现 —— `core.paddleocr_cache.cache_state_by_hash()`（按 `doc.content_hash` 查，不重算文件哈希），与 `get_cached` 同口径：条目损坏或 model_version 不符算未命中。历史 `source=fallback_pdfplumber` 条目按命中计（#99/05 后 V8 cache defense 已删除，运维清理是单独工单）。
   _Avoid_: 只探测缓存文件是否存在就报"命中"——会让清单与统计自相矛盾。
+- **实测 OCR 消耗 (Actual OCR Usage)** — 批量跑完后**回收**的真实配额支出，与预检估算互为对照。地面真相是缓存条目的 `source` 字段（`core.paddleocr_cache.cache_source_by_hash()`）—— #93 事后正是靠数 `source=paddleocr` 的条目才证明"154 篇真跑了 OCR"，#110 把那次考古变成流程产物。四类分桶：`paddleocr`（真烧配额，唯一计入 `actual_ocr_pages` 的一桶）/ `cache_hit`（**跑之前**就已有条目，故缓存快照必须在触发任何解析前取）/ 其它解析器来源（`pymupdf` 等，零配额）/ `unknown`（跑完仍读不到条目）。页数取落盘 `pages/{doc_id}.json` 的真实 `by_page` 长度，读不到才回落预检估值。
+  _Avoid_: 只看 `source` 就判"真实 OCR"——缓存命中的条目 `source` 同样写着 `paddleocr`，分不出来就等于把 0 页报成满页。
+  _Avoid_: 读不到来源时默认按 OCR 记账——凭空补一个好看的页数正是 #90 报 1694 页而实际 0 页的错法，宁可显式记 `unknown`。
+- **批量重新解析报告 (Bulk Reparse Report)** — 一次批量运行的结构化产出，落在 `data/kbs/{kb_id}/bulk_reparse_report.json`（`pages/` 的兄弟，`core/bulk_reparse_report_store.py` 管路径与读写）。内容：目标集与每篇的入选原因、预检估算与实测消耗**并列**、done / failed / skipped 三类明细（各带 doc id、原始文件名、原因串）、起止时间与耗时、并发度与是否 `force`。只留最近一次，历史归档不在 v1。
+  _Avoid_: 预估与实测背离时自动拦截执行——#91 的教训是"差异需要被看见"，不是"差异需要被自动处置"。
+  _Avoid_: 把报告塞进 `kb.metadata`——与"按页文本不写在 `doc.metadata`"同源的理由：无 schema、随字段增长膨胀。
 
 ## 跨层坐标语义
 
