@@ -14,7 +14,7 @@ import pytest
 from core import parse_document as pd_module
 from core.parse_document import (
     ParseResult, PageText, PageLayout, Block,
-    parse_document, _paddleocr_call,
+    parse_document, _paddleocr_call, _is_text_layer_pdf,
 )
 
 
@@ -28,7 +28,40 @@ def pytest_configure(config):
     )
 
 
-# ── ParseResult 数据类 round-trip ───────────────────────────────────────────────
+# ── _is_text_layer_pdf: issue #104 ─────────────────────────────────────────────
+
+
+@pytest.mark.requires_pymupdf
+def test_is_text_layer_pdf_detects_text_fixture():
+    fixture = Path(__file__).parent / "fixtures/text_layer_pdfs/s1_p1.pdf"
+    if not pd_module._pymupdf_available():
+        pytest.skip("pymupdf wheel not installed")
+    assert _is_text_layer_pdf(str(fixture)) is True
+
+
+@pytest.mark.requires_pymupdf
+def test_is_text_layer_pdf_rejects_scanned_fixture():
+    fixture = Path(__file__).parent / "fixtures/scanned/s7.pdf"
+    if not pd_module._pymupdf_available():
+        pytest.skip("pymupdf wheel not installed")
+    assert _is_text_layer_pdf(str(fixture)) is False
+
+
+def test_is_text_layer_pdf_returns_false_for_missing_file():
+    assert _is_text_layer_pdf("/tmp/definitely_missing.pdf") is False
+
+
+def test_is_text_layer_pdf_returns_false_for_corrupt_pdf(tmp_path):
+    corrupt = tmp_path / "corrupt.pdf"
+    corrupt.write_bytes(b"not a PDF")
+    assert _is_text_layer_pdf(str(corrupt)) is False
+
+
+def test_is_text_layer_pdf_returns_false_without_pymupdf(monkeypatch, tmp_path):
+    pdf = tmp_path / "document.pdf"
+    pdf.write_bytes(b"%PDF-1.7")
+    monkeypatch.setitem(__import__("sys").modules, "pymupdf", None)
+    assert _is_text_layer_pdf(str(pdf)) is False
 
 
 def test_parse_result_to_from_dict_round_trip():

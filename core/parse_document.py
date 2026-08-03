@@ -122,6 +122,22 @@ def _pymupdf_available() -> bool:
     return True
 
 
+def _is_text_layer_pdf(file_path: str) -> bool:
+    """Return whether a PDF contains at least 20 characters of text."""
+    if not file_path or Path(file_path).suffix.lower() != ".pdf":
+        return False
+
+    try:
+        import pymupdf
+
+        with pymupdf.open(file_path) as document:
+            text = "".join(page.get_text() for page in document)
+        return len(text.strip()) >= 20
+    except Exception as e:
+        _logger.debug("text-layer detection failed for %s: %s", file_path, e)
+        return False
+
+
 def parse_document(file_path: str, *, use_cache: bool = True) -> ParseResult:
     """解析单份文档，返回 ParseResult。
 
