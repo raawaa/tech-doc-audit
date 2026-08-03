@@ -37,8 +37,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # 加载 .env（与 api/main.py:5-7 同源）— PaddleOCR 凭证必须在
-# core.parse_document._paddleocr_available() 调用前就位，否则子进程会走
-# _pdf_fallback() 拿到 layout=[]（wayfinder #93）
+# core.parse_document._paddleocr_available() 调用前就位，否则子进程会因
+# PaddleOCR 与 PyMuPDF 都不可用而抛 RuntimeError（issue #99/05 后无
+# _pdf_fallback() 兜底）。wayfinder #93 提到的 layout=[] 假成功已不再可能。
+# DEPRECATED: #99/05 起的修复 — 历史 cache 条目仍可能含 fallback_pdfplumber。
 from dotenv import load_dotenv
 
 _env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -87,12 +89,12 @@ def _pages_file(kb_id: str, doc_id: str) -> Path:
 
 def list_target_docs(kb_id: str) -> list:
     """列出 KB 内需要 reparse 的 doc：embedding_status != embedded 或缺 pages 文件
-    **或 pages 文件存在但 ``layout=[]``（wayfinder #93 揭示的静默 fallback bug 兜底）**。
+    **或 pages 文件存在但 ``layout=[]``（wayfinder #93 揭示的历史污染兜底）**。
 
-    兜底 layout 检查的动机：``parse_document._pdf_fallback()`` 在 PaddleOCR 不可用
-    时返回 ``layout=[]`` 但 ``full_text`` 仍有内容 → ``reparse_service`` 兜底校验
-    ``len(full_text) < 20`` 通过 → ``embedding_status=embedded``。**仅看状态机
-    无法识别这种"假成功"**——必须读 pages 文件 ``layout`` 字段。
+    兜底 layout 检查的动机：存量 KB 中可能残留 issue #99/05 之前的
+    ``source=fallback_pdfplumber`` 污染条目，``embedding_status`` 显示 embedded
+    但 ``layout=[]`` 不可用。仅看状态机无法识别这种"假成功"，必须读 pages 文件
+    ``layout`` 字段。
 
     返回 ``[(doc, has_pages_file), ...]``；保留 doc_repo.list_docs() 的原始顺序。
     """
@@ -132,12 +134,8 @@ def estimate_ocr_cost(docs: list) -> dict:
 
     返回 dict：``cached`` / ``uncached`` / ``pages_cached`` / ``pages_uncached`` /
     ``warnings``（超过 PAGE_LIMIT 的 doc 列表）/
-    ``polluted_cached``（V8 cache defense 会判废的 fallback_pdfplumber 条目数，
-    实际会被重 OCR，归入 ``uncached``）。
-
-    V8 cache defense 语义（``core/paddleocr_cache.py:55-60``）：``source=fallback_pdfplumber``
-    + PaddleOCR 当前可用 → 视为未命中（强制重 OCR）。本估算函数读 cache 条目的
-    ``source`` 字段应用同一规则，避免误报"0 页 OCR"但 V8 defense 实际重 OCR。
+    ``polluted_cached``（issue #99/05 前被 V8 cache defense 判废的 fallback_pdfplumber
+    条目数；现在仍按 source 字段识别以便估算，实际命中由 ``paddleocr_cache.get_cached`` 决定）。
     """
     cached = 0
     uncached = 0
@@ -159,14 +157,17 @@ def estimate_ocr_cost(docs: list) -> dict:
 
         cache_path = _cache_path_for_hash(doc.content_hash) if doc.content_hash else None
         if cache_path and cache_path.exists():
-            # 读 source 字段：V8 defense 兼容
+            # 读 source 字段：识别历史 fallback_pdfplumber 污染条目
+            # DEPRECATED: #99/05 — V8 cache defense 已删除，core.paddleocr_cache
+            # 不再按 source 判废；本函数仍识别该 source 以估算污染数，但实际
+            # 命中仍由 core.paddleocr_cache.get_cached 决定。
             try:
                 entry = json.loads(cache_path.read_text(encoding="utf-8"))
                 source = entry.get("source", "")
             except (OSError, json.JSONDecodeError):
                 source = ""
             if source == "fallback_pdfplumber" and paddleocr_available:
-                # V8 defense 会判废，视为未命中（实际会重 OCR）
+                # 历史污染条目（layout=[]，需重 OCR 补齐）— 仅用于估算
                 uncached += 1
                 pages_uncached += page_count_for_cost
                 polluted_cached += 1

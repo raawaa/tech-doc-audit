@@ -158,75 +158,54 @@ def test_save_cached_default_source_is_paddleocr(cache_dir, tmp_path):
     assert entry["source"] == "paddleocr"
 
 
-def test_save_cached_records_explicit_source(cache_dir, tmp_path):
-    """save_cached 显式传 source="fallback_pdfplumber" 时落盘。"""
+def test_save_cached_records_pymupdf_source(cache_dir, tmp_path):
+    """save_cached 显式传 source="pymupdf" 时落盘。"""
     pdf = tmp_path / "e.pdf"
     pdf.write_bytes(b"%PDF-1.4\ne")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     paddleocr_cache.save_cached(
         str(pdf), {"by_page": [], "full_text": "x", "layout": []},
-        source="fallback_pdfplumber",
+        source="pymupdf",
     )
 
     import json
     entry_path = cache_dir / f"{paddleocr_cache._file_hash(str(pdf))}_{paddleocr_cache._MODEL_VERSION}.json"
     entry = json.loads(entry_path.read_text(encoding="utf-8"))
-    assert entry["source"] == "fallback_pdfplumber"
+    assert entry["source"] == "pymupdf"
 
 
-def test_get_cached_skips_fallback_pdfplumber_when_paddleocr_available(
+def test_get_cached_returns_legacy_fallback_source_when_present(
     cache_dir, tmp_path, monkeypatch
 ):
-    """V8 cache defense 核心: PaddleOCR 可用时,旧 fallback_pdfplumber 产物视为污染 → 返回 None 触发重解析。
+    """历史 source="fallback_pdfplumber" 条目（运维尚未清理的污染）继续可读，调用方可识别 source 自行处理。
 
-    重现 issue #57 失败场景: 部署时未设 PADDLEOCR_API_TOKEN → 走 pdfplumber 落
-    cache (source=fallback_pdfplumber, layout=[]) → 后来补上 token → 旧 cache
-    仍命中, V8 _inject_block_range 拿不到 layout。
+    issue #99/05 删除 V8 cache defense 后的新契约：``get_cached`` 不再按 source 判废，
+    历史污染条目照常返回；运维清理交给 `bulk_reparse.py --clean-cache-pollution` 单独 ticket。
     """
     pdf = tmp_path / "f.pdf"
     pdf.write_bytes(b"%PDF-1.4\nf")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # 模拟旧 cache: source=fallback_pdfplumber, layout=[]
-    paddleocr_cache.save_cached(
-        str(pdf),
-        {"by_page": [{"page": 0, "text": "old"}], "full_text": "old", "layout": []},
-        source="fallback_pdfplumber",
-    )
+    # 手工写入旧 cache 条目（V8 defense 删除后，新代码不再产生这种条目）
+    legacy_entry = {
+        "version": paddleocr_cache._MODEL_VERSION,
+        "file_hash": paddleocr_cache._file_hash(str(pdf)),
+        "parsed_at": "2024-01-01T00:00:00+00:00",
+        "source": "fallback_pdfplumber",
+        "result": {
+            "by_page": [{"page": 0, "text": "old"}],
+            "full_text": "old",
+            "layout": [],
+        },
+    }
+    import json
+    legacy_path = cache_dir / f"{paddleocr_cache._file_hash(str(pdf))}_{paddleocr_cache._MODEL_VERSION}.json"
+    legacy_path.write_text(json.dumps(legacy_entry), encoding="utf-8")
 
-    # 模拟 PaddleOCR 凭证已就位
+    # 即便 PaddleOCR 凭证已就位，也照常返回历史条目
     monkeypatch.setenv("PADDLEOCR_API_TOKEN", "fake-token")
     monkeypatch.setenv("PADDLEOCR_API_URL", "https://fake.example.com")
 
-    # 关键断言: 命中 cache 但被防御逻辑拦截 → 返回 None
-    assert paddleocr_cache.get_cached(str(pdf)) is None, (
-        "PaddleOCR 可用时, fallback_pdfplumber 旧 cache 必须被强制失效, "
-        "否则 V8 _inject_block_range 拿不到 layout, block_range 永远 None"
-    )
-
-
-def test_get_cached_returns_fallback_pdfplumber_when_paddleocr_unavailable(
-    cache_dir, tmp_path, monkeypatch
-):
-    """PaddleOCR 仍未配置时, fallback_pdfplumber cache 仍命中(不破坏离线场景)。"""
-    pdf = tmp_path / "g.pdf"
-    pdf.write_bytes(b"%PDF-1.4\ng")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    fallback_result = {
-        "by_page": [{"page": 0, "text": "fb"}],
-        "full_text": "fb",
-        "layout": [],
-    }
-    paddleocr_cache.save_cached(
-        str(pdf), fallback_result, source="fallback_pdfplumber",
-    )
-
-    # 模拟 PaddleOCR 仍不可用
-    monkeypatch.delenv("PADDLEOCR_API_TOKEN", raising=False)
-    monkeypatch.delenv("PADDLEOCR_API_URL", raising=False)
-
-    # 应当返回 cache 结果(不强制重解析, 因为 PaddleOCR 不可用, 重解析只会再走 fallback)
     loaded = paddleocr_cache.get_cached(str(pdf))
-    assert loaded == fallback_result
+    assert loaded == legacy_entry["result"]
