@@ -275,7 +275,7 @@ def _stub_reparse(monkeypatch, outcomes: dict[str, str]):
 
     monkeypatch.setattr(svc, "_POLL_INTERVAL_S", 0.01)
 
-    def _fake(doc_id: str):
+    def _fake(doc_id: str, **_kwargs):
         outcome = outcomes.get(doc_id, "embedded")
         if outcome == "raise":
             raise RuntimeError("simulated reparse outage")
@@ -359,7 +359,7 @@ def test_reparse_one_times_out_without_terminal_status(kb, monkeypatch):
     doc = _add_doc(kb.id, "stuck.pdf", embedding_status="failed", page_count=3)
     monkeypatch.setattr(svc, "_POLL_INTERVAL_S", 0.01)
 
-    def _fake(doc_id: str):
+    def _fake(doc_id: str, **_kwargs):
         stuck = doc_repo.find_doc_by_id(doc_id)
         stuck.embedding_status = "indexing"  # 永不进终态
         doc_repo._save_doc_meta(stuck)
@@ -370,6 +370,216 @@ def test_reparse_one_times_out_without_terminal_status(kb, monkeypatch):
     doc_id, outcome = svc.reparse_one(kb.id, doc, timeout_s=0.05)
 
     assert (doc_id, outcome) == (doc.id, "timeout")
+
+
+# ── KB 级检索状态稳定性（issue #109）────────────────────────────────────────────
+#
+# 批量跑到一半时 KB **不可能**"此刻可被向量检索"。#93 实测下每完成一篇就写回
+# searchable，154 篇 = 上百次 building ⇄ searchable 抖动，前端轮询以
+# ``index_status === 'building'`` 为唯一续订条件，于是反复停轮询又重启。
+# 编排层现在是 KB 级状态的**唯一写入者**：批次开头写一次 building，
+# 期间只推进 index_progress / index_current_doc，末尾写一次终态。
+
+
+def _spy_kb_writes(monkeypatch):
+    """记录所有经 ``kb_repo.update`` 落盘的 KB 状态快照，按时间顺序。
+
+    "整批期间只在首尾各写一次终态"这条契约只有看写入序列才能证伪，
+    看最终快照是看不出中间抖动的。
+    """
+    writes: list[tuple[str, float | None, str]] = []
+    real_update = kb_repo.update
+
+    def _spy(kb):
+        writes.append((kb.index_status, kb.index_progress, kb.index_current_doc))
+        return real_update(kb)
+
+    monkeypatch.setattr(kb_repo, "update", _spy)
+    return writes
+
+
+def _stub_reparse_observing_kb(monkeypatch, kb_id, outcomes: dict[str, str] | None = None):
+    """``_stub_reparse`` 的加强版：每次被调用时顺手快照 KB 状态与入参。
+
+    返回 ``(svc, observed, calls)``；``observed`` 是"某篇正在跑的那一刻"
+    KB 对外宣称的状态，``calls`` 是 ``reparse_document`` 收到的 kwargs。
+    """
+    from services import bulk_reparse_service as svc
+
+    monkeypatch.setattr(svc, "_POLL_INTERVAL_S", 0.01)
+    outcomes = outcomes or {}
+    observed: list[tuple[str, float | None, str]] = []
+    calls: list[tuple[str, dict]] = []
+
+    def _fake(doc_id: str, **kwargs):
+        calls.append((doc_id, kwargs))
+        snapshot = kb_repo.get(kb_id)
+        observed.append(
+            (snapshot.index_status, snapshot.index_progress, snapshot.index_current_doc)
+        )
+        outcome = outcomes.get(doc_id, "embedded")
+        if outcome == "raise":
+            raise RuntimeError("simulated reparse outage")
+        doc = doc_repo.find_doc_by_id(doc_id)
+        doc.embedding_status = outcome
+        doc_repo._save_doc_meta(doc)
+        return {"status": "pending_index", "doc_id": doc_id}
+
+    monkeypatch.setattr(svc, "reparse_document", _fake)
+    return svc, observed, calls
+
+
+def test_bulk_run_opts_into_caller_managed_kb_status(kb, monkeypatch):
+    """编排层必须对每一篇打开"调用方托管 KB 状态"开关，否则单篇仍会自己写 searchable。"""
+    _add_doc(kb.id, "a.pdf", embedding_status="failed", page_count=3)
+    _add_doc(kb.id, "b.pdf", embedding_status="failed", page_count=3)
+    svc, _observed, calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
+
+    svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
+
+    assert len(calls) == 2
+    for _doc_id, kwargs in calls:
+        assert kwargs.get("caller_manages_kb_status") is True
+
+
+def test_bulk_run_never_claims_searchable_mid_batch(kb, monkeypatch):
+    """#93 抖动症状的直接回归锁：整批期间 KB 一律 ``building``，终态只写一次。"""
+    _add_doc(kb.id, "a.pdf", embedding_status="failed", page_count=3)
+    _add_doc(kb.id, "b.pdf", embedding_status="failed", page_count=3)
+    _add_doc(kb.id, "c.pdf", embedding_status="failed", page_count=3)
+    svc, observed, _calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
+    writes = _spy_kb_writes(monkeypatch)
+
+    svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
+
+    # 每篇开跑的那一刻，KB 对外都还是 building
+    assert [status for status, _p, _d in observed] == ["building"] * 3
+
+    statuses = [status for status, _p, _d in writes]
+    assert statuses[0] == "building", "批次开头必须先写一次 building"
+    assert statuses[-1] == "searchable", "批次末尾必须落终态"
+    assert all(s == "building" for s in statuses[:-1]), (
+        f"整批期间只许停在 building，实际写入序列 {statuses}"
+    )
+    assert statuses.count("searchable") == 1, "终态只许写一次"
+
+
+def test_bulk_run_starts_at_building_with_zero_progress(kb, monkeypatch):
+    """触发瞬间 KB 即 ``building`` + ``index_progress = 0``（前端轮询的起点）。"""
+    _add_doc(kb.id, "a.pdf", embedding_status="failed", page_count=3)
+    svc, _observed, _calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
+    writes = _spy_kb_writes(monkeypatch)
+
+    svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
+
+    assert writes[0][:2] == ("building", 0.0)
+
+
+def test_bulk_run_advances_progress_monotonically_as_done_over_total(kb, monkeypatch):
+    """``index_progress`` 是 ``done / total`` 且单调不减；``index_current_doc`` 是在跑的那篇。"""
+    a = _add_doc(kb.id, "a.pdf", embedding_status="failed", page_count=3)
+    b = _add_doc(kb.id, "b.pdf", embedding_status="failed", page_count=3)
+    c = _add_doc(kb.id, "c.pdf", embedding_status="failed", page_count=3)
+    names = {a.original_name, b.original_name, c.original_name}
+    svc, observed, _calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
+    writes = _spy_kb_writes(monkeypatch)
+
+    svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
+
+    progresses = [p for _s, p, _d in writes]
+    assert progresses == sorted(progresses), f"进度必须单调不减，实际 {progresses}"
+    # 串行跑 3 篇：完成 1/3、2/3 两个中间刻度都应出现过（第 3 篇并入终态 1.0）
+    assert 1 / 3 in progresses and 2 / 3 in progresses
+    assert progresses[-1] == 1.0
+
+    # 每篇开跑时 index_current_doc 指向在飞的那一篇
+    in_flight = [current for _s, _p, current in observed]
+    assert set(in_flight) == names
+    assert writes[-1][2] == "", "成功终态不留残余的在飞文档名"
+
+
+def test_bulk_run_failure_terminates_failed_with_error_summary(kb, monkeypatch):
+    """批次中途有失败 → 终态 ``failed``，``index_current_doc`` 带人能读懂的失败摘要。"""
+    ok = _add_doc(kb.id, "ok.pdf", embedding_status="failed", page_count=3)
+    bad = _add_doc(kb.id, "bad.pdf", embedding_status="failed", page_count=3)
+    svc, _observed, _calls = _stub_reparse_observing_kb(
+        monkeypatch, kb.id, {bad.id: "failed"}
+    )
+    writes = _spy_kb_writes(monkeypatch)
+
+    result = svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
+
+    assert result.done == [ok.id]
+    statuses = [status for status, _p, _d in writes]
+    assert all(s == "building" for s in statuses[:-1]), (
+        f"中途那篇失败不许提前把整库判死，实际 {statuses}"
+    )
+    assert statuses[-1] == "failed"
+    assert statuses.count("failed") == 1
+
+    final = kb_repo.get(kb.id)
+    assert final.index_status == "failed"
+    assert bad.original_name in final.index_current_doc, "摘要要点名是哪篇没跑成"
+    assert "1/2" in final.index_current_doc, "摘要要给出失败/总数"
+
+
+def test_bulk_run_with_nothing_runnable_leaves_kb_status_untouched(kb, monkeypatch):
+    """没有可跑的目标（全被页数上限拦下）= 没发生任何重解析，不该改写 KB 状态。"""
+    huge = _add_doc(kb.id, "huge.pdf", embedding_status="failed")
+    svc, _observed, _calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
+    huge.page_count = svc.PAGE_LIMIT + 1
+    doc_repo._save_doc_meta(huge)
+    before = kb_repo.get(kb.id).index_status
+    writes = _spy_kb_writes(monkeypatch)
+
+    result = svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
+
+    assert result.total == 0
+    assert [s.doc.id for s in result.skipped] == [huge.id]
+    assert writes == [], "空批次不该产生任何 KB 状态写入"
+    assert kb_repo.get(kb.id).index_status == before
+
+
+def test_bulk_run_interrupted_orchestration_still_lands_terminal_status(kb, monkeypatch):
+    """编排层自身抛错（这里用逐篇回调模拟）也不许把 KB 留在 ``building``。
+
+    留在 ``building`` 的 KB 会让前端永远轮询一个永不落地的批次 —— 比落 failed 更糟。
+    """
+    _add_doc(kb.id, "a.pdf", embedding_status="failed", page_count=3)
+    _add_doc(kb.id, "b.pdf", embedding_status="failed", page_count=3)
+    svc, _observed, _calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
+
+    def _boom(completed, total, doc, outcome):
+        raise RuntimeError("progress renderer exploded")
+
+    with pytest.raises(RuntimeError, match="progress renderer exploded"):
+        svc.run_bulk_reparse(
+            kb.id, svc.list_target_docs(kb.id), concurrency=1, on_doc_complete=_boom
+        )
+
+    final = kb_repo.get(kb.id)
+    assert final.index_status == "failed"
+    assert "中断" in final.index_current_doc
+    assert "progress renderer exploded" in final.index_current_doc
+
+
+def test_bulk_run_tolerates_missing_kb_without_raising(kb, monkeypatch):
+    """``_KbIndexStatus._write`` 遇到 ``kb_repo.get`` 返回 ``None`` 时静默跳过。
+
+    真实场景：KB 元数据被运维误删 / 还没创建就被外部触发。编排层自身不应因此炸。
+    """
+    from services import bulk_reparse_service as svc
+
+    _add_doc(kb.id, "a.pdf", embedding_status="failed", page_count=3)
+    _stub_reparse(monkeypatch, {})  # 单篇立刻落 embedded，避免轮询挂死
+    monkeypatch.setattr(svc.kb_repo, "get", lambda _kb_id: None)
+
+    result = svc.run_bulk_reparse(
+        kb.id, svc.list_target_docs(kb.id), concurrency=1
+    )
+
+    assert result.done == [doc_repo.list_docs(kb.id)[0].id]
+    assert result.failed == []
 
 
 # ── CLI 薄 wrapper：与 service 同源 ─────────────────────────────────────────────

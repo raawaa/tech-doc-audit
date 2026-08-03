@@ -61,6 +61,8 @@
 - **待重解析文档 (Reparse Target)** — 满足三条选取规则**任一**的 KB 文档：① 未向量化（`embedding_status != "embedded"`）；② 缺按页文本文件；③ 按页文本存在但 `layout == []`（历史的 `_pdf_fallback()` 假成功残留；`force` 模式绕过三条规则，整库皆为目标）。`force` 模式绕过三条规则，整库皆为目标（换解析器后的整库重建入口）。
 - **OCR 成本预检 (Preflight)** — 批量重新解析触发前的**无副作用**估算：命中 / 未命中缓存的篇数与页数、超单文件页数上限（`PAGE_LIMIT = 100`，issue #87）的清单。命中判定只有一份实现 —— `core.paddleocr_cache.cache_state_by_hash()`（按 `doc.content_hash` 查，不重算文件哈希），与 `get_cached` 同口径：条目损坏或 model_version 不符算未命中。历史 `source=fallback_pdfplumber` 条目按命中计（#99/05 后 V8 cache defense 已删除，运维清理是单独工单）。
   _Avoid_: 只探测缓存文件是否存在就报"命中"——会让清单与统计自相矛盾。
+- **批次内 KB 状态托管 (Caller-Managed KB Status)** — 批量重新解析期间，**知识库检索索引**由编排层独占写入：批次开头一次 `building` + `index_progress = 0`，期间只推进 `index_progress`（`done / total`，单调不减）与 `index_current_doc`（在飞文档名），末尾按结果写**唯一一次**终态（全成功 `searchable` / 有失败或中断 `failed` + 一行失败摘要）。单篇入口 `reparse_document(doc_id, caller_manages_kb_status=True)` 据此**完全不碰** KB 级状态（doc 级 `embedding_status` 照常写）；默认 `False`，per-doc API 与单篇 UI 按钮行为不变。
+  _Avoid_: 让单篇完成回调在批次中途写 `searchable`——按定义 `searchable` 表示"该库**此刻**可被向量检索"，批量跑到一半时这句话不成立；且前端 `KnowledgeBaseDetail.tsx` 以 `index_status === 'building'` 为轮询续订的唯一条件，抖动会让它反复停轮询又重启（#93 实测 154 篇抖动上百次）。
 
 ## 跨层坐标语义
 
