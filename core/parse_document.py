@@ -4,12 +4,11 @@
 一次解析返回 {by_page, full_text, layout}，所有下游（按页文本存储 / 向量索引 / 文本搜索 / PDF 跳转）
 从同一份数据消费——避免历史上双解析器（``extract_text`` + ``extract_text_by_page``）导致的不一致。
 
-降级链（P1 数据层 #32 V1 已落 cache）：
+解析路径：
   1. PDF: PaddleOCR-VL-1.6（带缓存，命中即跳过 OCR 配额）
-  2. PDF 缓存未命中 → PaddleOCR 重新推理 → 落缓存
-  3. PaddleOCR 不可用/失败 → 提取页面 markdown 聚合到 full_text + by_page=单页
-  4. PaddleOCR/MinerU 全失败 → pdfplumber 流式逐页抽取
-  5. 非 PDF（DOCX / MD）→ 单页 full_text，无 OCR
+  2. PDF 缓存未命中 → PyMuPDF 文字层解析，或 PaddleOCR 扫描件解析
+  3. PyMuPDF 与 PaddleOCR 均不可用 / 解析失败 → 抛出明确异常
+  4. 非 PDF（DOCX / MD）→ 单页 full_text，无 OCR
 
 文本层 PDF 另解(issue #99/#105):`_pymupdf_parse(file_path) -> ParseResult`
 按 PyMuPDF text-block + image-block + tables(block_label="table")产
@@ -190,18 +189,13 @@ def _parse_pdf(file_path: str, *, use_cache: bool) -> ParseResult:
     """PDF 解析路由（issue #106）。
 
     契约：
-    1. 缓存命中 → 直接反序列化（任何 source 类型：paddleocr / fallback_pdfplumber
-       / pymupdf — V8 cache defense 已把 ``fallback_pdfplumber`` 在 PaddleOCR 可用
-       时打回未命中）。
+    1. 缓存命中 → 直接反序列化（``paddleocr`` / ``pymupdf`` 等 source 均兼容）。
     2. PyMuPDF 可用 → 先 ``_is_text_layer_pdf`` 判定，文字版走 ``_pymupdf_parse``
        （零 OCR 配额，毫秒级），扫描件 / 文本层不足走 ``_paddleocr_parse``。
     3. PyMuPDF 不可用 → 走 ``_paddleocr_parse``（dev 环境兼容）。
-    4. **PyMuPDF + PaddleOCR 都不可用 → 抛 ``RuntimeError``**，不再静默降级
-       到 ``_pdf_fallback``（_pdf_fallback 在下一个 ticket 删）。
+    4. **PyMuPDF + PaddleOCR 都不可用 → 抛 ``RuntimeError``**，不再静默降级。
     5. PyMuPDF 文字版检测抛异常（损坏 / 加密 PDF 在检测阶段）→ 也走 PaddleOCR。
-    6. 写 cache 时 ``source="pymupdf"`` 标识，与现有 ``"paddleocr"`` /
-       ``"fallback_pdfplumber"`` 并列。新 ``pymupdf`` 条目无 V8 defense 问题
-       （layout 非空）。
+    6. 写 cache 时 ``source="pymupdf"`` 标识，与现有 ``"paddleocr"`` 并列。
     """
     cached: Optional[dict] = None
     if use_cache:
@@ -221,7 +215,7 @@ def _parse_pdf(file_path: str, *, use_cache: bool) -> ParseResult:
             result = _pymupdf_parse(file_path)
             source = "pymupdf"
         else:
-            # 扫描件 → 走 PaddleOCR；PaddleOCR 不在则抛（不再降级到 pdfplumber）
+            # 扫描件 → 走 PaddleOCR；PaddleOCR 不在则抛
             if not _paddleocr_available():
                 raise RuntimeError(
                     "scanned PDF detected but PADDLEOCR_API_TOKEN/URL not configured"
@@ -246,14 +240,12 @@ def _parse_pdf(file_path: str, *, use_cache: bool) -> ParseResult:
 
 
 def _paddleocr_parse(file_path: str) -> tuple[ParseResult, str]:
-    """调 PaddleOCR API → 落 ParseResult；不可用 / 失败 → 降级。
+    """调用 PaddleOCR API 并返回 ParseResult；不可用或失败时抛出异常。
 
-    返回 ``(result, source)``: source 是 cache 元数据，标识结果来自哪个解析器
-    （见 ``paddleocr_cache.save_cached`` 的 source 参数说明，issue #57）。
+    返回 ``(result, source)``: source 是 cache 元数据，标识结果来自哪个解析器。
     """
     if not _paddleocr_available():
-        result = _pdf_fallback(file_path)
-        return result, "fallback_pdfplumber"
+        raise RuntimeError("PaddleOCR API not configured")
 
     try:
         result = _paddleocr_call(file_path)
@@ -263,7 +255,7 @@ def _paddleocr_parse(file_path: str) -> tuple[ParseResult, str]:
         return result, "paddleocr"
     except Exception as e:
         _logger.warning("paddleocr_parse failed for %s: %s", file_path, e)
-        return _pdf_fallback(file_path), "fallback_pdfplumber"
+        raise
 
 
 def _paddleocr_call(file_path: str, orientation_classify: bool = False) -> ParseResult:
@@ -628,32 +620,6 @@ def _norm_bbox_polygon(
     return norm_bbox, polygon
 
 
-# ── PDF 降级:pdfplumber 流式逐页 ───────────────────────────────────────────────
-
-
-def _pdf_fallback(file_path: str) -> ParseResult:
-    """PaddleOCR 不可用 / 失败：走 pdfplumber 流式逐页抽取，落 ParseResult。"""
-    try:
-        import pdfplumber
-    except ImportError:
-        return _empty_result()
-
-    page_texts: list[PageText] = []
-    try:
-        with pdfplumber.open(file_path) as pdf:
-            for i, page in enumerate(pdf.pages):
-                t = page.extract_text() or ""
-                page_texts.append(PageText(page=i, text=t))
-                page.flush_cache()
-    except Exception as e:
-        _logger.warning("pdfplumber fallback failed for %s: %s", file_path, e)
-        return _empty_result()
-
-    full_text = "\n\n".join(p.text for p in page_texts if p.text)
-    full_text = _normalize_headings(full_text)
-    return ParseResult(by_page=page_texts, full_text=full_text, layout=[])
-
-
 # ── 非 PDF 路径 ────────────────────────────────────────────────────────────────
 
 
@@ -689,5 +655,5 @@ def _parse_plain_text(file_path: str) -> ParseResult:
 
 
 def _empty_result() -> ParseResult:
-    """PaddleOCR + pdfplumber 都失败时的兜底：空结构。"""
+    """缺失文件或非 PDF 解析失败时的空结构。"""
     return ParseResult(by_page=[], full_text="", layout=[])

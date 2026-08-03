@@ -157,8 +157,6 @@ def test_pdf_cache_hit_skips_paddleocr(tmp_path, monkeypatch):
         raise AssertionError("PaddleOCR must not be called when cache hits")
 
     monkeypatch.setattr(pd_module, "_paddleocr_call", _explode)
-    # 同时关掉降级路径
-    monkeypatch.setattr(pd_module, "_pdf_fallback", _explode)
 
     pr = parse_document(str(pdf))
     assert pr.full_text == "cached text"
@@ -183,9 +181,9 @@ def test_pdf_cache_miss_with_paddleocr_success(tmp_path, monkeypatch):
     )
 
     monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: True)
-    monkeypatch.setattr(pd_module, "_paddleocr_call", lambda p: expected)
-    # 关闭降级路径，强制走 PaddleOCR
-    monkeypatch.setattr(pd_module, "_pdf_fallback", lambda p: pytest.fail("fallback called"))
+    monkeypatch.setattr(
+        pd_module, "_paddleocr_call", lambda p, **kwargs: expected
+    )
 
     pr = parse_document(str(pdf))
     assert pr.full_text == "paddleocr text"
@@ -198,33 +196,24 @@ def test_pdf_cache_miss_with_paddleocr_success(tmp_path, monkeypatch):
 
 
 def test_pdf_paddleocr_unavailable_raises_runtime_error(tmp_path, monkeypatch):
-    """PyMuPDF 可用 + dummy PDF（无文字层） + PaddleOCR 不可用 → RuntimeError（issue #106 契约变更）。
-
-    dummy PDF 被 PyMuPDF 视为"无文字层" → 走扫描件分支 → paddleocr 不可用
-    → 不再隐式降级到 _pdf_fallback（pdfplumber），显式抛错。
-    """
-    import pytest
+    """扫描件 PDF + PaddleOCR 未配置 → 显式抛出 RuntimeError。"""
     pdf = tmp_path / "doc3.pdf"
     pdf.write_bytes(b"%PDF-1.4 dummy3")
 
+    monkeypatch.setattr(pd_module, "_pymupdf_available", lambda: True)
+    monkeypatch.setattr(pd_module, "_is_text_layer_pdf", lambda p: False)
     monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: False)
-    # _pdf_fallback 不应被调
-    monkeypatch.setattr(
-        pd_module, "_pdf_fallback",
-        lambda p: (_ for _ in ()).throw(
-            AssertionError("must not fall back to pdfplumber under new contract")
-        ),
-    )
 
     with pytest.raises(RuntimeError, match="scanned PDF detected"):
         parse_document(str(pdf))
 
 
-def test_pdf_paddleocr_failure_falls_back_to_pdfplumber(tmp_path, monkeypatch):
-    """PaddleOCR 抛异常 → 走 _pdf_fallback，不让异常传播。"""
+def test_pdf_paddleocr_failure_raises_runtime_error(tmp_path, monkeypatch):
+    """PaddleOCR 解析失败 → 异常向调用方传播，不静默返回空结果。"""
     pdf = tmp_path / "doc4.pdf"
     pdf.write_bytes(b"%PDF-1.4 dummy4")
 
+    monkeypatch.setattr(pd_module, "_pymupdf_available", lambda: False)
     monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: True)
 
     def boom(p):
@@ -232,11 +221,8 @@ def test_pdf_paddleocr_failure_falls_back_to_pdfplumber(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pd_module, "_paddleocr_call", boom)
 
-    fallback = ParseResult(by_page=[PageText(page=0, text="fallback")], full_text="fallback", layout=[])
-    monkeypatch.setattr(pd_module, "_pdf_fallback", lambda p: fallback)
-
-    pr = parse_document(str(pdf))
-    assert pr.full_text == "fallback"
+    with pytest.raises(RuntimeError, match="paddleocr down"):
+        parse_document(str(pdf))
 
 
 def test_pdf_use_cache_false_skips_cache_lookup(tmp_path, monkeypatch):
@@ -259,8 +245,7 @@ def test_pdf_use_cache_false_skips_cache_lookup(tmp_path, monkeypatch):
         full_text="fresh",
         layout=[],
     )
-    monkeypatch.setattr(pd_module, "_paddleocr_call", lambda p: expected)
-    monkeypatch.setattr(pd_module, "_pdf_fallback", lambda p: pytest.fail("fallback called"))
+    monkeypatch.setattr(pd_module, "_paddleocr_call", lambda p, **kwargs: expected)
 
     pr = parse_document(str(pdf), use_cache=False)
     assert pr.full_text == "fresh"
@@ -490,7 +475,7 @@ def test_paddleocr_jsonl_supports_multi_page_packed_layout():
 
 
 def test_paddleocr_call_raises_when_api_missing(monkeypatch):
-    """没 token 时直接走降级（paddleocr_available False）— _paddleocr_call 永远不被调用。"""
+    """没 token 时 _paddleocr_call 永远不被调用（路由层在 _paddleocr_parse 阶段抛错）。"""
     monkeypatch.setattr(pd_module, "_paddleocr_api_url", "", raising=False)
     monkeypatch.setattr(pd_module, "_PADDLEOCR_API_URL", "", raising=False)
     monkeypatch.setattr(pd_module, "_PADDLEOCR_API_TOKEN", "", raising=False)
