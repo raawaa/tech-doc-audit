@@ -22,6 +22,10 @@ data/
 *.pdf
 *.doc
 *.docx
+# 但 tests/fixtures 下的 PDF 走 pytest fixture 入仓（issue #104 / #106）：
+# 文字版 / 扫描件 / 损坏 / 加密 fixture 必须随提交走，否则 CI 上无 PyMuPDF
+# 文字层检测的回归样本。
+!tests/fixtures/**/*.pdf
 
 # Generated output
 audit_report_*.txt

@@ -14,7 +14,7 @@ import threading
 from typing import Optional
 
 from core.logger import get_logger
-from core.parse_document import parse_document
+from core.parse_document import parse_document, MIN_FULL_TEXT_CHARS
 from core.pages_store import save_pages
 from core.index_manager import (
     _get_index_lock,
@@ -73,7 +73,7 @@ def _reparse_async(kb_id: str, doc_id: str) -> None:
         try:
             # 1) 解析（带缓存；命中跳过 OCR 配额）
             parse_result = parse_document(doc.file_path)
-            if not parse_result.full_text or len(parse_result.full_text) < 20:
+            if not parse_result.full_text or len(parse_result.full_text) < MIN_FULL_TEXT_CHARS:
                 raise RuntimeError("parse_document returned empty/sparse text")
             # 防御 #94 假成功指纹：full_text ≥ 20 chars 但 layout/by_page 为空
             # 意味着无高亮坐标，chip 预览会显示"未解析"；显式抛错走 _mark_failed

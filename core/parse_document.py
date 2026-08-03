@@ -126,6 +126,20 @@ def _pymupdf_available() -> bool:
     return True
 
 
+# 文字版 / 扫描件判定的字符阈值（issue #104 / PRD #99）。
+# 与 _paddleocr_parse 内部空值重试阈值 + services/reparse_service.layout-empty
+# 守卫（lines 70-71）共享同一常量 —— 三处必须保持一致。
+MIN_FULL_TEXT_CHARS = 20
+_TEXT_LAYER_MIN_CHARS = MIN_FULL_TEXT_CHARS  # issue #104 内部同名 alias
+
+# 同时 export 给重解析路径（其它模块 import 此名，不应用本地字面量 20）
+__all__ = [
+    "ParseResult", "PageText", "PageLayout", "Block",
+    "parse_document",
+    "MIN_FULL_TEXT_CHARS",
+]
+
+
 def _is_text_layer_pdf(file_path: str) -> bool:
     """Return whether a PDF contains at least 20 characters of text."""
     if not file_path or Path(file_path).suffix.lower() != ".pdf":
@@ -136,7 +150,7 @@ def _is_text_layer_pdf(file_path: str) -> bool:
 
         with pymupdf.open(file_path) as document:
             text = "".join(page.get_text() for page in document)
-        return len(text.strip()) >= 20
+        return len(text.strip()) >= MIN_FULL_TEXT_CHARS
     except Exception as e:
         _logger.debug("text-layer detection failed for %s: %s", file_path, e)
         return False
@@ -173,6 +187,22 @@ def parse_document(file_path: str, *, use_cache: bool = True) -> ParseResult:
 
 
 def _parse_pdf(file_path: str, *, use_cache: bool) -> ParseResult:
+    """PDF 解析路由（issue #106）。
+
+    契约：
+    1. 缓存命中 → 直接反序列化（任何 source 类型：paddleocr / fallback_pdfplumber
+       / pymupdf — V8 cache defense 已把 ``fallback_pdfplumber`` 在 PaddleOCR 可用
+       时打回未命中）。
+    2. PyMuPDF 可用 → 先 ``_is_text_layer_pdf`` 判定，文字版走 ``_pymupdf_parse``
+       （零 OCR 配额，毫秒级），扫描件 / 文本层不足走 ``_paddleocr_parse``。
+    3. PyMuPDF 不可用 → 走 ``_paddleocr_parse``（dev 环境兼容）。
+    4. **PyMuPDF + PaddleOCR 都不可用 → 抛 ``RuntimeError``**，不再静默降级
+       到 ``_pdf_fallback``（_pdf_fallback 在下一个 ticket 删）。
+    5. PyMuPDF 文字版检测抛异常（损坏 / 加密 PDF 在检测阶段）→ 也走 PaddleOCR。
+    6. 写 cache 时 ``source="pymupdf"`` 标识，与现有 ``"paddleocr"`` /
+       ``"fallback_pdfplumber"`` 并列。新 ``pymupdf`` 条目无 V8 defense 问题
+       （layout 非空）。
+    """
     cached: Optional[dict] = None
     if use_cache:
         from core.paddleocr_cache import get_cached
@@ -181,7 +211,29 @@ def _parse_pdf(file_path: str, *, use_cache: bool) -> ParseResult:
     if cached is not None:
         return ParseResult.from_dict(cached)
 
-    result, source = _paddleocr_parse(file_path)
+    result: ParseResult
+    source: str
+
+    if _pymupdf_available():
+        text_layer = _is_text_layer_pdf(file_path)
+
+        if text_layer:
+            result = _pymupdf_parse(file_path)
+            source = "pymupdf"
+        else:
+            # 扫描件 → 走 PaddleOCR；PaddleOCR 不在则抛（不再降级到 pdfplumber）
+            if not _paddleocr_available():
+                raise RuntimeError(
+                    "scanned PDF detected but PADDLEOCR_API_TOKEN/URL not configured"
+                )
+            result, source = _paddleocr_parse(file_path)
+    else:
+        # PyMuPDF 不可用 → 走 PaddleOCR；PaddleOCR 不在则抛
+        if not _paddleocr_available():
+            raise RuntimeError(
+                "PyMuPDF not installed and PaddleOCR not configured"
+            )
+        result, source = _paddleocr_parse(file_path)
 
     if use_cache and result.by_page:
         try:
@@ -205,7 +257,7 @@ def _paddleocr_parse(file_path: str) -> tuple[ParseResult, str]:
 
     try:
         result = _paddleocr_call(file_path)
-        if not result.full_text or len(result.full_text) < 20:
+        if not result.full_text or len(result.full_text) < MIN_FULL_TEXT_CHARS:
             _logger.info("paddleocr returned empty for %s, retrying with orientation classify", file_path)
             result = _paddleocr_call(file_path, orientation_classify=True)
         return result, "paddleocr"
