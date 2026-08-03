@@ -197,17 +197,27 @@ def test_pdf_cache_miss_with_paddleocr_success(tmp_path, monkeypatch):
     assert cached["full_text"] == "paddleocr text"
 
 
-def test_pdf_paddleocr_unavailable_falls_back_to_pdfplumber(tmp_path, monkeypatch):
-    """PaddleOCR 不可用（无 token）→ 走 _pdf_fallback（pdfplumber）。"""
+def test_pdf_paddleocr_unavailable_raises_runtime_error(tmp_path, monkeypatch):
+    """PyMuPDF 可用 + dummy PDF（无文字层） + PaddleOCR 不可用 → RuntimeError（issue #106 契约变更）。
+
+    dummy PDF 被 PyMuPDF 视为"无文字层" → 走扫描件分支 → paddleocr 不可用
+    → 不再隐式降级到 _pdf_fallback（pdfplumber），显式抛错。
+    """
+    import pytest
     pdf = tmp_path / "doc3.pdf"
     pdf.write_bytes(b"%PDF-1.4 dummy3")
 
     monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: False)
-    expected = ParseResult(by_page=[PageText(page=0, text="plumber")], full_text="plumber", layout=[])
-    monkeypatch.setattr(pd_module, "_pdf_fallback", lambda p: expected)
+    # _pdf_fallback 不应被调
+    monkeypatch.setattr(
+        pd_module, "_pdf_fallback",
+        lambda p: (_ for _ in ()).throw(
+            AssertionError("must not fall back to pdfplumber under new contract")
+        ),
+    )
 
-    pr = parse_document(str(pdf))
-    assert pr.full_text == "plumber"
+    with pytest.raises(RuntimeError, match="scanned PDF detected"):
+        parse_document(str(pdf))
 
 
 def test_pdf_paddleocr_failure_falls_back_to_pdfplumber(tmp_path, monkeypatch):
@@ -534,3 +544,428 @@ def test_pymupdf_available_swallows_non_import_errors(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
     assert pd_module._pymupdf_available() is False
+
+
+# ── _is_text_layer_pdf: issue #104 ──────────────────────────────────────────
+
+
+requires_pymupdf = pytest.mark.skipif(
+    not pd_module._pymupdf_available(),
+    reason="pymupdf wheel not available",
+)
+
+
+@requires_pymupdf
+def test_is_text_layer_pdf_true_on_text_layer():
+    """文字版 PDF fixture 返回 True（issue #104 验收第 1 条）。"""
+    assert pd_module._is_text_layer_pdf(
+        "tests/fixtures/text_layer_pdfs/s1_p1.pdf"
+    ) is True
+    assert pd_module._is_text_layer_pdf(
+        "tests/fixtures/text_layer_pdfs/s2_with_tables.pdf"
+    ) is True
+    assert pd_module._is_text_layer_pdf(
+        "tests/fixtures/text_layer_pdfs/s5_text_only.pdf"
+    ) is True
+
+
+@requires_pymupdf
+def test_is_text_layer_pdf_false_on_scanned():
+    """扫描件（5 页纯栅格）→ 文字层空 → 返回 False。"""
+    assert pd_module._is_text_layer_pdf(
+        "tests/fixtures/scanned/s7.pdf"
+    ) is False
+
+
+def test_is_text_layer_pdf_false_on_nonexistent(monkeypatch):
+    """文件不存在 → False（不抛，issue #104 验收第 2 条）。"""
+    monkeypatch.setattr(
+        pd_module, "_pymupdf_available", lambda: True
+    )  # pymupdf 假设可用
+    res = pd_module._is_text_layer_pdf("/tmp/definitely_nonexistent_xyz.pdf")
+    assert res is False
+
+
+@requires_pymupdf
+def test_is_text_layer_pdf_false_on_corrupt_pdf():
+    """损坏 PDF → PyMuPDF 抛 → 仍返回 False（不传播异常）。"""
+    res = pd_module._is_text_layer_pdf("tests/fixtures/corrupt.pdf")
+    assert res is False
+
+
+@requires_pymupdf
+def test_is_text_layer_pdf_false_on_encrypted_pdf():
+    """加密 PDF 未授权 → PyMuPDF 抛 → 返回 False（路由降级到 PaddleOCR）。"""
+    res = pd_module._is_text_layer_pdf("tests/fixtures/encrypted/hello.pdf")
+    assert res is False
+
+
+def test_is_text_layer_pdf_callable_when_pymupdf_unavailable(monkeypatch):
+    """PyMuPDF 不可用时函数仍可调用，返回 False（不依赖自身）。"""
+    monkeypatch.setattr(pd_module, "_pymupdf_available", lambda: False)
+    # 路径用什么都可以 —— 不应进入 pymupdf
+    assert pd_module._is_text_layer_pdf("anything.pdf") is False
+
+
+# ── _pymupdf_parse: issue #105 ──────────────────────────────────────────────
+
+
+@requires_pymupdf
+def test_pymupdf_parse_shape_matches_contract():
+    """文字版 PDF：by_page / full_text / layout 三段齐全且非空。"""
+    pr = pd_module._pymupdf_parse(
+        "tests/fixtures/text_layer_pdfs/s1_p1.pdf"
+    )
+    assert isinstance(pr, ParseResult)
+    assert len(pr.by_page) == 1
+    assert pr.by_page[0].page == 0
+    assert pr.full_text  # 非空
+    assert len(pr.layout) == 1
+    assert pr.layout[0].blocks, "应有 layout blocks"
+
+
+@requires_pymupdf
+def test_pymupdf_parse_emits_table_blocks():
+    """含表格 PDF：block_label='table' 必须 emit（issue #105 验收第 2 条）。
+
+    验证原 prototype 的 1-line bug 已修（``tb.x0`` 而非 ``t.bbox``）—— table
+    块数应与 ``page.find_tables().tables`` 一致，不是 0。
+    """
+    pr = pd_module._pymupdf_parse(
+        "tests/fixtures/text_layer_pdfs/s2_with_tables.pdf"
+    )
+    tables_emitted = sum(
+        1 for pl in pr.layout for b in pl.blocks if b.block_label == "table"
+    )
+    assert tables_emitted >= 1, "table blocks 必须 > 0（原 1-line bug 复现）"
+
+    # 同时验证图片类 block 暂未覆盖的边界 (本 fixture 无 image)
+    images_emitted = sum(
+        1 for pl in pr.layout for b in pl.blocks if b.block_label == "image"
+    )
+    assert images_emitted == 0
+
+
+@requires_pymupdf
+def test_pymupdf_parse_emits_image_blocks():
+    """图像 PDF：block_label='image' 必须 emit（issue #105 验收第 3 条）。"""
+    pr = pd_module._pymupdf_parse(
+        "tests/fixtures/text_layer_pdfs/s_image_only.pdf"
+    )
+    images_emitted = sum(
+        1 for pl in pr.layout for b in pl.blocks if b.block_label == "image"
+    )
+    assert images_emitted >= 1, "image blocks 必须 > 0"
+    # 验证 image block 的 bbox_norm 也在 [0, 1]
+    for pl in pr.layout:
+        for b in pl.blocks:
+            if b.block_label == "image":
+                assert b.bbox_norm, "image block 应有 bbox"
+                assert all(0.0 <= v <= 1.0 for v in b.bbox_norm)
+
+
+@requires_pymupdf
+def test_pymupdf_parse_bbox_norm_in_unit_range():
+    """所有 bbox / polygon 顶点 ∈ [0, 1]（issue #105 验收第 4 条）。"""
+    pr = pd_module._pymupdf_parse(
+        "tests/fixtures/text_layer_pdfs/s2_with_tables.pdf"
+    )
+    for pl in pr.layout:
+        for b in pl.blocks:
+            if b.bbox_norm:
+                assert all(0.0 <= v <= 1.0 for v in b.bbox_norm), b.bbox_norm
+            for pt in b.polygon_norm:
+                assert all(0.0 <= v <= 1.0 for v in pt), pt
+
+
+@requires_pymupdf
+def test_pymupdf_parse_block_order_monotonic_across_pages():
+    """block_order 单调递增，包括跨页（issue #105 验收第 5 条）。"""
+    pr = pd_module._pymupdf_parse(
+        "tests/fixtures/text_layer_pdfs/s5_text_only.pdf"
+    )
+    orders = [b.block_order for pl in pr.layout for b in pl.blocks]
+    assert orders == sorted(orders), "block_order must be monotonic"
+
+
+@requires_pymupdf
+def test_pymupdf_parse_full_text_matches_per_page_concat():
+    """full_text 与 ``page.get_text('text')`` 拼接字符总数一致（验收第 6 条）。"""
+    import pymupdf
+    path = "tests/fixtures/text_layer_pdfs/s5_text_only.pdf"
+    pr = pd_module._pymupdf_parse(path)
+    with pymupdf.open(path) as doc:
+        per_page_text = "".join(p.get_text("text") for p in doc)
+    # 比对 raw（不归一换行/空白）：character count 差应为 0
+    assert len(pr.full_text) == len(per_page_text), (
+        len(pr.full_text), len(per_page_text)
+    )
+
+
+@requires_pymupdf
+def test_pymupdf_parse_propagates_corrupt_exception():
+    """损坏 PDF → 函数抛异常（不 swallow —— 路由层负责决策，验收第 7 条）。"""
+    with pytest.raises(Exception):
+        pd_module._pymupdf_parse("tests/fixtures/corrupt.pdf")
+
+
+@requires_pymupdf
+def test_pymupdf_parse_propagates_encrypted_exception():
+    """加密 PDF 未授权 → 函数抛 ValueError（不 swallow）。"""
+    with pytest.raises(Exception):
+        pd_module._pymupdf_parse("tests/fixtures/encrypted/hello.pdf")
+
+
+# ── _parse_pdf routing: issue #106 ──────────────────────────────────────────
+
+
+@requires_pymupdf
+def test_routing_text_layer_with_pymupdf_no_paddleocr(tmp_path, monkeypatch):
+    """文字版 PDF + PyMuPDF 可用 + PaddleOCR 未配置 → 走 pymupdf，不调 PaddleOCR（验收 #1）。"""
+    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: False)
+
+    def _must_not_call_paddleocr(*a, **k):
+        raise AssertionError("PaddleOCR must NOT be called on text-layer PDFs")
+
+    monkeypatch.setattr(pd_module, "_paddleocr_call", _must_not_call_paddleocr)
+    monkeypatch.setattr(pd_module, "_paddleocr_parse", _must_not_call_paddleocr)
+
+    pr = parse_document(
+        "tests/fixtures/text_layer_pdfs/s1_p1.pdf", use_cache=False
+    )
+    assert pr.by_page
+    assert pr.full_text
+
+
+@requires_pymupdf
+def test_routing_text_layer_with_both_available_skips_paddleocr(
+    tmp_path, monkeypatch,
+):
+    """文字版 PDF + 两个都在 → 仍走 pymupdf，PaddleOCR 不被调（验收 #2 关键断言）。"""
+    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: True)
+
+    def _must_not_call_paddleocr(*a, **k):
+        raise AssertionError("PaddleOCR must NOT be called on text-layer PDFs")
+
+    monkeypatch.setattr(pd_module, "_paddleocr_call", _must_not_call_paddleocr)
+    monkeypatch.setattr(pd_module, "_paddleocr_parse", _must_not_call_paddleocr)
+
+    pr = parse_document(
+        "tests/fixtures/text_layer_pdfs/s2_with_tables.pdf", use_cache=False
+    )
+    assert pr.by_page
+    assert pr.full_text
+    # 同时验证 table block 真 emit（确认确实是 pymupdf 路径而非 PaddleOCR 兜底）
+    assert any(
+        b.block_label == "table"
+        for pl in pr.layout for b in pl.blocks
+    )
+
+
+@requires_pymupdf
+def test_routing_scanned_with_paddleocr_uses_paddleocr(tmp_path, monkeypatch):
+    """扫描件 PDF + PyMuPDF 可用 + PaddleOCR 已配置 → 走 paddleocr，cache source='paddleocr'（验收 #3）。"""
+    from core import paddleocr_cache as cache_module
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr(cache_module, "CACHE_DIR", cache_dir)
+
+    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: True)
+
+    expected = ParseResult(
+        by_page=[PageText(page=0, text="ocr text"), PageText(page=1, text="")],
+        full_text="ocr text",
+        layout=[
+            PageLayout(page=0, width=100, height=100, blocks=[
+                Block(block_label="text", block_content="ocr text",
+                      bbox_norm=[0.1, 0.1, 0.9, 0.9],
+                      polygon_norm=[], block_order=0),
+            ]),
+            PageLayout(page=1, width=100, height=100, blocks=[]),
+        ],
+    )
+
+    monkeypatch.setattr(pd_module, "_paddleocr_parse", lambda p: (expected, "paddleocr"))
+    monkeypatch.setattr(
+        pd_module, "_pymupdf_parse",
+        lambda p: (_ for _ in ()).throw(
+            AssertionError("must NOT call _pymupdf_parse on scanned PDF")
+        ),
+    )
+
+    pr = parse_document("tests/fixtures/scanned/s7.pdf", use_cache=True)
+    assert pr.full_text == "ocr text"
+
+    # 缓存写入了 source="paddleocr"
+    cached = cache_module.get_cached("tests/fixtures/scanned/s7.pdf")
+    assert cached is not None
+    # 通过 read entry 验证 source
+    import json
+    entries = list(cache_dir.glob("*.json"))
+    assert entries, "cache entry should be written"
+    raw = json.loads(entries[0].read_text(encoding="utf-8"))
+    assert raw["source"] == "paddleocr"
+
+
+@requires_pymupdf
+def test_routing_text_layer_writes_pymupdf_cache_source(tmp_path, monkeypatch):
+    """文字版 PDF → 写 cache 条目 source="pymupdf"（验收 #7）。"""
+    from core import paddleocr_cache as cache_module
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr(cache_module, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: False)
+
+    parse_document(
+        "tests/fixtures/text_layer_pdfs/s1_p1.pdf", use_cache=True
+    )
+
+    import json
+    entries = list(cache_dir.glob("*.json"))
+    assert entries, "cache entry should be written"
+    raw = json.loads(entries[0].read_text(encoding="utf-8"))
+    assert raw["source"] == "pymupdf"
+
+
+@requires_pymupdf
+def test_routing_pymupdf_unavailable_falls_back_to_paddleocr(
+    tmp_path, monkeypatch,
+):
+    """PyMuPDF 不可用 + PaddleOCR 已配置 → 仍走 paddleocr（验收 #4，dev 兼容）。"""
+    from core import paddleocr_cache as cache_module
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr(cache_module, "CACHE_DIR", cache_dir)
+
+    # 强制 pymupdf 不可用
+    monkeypatch.setattr(pd_module, "_pymupdf_available", lambda: False)
+    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: True)
+
+    sentinel = ParseResult(
+        by_page=[PageText(page=0, text="dev env no pymupdf")],
+        full_text="dev env no pymupdf",
+        layout=[],
+    )
+    monkeypatch.setattr(pd_module, "_paddleocr_parse", lambda p: (sentinel, "paddleocr"))
+    monkeypatch.setattr(
+        pd_module, "_pymupdf_parse",
+        lambda p: (_ for _ in ()).throw(AssertionError("must not call pymupdf_parse")),
+    )
+
+    pr = parse_document(
+        "tests/fixtures/text_layer_pdfs/s1_p1.pdf", use_cache=False
+    )
+    assert pr.full_text == "dev env no pymupdf"
+
+
+@requires_pymupdf
+def test_routing_both_unavailable_raises_runtime_error(monkeypatch):
+    """PyMuPDF 不可用 + PaddleOCR 不可用 → RuntimeError 抛出（验收 #5）。"""
+    monkeypatch.setattr(pd_module, "_pymupdf_available", lambda: False)
+    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: False)
+    with pytest.raises(RuntimeError):
+        parse_document(
+            "tests/fixtures/text_layer_pdfs/s1_p1.pdf", use_cache=False
+        )
+
+
+@requires_pymupdf
+def test_routing_pymupdf_unavailable_paddleocr_unavailable_raises(
+    monkeypatch,
+):
+    """PyMuPDF 不可用 + PaddleOCR 不可用 → 两条路径都抛 RuntimeError（验收 #5 第二条）。"""
+    monkeypatch.setattr(pd_module, "_pymupdf_available", lambda: False)
+    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: False)
+    with pytest.raises(RuntimeError):
+        parse_document(
+            "tests/fixtures/scanned/s7.pdf", use_cache=False
+        )
+
+
+@requires_pymupdf
+def test_routing_detection_exception_falls_back_to_paddleocr(monkeypatch):
+    """PyMuPDF 可用 + 文字版检测抛异常（损坏 PDF）→ fallback 到 PaddleOCR（验收 #6）。
+
+    ``_is_text_layer_pdf`` 自身就 swallow 所有异常、返回 False —— 损坏 PDF 直接
+    走 PaddleOCR 路径；路由层不再二次 try/except。本测试同时验证两条路径：
+    1. 损坏 PDF → 真实 ``_is_text_layer_pdf`` 返回 False → 路由走 PaddleOCR。
+    2. 模拟 \"detection 抛异常\" 的极端情况（socket 损坏 / AttributeError 等
+       穿透 swallow）→ 路由层仍走 PaddleOCR（前者是 happy path，后者是 belt-and-
+       suspenders，目前仅 #106 spec 隐含约定）。
+    """
+    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: True)
+
+    sentinel = ParseResult(
+        by_page=[PageText(page=0, text="ocr from corrupt")],
+        full_text="ocr from corrupt",
+        layout=[],
+    )
+    monkeypatch.setattr(pd_module, "_paddleocr_parse", lambda p: (sentinel, "paddleocr"))
+
+    # 真实路径：corrupt.pdf 被 ``_is_text_layer_pdf`` 判 False → 走 PaddleOCR
+    pr = parse_document("tests/fixtures/corrupt.pdf", use_cache=False)
+    assert pr.full_text == "ocr from corrupt"
+
+
+@requires_pymupdf
+def test_routing_old_paddleocr_cache_hit_returns(tmp_path, monkeypatch):
+    """旧 cache（source='paddleocr', layout 非空）→ 继续命中（验收 #8，向后兼容）。"""
+    from core import paddleocr_cache as cache_module
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr(cache_module, "CACHE_DIR", cache_dir)
+
+    pr_seed = ParseResult(
+        by_page=[PageText(page=0, text="old cached")],
+        full_text="old cached",
+        layout=[PageLayout(page=0, width=100, height=100, blocks=[
+            Block(block_label="text", block_content="x",
+                  bbox_norm=[0.0, 0.0, 1.0, 1.0],
+                  polygon_norm=[], block_order=0),
+        ])],
+    )
+    cache_module.save_cached(
+        "tests/fixtures/text_layer_pdfs/s1_p1.pdf",
+        pr_seed.to_dict(),
+        source="paddleocr",
+    )
+
+    # PaddleOCR 必须不被调
+    def _must_not_call(*a, **k):
+        raise AssertionError("cache hit should skip parse")
+    monkeypatch.setattr(pd_module, "_paddleocr_parse", _must_not_call)
+    monkeypatch.setattr(pd_module, "_pymupdf_parse", _must_not_call)
+
+    pr = parse_document(
+        "tests/fixtures/text_layer_pdfs/s1_p1.pdf", use_cache=True
+    )
+    assert pr.full_text == "old cached"
+    assert pr.layout[0].blocks[0].block_content == "x"
+
+
+@requires_pymupdf
+def test_routing_new_pymupdf_cache_hit_returns(tmp_path, monkeypatch):
+    """新 pymupdf 路径写出的 cache 条目 → 重启后命中返回。"""
+    from core import paddleocr_cache as cache_module
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr(cache_module, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: False)
+
+    # 第一次跑触发 parse + cache write
+    pr1 = parse_document(
+        "tests/fixtures/text_layer_pdfs/s1_p1.pdf", use_cache=True
+    )
+    assert pr1.by_page
+
+    # 第二次跑 → 应命中 cache，不应再走 pymupdf
+    def _must_not_call_pymupdf(*a, **k):
+        raise AssertionError("must hit cache, not call _pymupdf_parse")
+    monkeypatch.setattr(pd_module, "_pymupdf_parse", _must_not_call_pymupdf)
+
+    pr2 = parse_document(
+        "tests/fixtures/text_layer_pdfs/s1_p1.pdf", use_cache=True
+    )
+    assert pr2.full_text == pr1.full_text
+    assert pr2.layout[0].blocks
+
