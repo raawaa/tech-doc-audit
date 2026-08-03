@@ -10,6 +10,10 @@
   3. PaddleOCR 不可用/失败 → 提取页面 markdown 聚合到 full_text + by_page=单页
   4. PaddleOCR/MinerU 全失败 → pdfplumber 流式逐页抽取
   5. 非 PDF（DOCX / MD）→ 单页 full_text，无 OCR
+
+文本层 PDF 另解(issue #99/#105):`_pymupdf_parse(file_path) -> ParseResult`
+按 PyMuPDF text-block + image-block + tables(block_label="table")产
+ParseResult,**不**接管路由(routing 仍由 `_parse_pdf` 负责)。
 """
 from __future__ import annotations
 
@@ -400,7 +404,163 @@ def _normalize_headings(text: str) -> str:
         return text
 
 
-# ── PDF 降级：pdfplumber 流式逐页 ───────────────────────────────────────────────
+# ── PyMuPDF 文本层解析（issue #99/#105）──────────────────────────────────────────
+
+
+def _pymupdf_parse(file_path: str) -> ParseResult:
+    """PyMuPDF 文本层 PDF 解析(issue #99 主路径之一,PRD 来自 #105)。
+
+    关键陷阱(**PyMuPDF 文档示例不会告诉你**):``page.find_tables().tables[i].bbox``
+    是 4-tuple ``(x0, y0, x1, y1)``——**不是** ``fitz.Rect``。原 subagent 代码曾用
+    ``tb.x0`` 被 silent ``except: pass`` 吞掉 → emit 0 table blocks。
+    本实现直接读取 4-tuple。
+
+    异常:损坏 / 加密 PDF 时 PyMuPDF 自身抛 ``pymupdf.FileDataError`` /
+    ``pymupdf.FilePasswordError``——**不在此函数内 swallow**,让路由层决定
+    fallback / 报错(pymupdf 自身已经抛得足够清晰)。
+
+    坐标系:bbox / polygon 以归一化坐标 ``[x/W, y/H, x/W, y/H]`` 存储(0-1)。
+    """
+    try:
+        import pymupdf
+    except ImportError:
+        # 没有 wheel → 抛清晰错误,让上层看到
+        raise RuntimeError(
+            "pymupdf wheel not installed; install pymupdf==1.28.0 to use "
+            "_pymupdf_parse (see issue #99 / #105)"
+        )
+
+    by_page: list[PageText] = []
+    layouts: list[PageLayout] = []
+    full_text_parts: list[str] = []
+    block_order = 0  # 跨页单调递增
+
+    with pymupdf.open(file_path) as doc:
+        for page_index, page in enumerate(doc):
+            W = float(page.rect.width)
+            H = float(page.rect.height)
+            page_text = page.get_text("text") or ""
+            by_page.append(PageText(page=page_index, text=page_text))
+            if page_text:
+                full_text_parts.append(page_text)
+
+            blocks = _pymupdf_page_blocks(page, W, H, block_order)
+            layouts.append(PageLayout(
+                page=page_index,
+                width=int(W),
+                height=int(H),
+                blocks=blocks,
+            ))
+            block_order += len(blocks)
+
+    full_text = "\n\n".join(full_text_parts)
+    if full_text:
+        full_text = _normalize_headings(full_text)
+    return ParseResult(by_page=by_page, full_text=full_text, layout=layouts)
+
+
+def _pymupdf_page_blocks(
+    page, W: float, H: float, start_order: int
+) -> list[Block]:
+    """单页 PyMuPDF → ``Block[]``(text + image + table,单页内 block_order 从
+    ``start_order`` 起递增)。
+
+    顺序:text(``get_text("dict")`` 中的 type=0)+ image(同 type=1),按 PDF 源顺序;
+    之后 tables(``find_tables().tables``)按检测顺序追加在文本/图像 blocks 之后。
+    跨多页时,block_order 连续递增(上游 ``_pymupdf_parse`` 在 page 间累加)。
+    """
+    blocks: list[Block] = []
+    if not (W > 0 and H > 0):
+        return blocks
+
+    # ── text + image:``page.get_text("dict")`` 给出 PDF 源顺序的 layout ─────────
+    # 注意:**不**在这里 swallow 异常——issue #105 明确要求"Pymupdf 抛异常不在
+    # 函数内 swallow,让调用方决定"。只有上游 ``pymupdf.open()`` 失败不在此 catch。
+    page_dict = page.get_text("dict")
+
+    block_order = start_order
+    for raw in page_dict.get("blocks", []) or []:
+        btype = raw.get("type", 0)
+        bbox = _coerce_bbox(raw.get("bbox"))
+        if len(bbox) != 4:
+            continue
+        norm_bbox, polygon_norm = _norm_bbox_polygon(bbox, W, H)
+
+        if btype == 1:
+            # image block:内容字段写 "[image]" 标记(与 PaddleOCR image block 兼容)
+            blocks.append(Block(
+                block_label="image",
+                block_content="[image]",
+                bbox_norm=norm_bbox,
+                polygon_norm=polygon_norm,
+                block_order=block_order,
+            ))
+        else:
+            # text block:拼接所有 spans 的 text
+            text_chunks: list[str] = []
+            for line in raw.get("lines", []) or []:
+                for span in line.get("spans", []) or []:
+                    t = span.get("text")
+                    if t:
+                        text_chunks.append(t)
+            blocks.append(Block(
+                block_label="text",
+                block_content="".join(text_chunks),
+                bbox_norm=norm_bbox,
+                polygon_norm=polygon_norm,
+                block_order=block_order,
+            ))
+        block_order += 1
+
+    # ── tables:``find_tables().tables`` → 4-tuple bbox,**不是 fitz.Rect** ───────
+    # 同样不 swallow:PyMuPDF 抛任何异常都向上传,路由层决定 fallback。
+    for tbl in (page.find_tables().tables or []):
+        # ``tbl.bbox`` 是 ``(x0, y0, x1, y1)``;原 1-line bug 就是想抓
+        # ``.x0`` 被 ``AttributeError`` swallow。这里直接读 4-tuple。
+        table_bbox = _coerce_bbox(tbl.bbox)
+        if len(table_bbox) != 4:
+            continue
+        norm_bbox, polygon_norm = _norm_bbox_polygon(table_bbox, W, H)
+        # 把 cells 文本拼成 block_content(给下游 consumers 一个概览)
+        cell_parts: list[str] = []
+        for row in (tbl.cells or []):
+            row_vals: list[str] = []
+            if isinstance(row, (list, tuple)):
+                row_vals = [str(c) if c is not None else "" for c in row]
+            cell_parts.append(" | ".join(row_vals))
+        blocks.append(Block(
+            block_label="table",
+            block_content="\n".join(cell_parts),
+            bbox_norm=norm_bbox,
+            polygon_norm=polygon_norm,
+            block_order=block_order,
+        ))
+        block_order += 1
+
+    return blocks
+
+
+def _norm_bbox_polygon(
+    bbox, W: float, H: float
+) -> tuple[list[float], list[list[float]]]:
+    """bbox ``(x0, y0, x1, y1)`` → ``(bbox_norm 4-list, polygon_norm 4-corner)``。
+    坐标全部 clamp 到 ``[0,1]``(可能 page.cropbox > mediabox 时出现轻微越界)。
+    """
+    x0 = float(bbox[0]) / W
+    y0 = float(bbox[1]) / H
+    x1 = float(bbox[2]) / W
+    y1 = float(bbox[3]) / H
+    norm_bbox = [max(0.0, min(1.0, v)) for v in (x0, y0, x1, y1)]
+    polygon = [
+        [norm_bbox[0], norm_bbox[1]],
+        [norm_bbox[2], norm_bbox[1]],
+        [norm_bbox[2], norm_bbox[3]],
+        [norm_bbox[0], norm_bbox[3]],
+    ]
+    return norm_bbox, polygon
+
+
+# ── PDF 降级:pdfplumber 流式逐页 ───────────────────────────────────────────────
 
 
 def _pdf_fallback(file_path: str) -> ParseResult:
