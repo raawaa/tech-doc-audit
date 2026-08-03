@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import shutil
 
 from pathlib import Path
+from typing import Optional
 
 # 缓存根目录：项目 data/.cache/paddleocr/。模块级常量，方便测试 monkeypatch。
 _DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "data"))
@@ -73,10 +74,52 @@ def get_cached(file_path: str) -> Optional[dict]:
 def _paddleocr_currently_available() -> bool:
     """检查 PaddleOCR API 凭证当前是否配置。环境变量由 core.parse_document 维护,
     这里只读取,避免循环 import。
+
+    注：#99/05 删除 ``_pdf_fallback`` 后,``_paddleocr_currently_available`` 不再
+    驱动运行时分支(parse_document 直接跑 PaddleOCR 或抛 RuntimeError),仅作诊断
+    与历史 cache 条目来源识别用。
     """
     token = os.environ.get("PADDLEOCR_API_TOKEN", "").strip()
     url = os.environ.get("PADDLEOCR_API_URL", "").rstrip("/")
     return bool(token and url)
+
+
+# 缓存状态：给"不想真解析、只想知道会不会烧配额"的调用方（如批量重新解析的
+# OCR 成本预检）用。判定规则与 get_cached 同源 —— 历史 source=fallback_pdfplumber
+# 条目在 #99/05 后已被删除 V8 defense；这里仅识别"有无条目 + 版本一致 + JSON 可读"。
+CACHE_STATE_HIT = "cached"
+CACHE_STATE_MISS = "uncached"
+
+
+def cache_state_by_hash(content_hash: str, *, model_version: Optional[str] = None) -> str:
+    """按**已知的** ``content_hash`` 判断缓存状态，不重算文件哈希。
+
+    ``get_cached`` 从 ``file_path`` 现算 sha256；成本预检要对几百篇 doc 问同一个问题，
+    而哈希早已记在 ``doc.content_hash`` 上 —— 重算等于为了估算把整库 PDF 读一遍。
+
+    返回值（与 ``get_cached`` 的命中判定同源）：
+    - ``CACHE_STATE_MISS`` —— 无条目 / 条目损坏 / model_version 不符（``get_cached`` 同样返回 None）
+    - ``CACHE_STATE_HIT`` —— 条目存在且版本一致，**注意：此处不校验 ``file_hash``**
+      （调用方给的就是 doc 侧记录的哈希，无从比对文件内容）
+
+    注：``source`` 字段（``paddleocr`` / ``pymupdf`` / ``fallback_*``）不影响配额
+    判定 —— 真正决定是否烧 OCR 的是 ``parse_document`` 拿到结果后的链路，
+    不是预检阶段就能精确知道的。预检乐观地按"有缓存条目就当命中"，实测由 #110 收。
+    """
+    version = model_version or _MODEL_VERSION
+    if not content_hash:
+        return CACHE_STATE_MISS
+    path = CACHE_DIR / f"{content_hash}_{version}.json"
+    if not path.exists():
+        return CACHE_STATE_MISS
+    try:
+        entry = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        # 缓存损坏：get_cached 会降级为未命中并重解析，估算必须同口径
+        return CACHE_STATE_MISS
+    if entry.get("version") != version:
+        return CACHE_STATE_MISS
+    return CACHE_STATE_HIT
 
 
 def save_cached(

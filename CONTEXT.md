@@ -55,6 +55,12 @@
   _Avoid_: 把按页文本写在 `doc.metadata["page_texts"]` ——metadata 字段会随布局/坐标增长而膨胀，且无 schema。把 layout / bbox 数据也存在 `metadata` 里——一并放在 `pages_store` 下保持关注点分离。
 - **重新解析 (Reparse)** — 对单篇 KB 文档触发的一次性重建流程，入口 `POST /api/v1/kb-documents/{doc_id}/reparse`。流程：`parse_document` → `pages_store.save_pages` → 重建向量索引 → 更新 `embedding_status`。状态机：``pending_index`` → ``indexing`` → ``embedded``，失败回 ``failed``。故意**不**自动迁移存量 KB 文档——OCR 配额由用户决定是否消耗，详见 `docs/adr/0004-kb-document-parse-pipeline.md`（取舍 1）。
   _Avoid_: 在代码里写"导入时自动全量 reparse 现有文档"——这是 ADR-0004 明确拒绝的取舍，会无声消耗 OCR 配额。
+- **批量重新解析 (Bulk Reparse)** — 对一个 KB 内全部**待重解析文档**触发的受控批量流程，是单篇**重新解析 (Reparse)** 之上的编排层：预检 → 确认 → 受控并发执行 → 终态统计。领域逻辑归属 `services/bulk_reparse_service.py`（目标选取 / 成本预检 / 页数上限分类 / 并发编排）；`scripts/bulk_reparse.py` 是它的**薄 CLI wrapper**，只负责 `.env` 加载、argparse 契约、终端渲染与退出码（0 全成功 / 1 有失败 / 2 dry-run 或取消）。与**重建索引 (rebuild_kb_index)** 的区别：后者只重建向量索引，不重新解析文档、不消耗 OCR 配额。
+  _Avoid_: 叫它"批量索引" / "reindex all"——会与 `POST /{kb_id}/reindex` 混淆，两者消耗的资源完全不同（一个烧 OCR 配额，一个不烧）。
+  _Avoid_: 在 CLI / API / 前端各写一份目标选取或成本估算——三条选取规则的第三条是 #93 复盘一整轮才补上的，第二份实现必然让它悄悄丢失。
+- **待重解析文档 (Reparse Target)** — 满足三条选取规则**任一**的 KB 文档：① 未向量化（`embedding_status != "embedded"`）；② 缺按页文本文件；③ 按页文本存在但 `layout == []`（历史的 `_pdf_fallback()` 假成功残留；`force` 模式绕过三条规则，整库皆为目标）。`force` 模式绕过三条规则，整库皆为目标（换解析器后的整库重建入口）。
+- **OCR 成本预检 (Preflight)** — 批量重新解析触发前的**无副作用**估算：命中 / 未命中缓存的篇数与页数、超单文件页数上限（`PAGE_LIMIT = 100`，issue #87）的清单。命中判定只有一份实现 —— `core.paddleocr_cache.cache_state_by_hash()`（按 `doc.content_hash` 查，不重算文件哈希），与 `get_cached` 同口径：条目损坏或 model_version 不符算未命中。历史 `source=fallback_pdfplumber` 条目按命中计（#99/05 后 V8 cache defense 已删除，运维清理是单独工单）。
+  _Avoid_: 只探测缓存文件是否存在就报"命中"——会让清单与统计自相矛盾。
 
 ## 跨层坐标语义
 
