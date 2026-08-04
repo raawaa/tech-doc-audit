@@ -12,22 +12,25 @@
 3. **页数上限分类** —— 超 ``PAGE_LIMIT`` 的文档会被解析器服务端截断（issue #87
    决议），预检里作为警告呈现、实际 run 里进 ``skipped``。
 4. **受控并发编排** —— 线程池限流 + 单篇轮询超时，单篇失败不中断整批。
-5. **实测 OCR 消耗计数与报告持久化**（issue #110）—— 跑完每篇回读它的缓存条目
-   ``source``，按"真烧配额 / 缓存命中 / 非 OCR 来源"分桶；预检估算与实测值并列
-   写进 ``data/kbs/{kb_id}/bulk_reparse_report.json``。
+5. **KB 级检索状态** —— 整批期间把 KB 按在 ``building``，终态末尾写一次
+   （issue #109，见 ``_KbIndexStatus``）。批量下单篇入口以
+   ``caller_manages_kb_status=True`` 调用，不再各写各的。
+6. **实测 OCR 消耗计数与报告持久化**（issue #110）—— 跑前取缓存条目快照，
+   跑完每篇按 ``paddleocr / cache_hit / 非 OCR 来源 / unknown`` 分桶，预检
+   估算与实测值并列写进 ``data/kbs/{kb_id}/bulk_reparse_report.json``。
 
 为什么在 service 而不是 CLI（issue #108 的全部动机）：三条选取规则里的第三条
 （``layout == []`` 兜底）是 #93 复盘一整轮才加上的，**只要它有第二份实现就必然分叉**。
 CLI (``scripts/bulk_reparse.py``) 与后续的 HTTP API 共用本模块，唯一实现、唯一语义。
 
-KB 级 ``index_status`` 语义修正（#109）与 HTTP 端点（#111）仍不在这里。
+HTTP 端点（#111）不在这里，后续 ticket 在此基础上加。
 """
 from __future__ import annotations
 
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
 from typing import Callable, Mapping, Optional, Sequence
 
 import storage.doc_repo as doc_repo
@@ -71,6 +74,9 @@ REASON_FORCED = "forced"
 
 # 跳过原因。
 SKIP_REASON_PAGE_LIMIT = "page_limit"
+
+# 失败摘要里最多点名几篇（``index_current_doc`` 是要给人看的一行字，不是日志）。
+_MAX_SUMMARY_ITEMS = 3
 
 # 实测 OCR 消耗的两个**非解析器**分桶名（其余分桶名直接就是缓存条目的 ``source``：
 # ``paddleocr`` / ``pymupdf`` / ``fallback_*``）。
@@ -149,8 +155,9 @@ class DocParseUsage:
 class ActualOcrUsage:
     """一次批量运行的**实测** OCR 消耗，按解析来源分桶。
 
-    只统计**成功完成**的文档 —— 失败篇的来源仍单独记在报告的 failed 明细里，
-    但不进配额账，避免把"跑了一半炸了"的页数当成确定支出。
+    成功篇按 ``source`` 落入对应桶；失败篇入显式 ``"failed"`` 桶（页数归零）——
+    不入这一桶就会让"预估 X、实际 X 篇 done 但 0 页 OCR"这种"claim 满但 burn
+    零"的指纹（正是 #90 那类）凭空消失。失败原因仍单独记在报告的 failed 明细里。
     """
 
     pages_by_source: dict[str, int] = field(default_factory=dict)
@@ -321,7 +328,11 @@ def _as_skipped(target: ReparseTarget) -> SkippedDoc:
 
 
 def reparse_one(
-    kb_id: str, doc: KBDocument, *, timeout_s: float = PER_DOC_TIMEOUT_S
+    kb_id: str,
+    doc: KBDocument,
+    *,
+    timeout_s: float = PER_DOC_TIMEOUT_S,
+    caller_manages_kb_status: bool = False,
 ) -> tuple[str, str]:
     """对一篇文档触发重新解析并等待终态。返回 ``(doc_id, outcome)``。
 
@@ -330,9 +341,12 @@ def reparse_one(
     读 —— ``reparse_service._mark_failed`` 写在那里），否则批量报告的 failed
     明细只剩光秃秃的 "failed" 串，根本看不出是 parse 挂了、layout 空了、还是
     索引写失败。同步 ``reparse_document()`` 抛异常仍走 ``"raised:<err>"`` 路径。
+
+    ``caller_manages_kb_status`` 原样透传给 ``reparse_document``：批量编排下必须为
+    ``True``，否则单篇一完成就把 KB 写回 ``searchable``（见 ``_KbIndexStatus``）。
     """
     try:
-        reparse_document(doc.id)  # 立即返回；后台线程执行
+        reparse_document(doc.id, caller_manages_kb_status=caller_manages_kb_status)
     except Exception as e:
         return (doc.id, f"raised:{type(e).__name__}:{e}")
 
@@ -364,6 +378,106 @@ def _wait_for_terminal(kb_id: str, doc_id: str, timeout_s: float) -> str:
     return "timeout"
 
 
+# ── 5) KB 级检索状态：批次期间的唯一写入者 ─────────────────────────────────────
+
+
+class _KbIndexStatus:
+    """一次批量运行期间 KB 级检索状态的**唯一写入者**（issue #109）。
+
+    契约三句话：
+
+    1. 批次开头写一次 ``building`` + ``index_progress=0``；
+    2. 期间只推进 ``index_progress``（``done/total``，单调不减）与
+       ``index_current_doc``（在飞文档名），``index_status`` 恒为 ``building``；
+    3. 批次末尾写一次终态 —— 全部完成 → ``searchable``；有任何一篇没完成 →
+       ``failed`` + 一行人能读懂的失败摘要。
+
+    为什么中途一次 ``searchable`` 都不许有：按 ``CONTEXT.md`` 的定义，
+    ``searchable`` 表示"该库**此刻**可被向量检索"，批量重解析进行到一半时
+    这句话不成立。而且前端 ``KnowledgeBaseDetail.tsx`` 以
+    ``index_status === "building"`` 为轮询续订的唯一条件，抖动会让它反复
+    停轮询又重启，进度条彻底不可信（#93 实测 154 篇抖动上百次）。
+
+    因此单篇入口在批量下必须以 ``caller_manages_kb_status=True`` 调用。
+    ``index_current_doc`` 在并发 > 1 时是"最近开跑的那一篇"（后写覆盖前写），
+    不试图表达"同时在飞的 N 篇"—— 这个字段只有一个槽位。
+    """
+
+    def __init__(self, kb_id: str, total: int) -> None:
+        self._kb_id = kb_id
+        self._total = total
+        self._lock = threading.Lock()
+        self._progress = 0.0
+
+    def begin(self) -> None:
+        self._write(status="building", progress=0.0, current_doc="")
+
+    def note_in_flight(self, doc: KBDocument) -> None:
+        self._write(current_doc=doc.original_name)
+
+    def advance(self, completed: int) -> None:
+        self._write(progress=completed / self._total if self._total else 1.0)
+
+    def finish(
+        self, failed: Sequence[tuple[str, str]], *, interrupted: Optional[str] = None
+    ) -> None:
+        """写终态，整批只调用一次。``failed`` 是 ``(文档名, outcome)`` 列表。
+
+        ``interrupted`` 是编排层自身出事时的错误串（线程池崩溃 / Ctrl-C）：
+        批次没跑完，但 KB 更不能永远卡在 ``building`` —— 前端会一直轮询一个
+        永不落地的批次。落 ``failed`` 并说明中断原因。
+        """
+        if interrupted is not None:
+            self._write(
+                status="failed", progress=1.0,
+                current_doc=f"批量重新解析中断: {interrupted}",
+            )
+        elif failed:
+            self._write(
+                status="failed", progress=1.0,
+                current_doc=_failure_summary(failed, self._total),
+            )
+        else:
+            self._write(status="searchable", progress=1.0, current_doc="")
+
+    def _write(
+        self,
+        *,
+        status: Optional[str] = None,
+        progress: Optional[float] = None,
+        current_doc: Optional[str] = None,
+    ) -> None:
+        """读—改—写一次 KB 元数据；只覆盖显式给出的字段。
+
+        锁住整个读—改—写：``kb_repo.update`` 落的是整个对象，没有锁的话
+        两个线程各自读到旧值再写回，后写的会把前一次的进度抹掉。
+        """
+        with self._lock:
+            if progress is not None:
+                # 单调不减：并发下完成回调乱序也不许让进度倒退
+                progress = max(self._progress, progress)
+                self._progress = progress
+            kb = kb_repo.get(self._kb_id)
+            if kb is None:
+                return
+            if status is not None:
+                kb.index_status = status
+            if progress is not None:
+                kb.index_progress = progress
+            if current_doc is not None:
+                kb.index_current_doc = current_doc
+            kb_repo.update(kb)
+
+
+def _failure_summary(failed: Sequence[tuple[str, str]], total: int) -> str:
+    """把失败清单压成一行给人看的摘要，写进 ``index_current_doc``。"""
+    shown = "；".join(
+        f"{name}: {outcome}" for name, outcome in failed[:_MAX_SUMMARY_ITEMS]
+    )
+    more = " 等" if len(failed) > _MAX_SUMMARY_ITEMS else ""
+    return f"批量重新解析失败 {len(failed)}/{total} 篇（{shown}{more}）"
+
+
 def run_bulk_reparse(
     kb_id: str,
     targets: Sequence[ReparseTarget],
@@ -378,7 +492,8 @@ def run_bulk_reparse(
     - 超 ``PAGE_LIMIT`` 的文档不触发，直接进 ``skipped``（带原因）。
     - 单篇失败 / 超时 / 抛异常都只记账，不中断整批。
     - 每篇跑完立刻回读它的解析来源，进 run log 也进实测分桶（#110）。
-    - ``on_doc_complete(completed, total, doc, outcome)`` 逐篇回调，供调用方渲染进度。
+    - 整批期间 KB 被按在 ``building``，终态在末尾写一次（见 ``_KbIndexStatus``）。
+      没有任何可跑的目标时一个字都不写 —— 什么都没发生，不该改写 KB 状态。
     - ``forced`` 只是报告里的一个字段（这批是不是 ``--force`` 跑的），不影响执行。
 
     并发用线程池限流（信号量等价物）；KB 级 RLock 会自然序列化索引写入。
@@ -397,41 +512,57 @@ def run_bulk_reparse(
 
     done: list[str] = []
     failed: list[tuple[str, str]] = []
+    failed_labels: list[tuple[str, str]] = []
     doc_usages: list[DocParseUsage] = []
 
     if total:
+        status = _KbIndexStatus(kb_id, total)
+        status.begin()
+
+        def _run_one(doc: KBDocument) -> tuple[str, str]:
+            status.note_in_flight(doc)
+            return reparse_one(
+                kb_id, doc, timeout_s=timeout_s, caller_manages_kb_status=True
+            )
+
         with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-            futures = {
-                pool.submit(reparse_one, kb_id, t.doc, timeout_s=timeout_s): t
-                for t in runnable
-            }
-            for completed, (fut, target) in enumerate(futures.items(), start=1):
-                doc = target.doc
-                try:
-                    _doc_id, outcome = fut.result()
-                except Exception as e:  # 线程池自身异常：仍然记账，不炸整批
-                    outcome = f"raised:{type(e).__name__}:{e}"
+            futures = {pool.submit(_run_one, t.doc): t for t in runnable}
+            try:
+                for completed, (fut, target) in enumerate(futures.items(), start=1):
+                    doc = target.doc
+                    try:
+                        _doc_id, outcome = fut.result()
+                    except Exception as e:  # 线程池自身异常：仍然记账，不炸整批
+                        outcome = f"raised:{type(e).__name__}:{e}"
 
-                succeeded = outcome == "embedded"
-                if succeeded:
-                    done.append(doc.id)
-                else:
-                    failed.append((doc.id, outcome))
+                    succeeded = outcome == "embedded"
+                    if succeeded:
+                        done.append(doc.id)
+                    else:
+                        failed.append((doc.id, outcome))
+                        failed_labels.append((doc.original_name, outcome))
 
-                usage = _measure_doc(
-                    kb_id, target,
-                    state_before=cached_before.get(doc.id, paddleocr_cache.CACHE_STATE_MISS),
-                    succeeded=succeeded,
-                )
-                doc_usages.append(usage)
+                    usage = _measure_doc(
+                        kb_id, target,
+                        state_before=cached_before.get(doc.id, paddleocr_cache.CACHE_STATE_MISS),
+                        succeeded=succeeded,
+                    )
+                    doc_usages.append(usage)
 
-                _logger.info(
-                    "bulk_reparse: [%d/%d] %s (%s) → %s [source=%s, pages=%d]",
-                    completed, total, doc.id, doc.original_name, outcome,
-                    usage.source, usage.pages,
-                )
-                if on_doc_complete is not None:
-                    on_doc_complete(completed, total, doc, outcome)
+                    _logger.info(
+                        "bulk_reparse: [%d/%d] %s (%s) → %s [source=%s, pages=%d]",
+                        completed, total, doc.id, doc.original_name, outcome,
+                        usage.source, usage.pages,
+                    )
+                    status.advance(completed)
+                    if on_doc_complete is not None:
+                        on_doc_complete(completed, total, doc, outcome)
+            except BaseException as e:
+                # 编排层自身出事（回调抛错 / Ctrl-C）：终态照落，绝不留 building。
+                status.finish(failed_labels, interrupted=f"{type(e).__name__}: {e}")
+                raise
+
+        status.finish(failed_labels)
 
     result = BulkReparseResult(
         kb_id=kb_id,
@@ -454,7 +585,7 @@ def run_bulk_reparse(
     )
 
 
-# ── 5) 实测 OCR 消耗计数（issue #110）─────────────────────────────────────────
+# ── 6) 实测 OCR 消耗计数（issue #110）─────────────────────────────────────────
 
 
 def _measure_doc(
@@ -523,7 +654,7 @@ def _aggregate_usage(doc_usages: Sequence[DocParseUsage]) -> ActualOcrUsage:
     return ActualOcrUsage(pages_by_source=pages_by_source, docs_by_source=docs_by_source)
 
 
-# ── 6) 批量重新解析报告（issue #110）──────────────────────────────────────────
+# ── 7) 批量重新解析报告（issue #110）──────────────────────────────────────────
 
 
 def build_report(

@@ -6,6 +6,9 @@
 设计上：
 - 立即返回（异步）；后台任务在 KB 级锁内执行，避免与重建索引混线。
 - 任何步骤失败 → ``embedding_status=failed`` + ``index_current_doc`` 写错误信息（沿用现有契约）。
+- ``caller_manages_kb_status=True`` 时**完全不碰** KB 级检索状态，交给调用方
+  （批量重新解析编排层）在批次首尾各写一次 —— 避免整批期间反复宣称
+  ``searchable``（issue #109 / #93 抖动症状）。默认关闭，单篇入口行为不变。
 - 完整逆向兼容：老 ``page_texts`` 路径仍在 ``import_document`` 里；reparse 走新路径。
 """
 from __future__ import annotations
@@ -27,8 +30,16 @@ import storage.kb_repo as kb_repo
 _logger = get_logger(__name__)
 
 
-def reparse_document(doc_id: str) -> dict:
+def reparse_document(doc_id: str, *, caller_manages_kb_status: bool = False) -> dict:
     """同步启动重新解析的 KB 文档。立即返回 status=pending_index；后台任务执行。
+
+    Args:
+        caller_manages_kb_status: 打开后本次重解析**完全不碰** KB 级检索状态
+            （``index_status`` / ``index_progress`` / ``index_current_doc``），
+            由调用方负责在合适的时机写。批量重新解析
+            （``services.bulk_reparse_service``）用它把 KB 按住在 ``building``；
+            默认关闭，per-doc API 端点与单篇 UI 按钮的行为不变。
+            注意：doc 级 ``embedding_status`` 无论开关如何都照常写。
 
     Returns:
         ``{"status": "pending_index", "doc_id": "..."}`` 表示已调度。
@@ -46,6 +57,7 @@ def reparse_document(doc_id: str) -> dict:
     thread = threading.Thread(
         target=_reparse_async,
         args=(doc.kb_id, doc_id),
+        kwargs={"caller_manages_kb_status": caller_manages_kb_status},
         daemon=True,
     )
     thread.start()
@@ -53,21 +65,27 @@ def reparse_document(doc_id: str) -> dict:
     return {"status": "pending_index", "doc_id": doc_id}
 
 
-def _reparse_async(kb_id: str, doc_id: str) -> None:
+def _reparse_async(
+    kb_id: str, doc_id: str, *, caller_manages_kb_status: bool = False
+) -> None:
     """后台执行：parse → save_pages → 重建索引 → 更新状态。"""
     doc = doc_repo.get_doc(kb_id, doc_id)
     if not doc or not doc.file_path:
-        _mark_failed(kb_id, doc_id, "doc or file_path missing")
+        _mark_failed(
+            kb_id, doc_id, "doc or file_path missing",
+            caller_manages_kb_status=caller_manages_kb_status,
+        )
         return
 
-    # 标记 KB building
+    # 标记 KB building（除非调用方托管 KB 状态）
     kb = kb_repo.get(kb_id)
     if not kb:
         return
-    kb.index_status = "building"
-    kb.index_progress = 0.0
-    kb.index_current_doc = doc.original_name
-    kb_repo.update(kb)
+    if not caller_manages_kb_status:
+        kb.index_status = "building"
+        kb.index_progress = 0.0
+        kb.index_current_doc = doc.original_name
+        kb_repo.update(kb)
 
     with _get_index_lock(kb_id):
         try:
@@ -107,12 +125,13 @@ def _reparse_async(kb_id: str, doc_id: str) -> None:
             doc.embedding_status = "embedded"
             doc_repo._save_doc_meta(doc)
 
-            fresh = kb_repo.get(kb_id)
-            if fresh is not None:
-                fresh.index_status = "searchable"
-                fresh.index_progress = 1.0
-                fresh.index_current_doc = ""
-                kb_repo.update(fresh)
+            if not caller_manages_kb_status:
+                fresh = kb_repo.get(kb_id)
+                if fresh is not None:
+                    fresh.index_status = "searchable"
+                    fresh.index_progress = 1.0
+                    fresh.index_current_doc = ""
+                    kb_repo.update(fresh)
 
             _logger.info(
                 "reparse: doc %s (%s) embedded %d chunks",
@@ -121,14 +140,22 @@ def _reparse_async(kb_id: str, doc_id: str) -> None:
             )
         except Exception as e:
             _logger.warning("reparse failed for doc %s: %s", doc_id, e)
-            _mark_failed(kb_id, doc_id, str(e))
+            _mark_failed(
+                kb_id, doc_id, str(e),
+                caller_manages_kb_status=caller_manages_kb_status,
+            )
 
 
-def _mark_failed(kb_id: str, doc_id: str, err: str) -> None:
+def _mark_failed(
+    kb_id: str, doc_id: str, err: str, *, caller_manages_kb_status: bool = False
+) -> None:
     doc = doc_repo.get_doc(kb_id, doc_id)
     if doc is not None:
         doc.embedding_status = "failed"
         doc_repo._save_doc_meta(doc)
+    if caller_manages_kb_status:
+        # 批量场景：单篇失败不代表整库失败，终态由编排层在批次末尾写一次。
+        return
     kb = kb_repo.get(kb_id)
     if kb is not None:
         kb.index_status = "failed"
