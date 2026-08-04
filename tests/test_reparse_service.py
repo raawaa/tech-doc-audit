@@ -223,3 +223,143 @@ def test_parse_document_raises_still_reaches_mark_failed(reparse_guard_kb, monke
     assert fake_kb.index_status == "failed"
     assert "simulated parse_document outage" in fake_kb.index_current_doc
     # doc_id 不在错误消息里（异常来自 parse_document 而非守卫），但应包含异常 msg
+
+
+# ── "调用方托管 KB 状态"模式（issue #109）───────────────────────────────────────
+#
+# 批量重新解析时，每篇完成都把 KB 写回 searchable 会让 KB 在整批期间
+# 在 building ⇄ searchable 之间抖动上百次（#93 实测），而"此刻可被向量检索"
+# 在批量跑到一半时根本不成立。修法是给单篇入口一个 opt-in 开关：
+# 打开后单篇**完全不碰** KB 级检索状态，由编排层在批次首尾各写一次。
+# 默认关闭 —— per-doc API 端点 / 单篇 UI 按钮的行为一个字都不变。
+
+
+def _good_parse_result() -> ParseResult:
+    """一份能走完整条成功路径的解析结果（三道守卫全过）。"""
+    return ParseResult(
+        by_page=[PageText(page=0, text="x" * 50)],
+        full_text="x" * 50,
+        layout=[PageLayout(page=0, blocks=[Block(block_order=0)])],
+    )
+
+
+def _run_reparse_with_mocked_repos(kb_id, doc_name, *, parse, **kwargs):
+    """在 mock 掉 kb_repo/doc_repo 的情况下同步跑 ``_reparse_async``。
+
+    返回 ``(fake_kb, fake_doc, mock_kb_repo)``，让断言既能看状态字段，
+    也能看"KB 到底被写过没有"（``update`` 调用次数）。
+    """
+    from unittest.mock import MagicMock, patch
+
+    fake_kb = MagicMock()
+    fake_kb.index_status = "searchable"
+    fake_kb.index_progress = 1.0
+    fake_kb.index_current_doc = ""
+    fake_doc = MagicMock()
+    fake_doc.embedding_status = "pending_index"
+    fake_doc.original_name = doc_name
+
+    patch_parse = (
+        patch("services.reparse_service.parse_document", side_effect=parse)
+        if callable(parse)
+        else patch("services.reparse_service.parse_document", return_value=parse)
+    )
+
+    with patch_parse, \
+         patch("services.reparse_service.save_pages"), \
+         patch("services.reparse_service.remove_document"), \
+         patch("services.reparse_service.index_document"), \
+         patch("services.reparse_service.kb_repo") as mock_kb_repo, \
+         patch("services.reparse_service.doc_repo") as mock_doc_repo:
+        mock_kb_repo.get.return_value = fake_kb
+        mock_doc_repo.get_doc.return_value = fake_doc
+
+        from services.reparse_service import _reparse_async
+        _reparse_async(kb_id, "doc_x", **kwargs)
+
+    return fake_kb, fake_doc, mock_kb_repo
+
+
+def test_default_mode_still_publishes_searchable_on_success(reparse_guard_kb):
+    """默认（未 opt-in）行为一个字不变：单篇成功仍把 KB 写回 searchable。
+
+    per-doc API 端点与单篇 UI 按钮走的就是这条路径 —— #109 只加开关，不改默认。
+    """
+    kb, doc = reparse_guard_kb
+
+    fake_kb, fake_doc, mock_kb_repo = _run_reparse_with_mocked_repos(
+        kb.id, doc.original_name, parse=_good_parse_result()
+    )
+
+    assert fake_doc.embedding_status == "embedded"
+    assert fake_kb.index_status == "searchable"
+    assert fake_kb.index_progress == 1.0
+    assert fake_kb.index_current_doc == ""
+    assert mock_kb_repo.update.called, "默认模式下单篇必须自己写 KB 状态"
+
+
+def test_caller_managed_mode_leaves_kb_status_untouched_on_success(reparse_guard_kb):
+    """opt-in 后单篇成功**不许**写 ``index_status="searchable"``（#93 抖动症状的源头）。
+
+    doc 级 ``embedding_status`` 照旧落 embedded —— 托管的只是 KB 级检索状态。
+    """
+    kb, doc = reparse_guard_kb
+
+    fake_kb, fake_doc, mock_kb_repo = _run_reparse_with_mocked_repos(
+        kb.id, doc.original_name,
+        parse=_good_parse_result(),
+        caller_manages_kb_status=True,
+    )
+
+    assert fake_doc.embedding_status == "embedded"
+    assert fake_kb.index_status == "searchable", "预置值未被改写 = 单篇没碰 KB"
+    mock_kb_repo.update.assert_not_called()
+
+
+def test_caller_managed_mode_leaves_kb_status_untouched_on_failure(reparse_guard_kb):
+    """opt-in 后单篇失败也不写 KB ``failed`` —— 终态由编排层在批次末尾写一次。
+
+    否则批次中间一篇失败就会把整库判死，而后面的篇数还在跑。
+    """
+    kb, doc = reparse_guard_kb
+
+    def _explode(*a, **k):
+        raise RuntimeError("simulated parse_document outage")
+
+    fake_kb, fake_doc, mock_kb_repo = _run_reparse_with_mocked_repos(
+        kb.id, doc.original_name,
+        parse=_explode,
+        caller_manages_kb_status=True,
+    )
+
+    assert fake_doc.embedding_status == "failed", "doc 级失败仍要如实记账"
+    assert fake_kb.index_status == "searchable", "预置值未被改写 = 单篇没碰 KB"
+    mock_kb_repo.update.assert_not_called()
+
+
+def test_reparse_document_forwards_caller_managed_mode_to_background_task(reparse_guard_kb):
+    """``reparse_document`` 是公开入口：开关必须透传到后台线程，否则形同虚设。"""
+    from unittest.mock import patch
+
+    kb, doc = reparse_guard_kb
+
+    with patch("services.reparse_service.threading.Thread") as mock_thread:
+        from services.reparse_service import reparse_document
+        reparse_document(doc.id, caller_manages_kb_status=True)
+
+    kwargs = mock_thread.call_args.kwargs
+    assert kwargs["kwargs"] == {"caller_manages_kb_status": True}
+    assert kwargs["args"] == (kb.id, doc.id)
+
+
+def test_reparse_document_defaults_to_self_managed_kb_status(reparse_guard_kb):
+    """不传开关 = 老行为（单篇自己管 KB 状态）。"""
+    from unittest.mock import patch
+
+    kb, doc = reparse_guard_kb
+
+    with patch("services.reparse_service.threading.Thread") as mock_thread:
+        from services.reparse_service import reparse_document
+        reparse_document(doc.id)
+
+    assert mock_thread.call_args.kwargs["kwargs"] == {"caller_manages_kb_status": False}
