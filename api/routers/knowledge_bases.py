@@ -1,12 +1,21 @@
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel
 from typing import Literal
 
 import services.kb_service as kb_svc
 import storage.doc_repo as doc_repo
+from core import bulk_reparse_report_store
 from core.logger import get_logger
+from services.bulk_reparse_service import (
+    DEFAULT_CONCURRENCY,
+    OcrCostEstimate,
+    cache_state,
+    estimate_ocr_cost,
+    list_target_docs,
+    run_bulk_reparse,
+)
 
 _logger = get_logger(__name__)
 
@@ -242,3 +251,192 @@ def delete_kb_document(kb_id: str, doc_id: str):
     if not success:
         raise HTTPException(status_code=404, detail="文档不存在")
     return {"message": "删除成功"}
+
+
+# ── 批量重新解析 (Bulk Reparse) — issue #111 ──────────────────────────────────
+#
+# 把一次性脚本 ``scripts/bulk_reparse.py`` 升级为产品入口。三个端点：
+#   - GET  /bulk-reparse/preflight?force=...  — 无副作用 dry-run
+#   - POST /bulk-reparse                       — 异步触发（接受 concurrency / force）
+#   - GET  /bulk-reparse/report                — 上次运行的报告
+#
+# 三条选取规则与成本估算只有一份实现（``services.bulk_reparse_service``），
+# CLI 与 API 共用。KB 状态机由 ``run_bulk_reparse`` 内的 ``_KbIndexStatus``
+# 统一接管，HTTP 层只做"已 building 则 409"这一道关卡 —— reindex 端点也复用
+# 同一字段，互斥天然成立。
+
+
+class BulkReparsePreflightResponse(BaseModel):
+    """预检返回：无副作用 dry-run 的成本估算 + 每篇入选原因。"""
+
+    kb_id: str
+    force: bool
+    target_count: int
+    cached_docs: int
+    uncached_docs: int
+    # 历史 ``source=fallback_pdfplumber`` 条目（V8 cache defense 标的"污染"）
+    # 在 #99/05 后不再判废，按命中计费；这里仍独立列出，运维清理时方便点名。
+    polluted_cached_docs: int = 0
+    cached_pages: int
+    uncached_pages: int
+    estimated_ocr_pages: int
+    targets: list[dict]
+    over_page_limit: list[dict]
+
+
+class BulkReparseTriggerRequest(BaseModel):
+    concurrency: int = DEFAULT_CONCURRENCY
+    force: bool = False
+
+
+class BulkReparseTriggerResponse(BaseModel):
+    """202 响应：AC 明确要求"返回 202 时 KB 处于 ``building``"，把状态塞进响应体，
+    让客户端不必再发一次 GET 就能立即确认；同时携带目标数，便于 UI 立刻渲染。"""
+
+    kb_id: str
+    target_count: int
+    index_status: str = "building"
+
+
+def _build_preflight_payload(kb_id: str, *, force: bool) -> BulkReparsePreflightResponse:
+    """预检核心：选目标 + 估算成本，纯函数 + 无副作用（issue #111 AC 2）。"""
+    targets = list_target_docs(kb_id, force=force)
+    cost: OcrCostEstimate = estimate_ocr_cost(targets)
+    return BulkReparsePreflightResponse(
+        kb_id=kb_id,
+        force=force,
+        target_count=len(targets),
+        cached_docs=cost.cached,
+        uncached_docs=cost.uncached,
+        polluted_cached_docs=0,  # V8 cache defense 已删（#99/05），运维清理单独 ticket
+        cached_pages=cost.pages_cached,
+        uncached_pages=cost.pages_uncached,
+        # OCR 配额只烧在未命中 → 预估 OCR 页数 = 未命中页数
+        estimated_ocr_pages=cost.pages_uncached,
+        targets=[
+            {
+                "doc_id": t.doc.id,
+                "original_name": t.doc.original_name,
+                "page_count": t.estimated_page_count,
+                "reason": t.reason,
+                # ``cache_state(doc)`` 已直接返 ``"cached" | "uncached"`` —— 不再做中间换算。
+                "cache_state": cache_state(t.doc),
+            }
+            for t in targets
+        ],
+        over_page_limit=[
+            {
+                "doc_id": s.doc.id,
+                "original_name": s.doc.original_name,
+                "page_count": s.page_count,
+                "reason": s.reason,
+            }
+            for s in cost.over_page_limit
+        ],
+    )
+
+
+@router.get(
+    "/{kb_id}/bulk-reparse/preflight",
+    response_model=BulkReparsePreflightResponse,
+)
+def bulk_reparse_preflight(kb_id: str, force: bool = Query(False)):
+    """批量重新解析预检 —— 无副作用 dry-run（spec #102 story 6）。
+
+    保证零副作用的边界：仅调用 ``list_target_docs`` + ``estimate_ocr_cost``，
+    两者只读 ``doc_repo`` / ``pages_store`` / ``paddleocr_cache``，不触发解析、
+    不写 pages/、不写缓存。AC 2 由 ``tests/test_api_bulk_reparse.py::test_preflight_has_zero_side_effects``
+    + ``..._does_not_invoke_parse_document`` 双向验证。
+    """
+    kb = kb_svc.get_kb(kb_id)
+    if kb is None:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    return _build_preflight_payload(kb_id, force=force)
+
+
+@router.post(
+    "/{kb_id}/bulk-reparse",
+    response_model=BulkReparseTriggerResponse,
+    status_code=202,
+)
+def bulk_reparse_trigger(
+    kb_id: str,
+    req: BulkReparseTriggerRequest = Body(default_factory=BulkReparseTriggerRequest),
+):
+    """触发一次批量重新解析 —— 异步执行，立即返回 202。
+
+    互斥由 ``kb.index_status == "building"`` 统一守门（spec #102 story 17/18）：
+    reindex 与 bulk 共享同一字段，in-flight 任一边都会挡住另一边，无需新 mutex。
+
+    KB 状态由 ``run_bulk_reparse`` 内部的 ``_KbIndexStatus`` 统一接管（issue #109）：
+    批次开头写一次 ``building``，期间只推 ``index_progress`` 与
+    ``index_current_doc``，末尾写一次终态。这里**预先**写一次 ``building`` 是
+    为了让紧跟的 GET 立刻看到 building，无需等线程调度 —— 与 reindex 端点同款。
+
+    **空批次短路**：没有可跑的目标（全被页数上限拦下 / 全 healthy）= 没发生
+    任何重解析，``run_bulk_reparse`` 的 ``if total:`` 分支根本不进，KB 状态
+    也不会被改写。若在这里也预写 building，KB 会**永远卡在 building** —— 前端
+    会一直轮询一个永不落地的批次，比触发失败更糟。直接返回 200（0 目标）即可。
+
+    Body 可省：缺省时 ``concurrency=DEFAULT_CONCURRENCY``、``force=False``；
+    前端从确认对话框直接 POST 即可，不必先序列化一份默认值。
+    """
+    kb = kb_svc.get_kb(kb_id)
+    if kb is None:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    if kb.index_status == "building":
+        raise HTTPException(status_code=409, detail="索引正在重建中")
+
+    # 算目标数（不缓存，spawn 后线程里也会再算；这里只是为了让响应携带这个数）
+    targets = list_target_docs(kb_id, force=req.force)
+
+    # 空批次：不预写 building、不 spawn 线程，run_bulk_reparse 自己也不会改 KB。
+    if not targets:
+        return BulkReparseTriggerResponse(
+            kb_id=kb_id, target_count=0, index_status=kb.index_status,
+        )
+
+    # 预写 building —— 让客户端 GET 立刻看到 building，reindex 互斥也立刻生效
+    kb.index_status = "building"
+    kb.index_progress = 0.0
+    kb.index_current_doc = ""
+    kb_svc.update_kb(kb)
+
+    def _run():
+        try:
+            run_bulk_reparse(
+                kb_id, targets,
+                concurrency=req.concurrency,
+                forced=req.force,
+            )
+        except Exception as e:
+            # 编排层自身抛错：把 KB 落在 failed 而不是让它永远卡在 building。
+            # （run_bulk_reparse 的 ``except BaseException`` 已经写过 failed；
+            # 这里是双保险 —— 比如线程根本没启起来 / 列表生成出错。）
+            fresh = kb_svc.get_kb(kb_id)
+            if fresh is not None and fresh.index_status == "building":
+                fresh.index_status = "failed"
+                fresh.index_current_doc = f"批量重新解析启动失败: {type(e).__name__}: {e}"
+                kb_svc.update_kb(fresh)
+
+    import threading
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    return BulkReparseTriggerResponse(
+        kb_id=kb_id,
+        target_count=len(targets),
+        index_status="building",
+    )
+
+
+@router.get("/{kb_id}/bulk-reparse/report")
+def bulk_reparse_report(kb_id: str):
+    """读取上一次批量运行的报告（#110 落盘的 JSON）；从未跑过 → 404。"""
+    kb = kb_svc.get_kb(kb_id)
+    if kb is None:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    report = bulk_reparse_report_store.load_report(kb_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="尚未运行过批量重新解析")
+    return report
