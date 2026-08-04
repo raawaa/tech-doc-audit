@@ -351,14 +351,41 @@ DATA_DIR = Path(
 )
 
 
+def _coerce_offset(offset: object) -> int:
+    """把 LLM 传来的 offset 归一化为非负 int。
+
+    LLM 可能给出 None（旧 session / 未填）、字符串、负数——一律退化为 0，
+    与"不传 offset"等价，不抛异常打断 agent loop。
+    """
+    try:
+        value = int(offset)
+    except (TypeError, ValueError):
+        return 0
+    return max(value, 0)
+
+
 def _tool_read_chapter(
     parsed_content: str,
     structure: DocumentStructure | None,
     chapter_index: int,
+    offset: int | str | None = 0,
 ) -> str:
-    """读取指定章节全文。"""
+    """读取指定章节全文，从 ``offset`` 起最多返回 ``CHAPTER_MAX_CHARS`` 字符。
+
+    Args:
+        parsed_content: 待审文档全文。
+        structure: 文档结构；缺失时退化为"全文"分支，同样支持翻页。
+        chapter_index: 章节序号，1 起算。
+        offset: 章节内起始字符位置（0 起算）。LLM 可能传 None/字符串/负数，
+            经 ``_coerce_offset`` 归一化。
+
+    Returns:
+        章节文本窗口。``offset`` 超出章节长度时返回"已读完"哨兵，
+        而非重复返回首页。
+    """
+    offset = _coerce_offset(offset)
     if not structure or not structure.chapters:
-        return _format_chapter_text(parsed_content[:CHAPTER_MAX_CHARS], 0, "全文")
+        return _format_chapter_text(parsed_content, chapter_index, "全文", offset)
 
     if chapter_index < 1 or chapter_index > len(structure.chapters):
         return f"章节序号 {chapter_index} 无效，文档共 {len(structure.chapters)} 章"
@@ -373,27 +400,66 @@ def _tool_read_chapter(
         label = f"第{chapter_index}章"
 
     text = _find_chapter_text(parsed_content, structure, chapter_index - 1)
-    return _format_chapter_text(text, chapter_index, label)
+    return _format_chapter_text(text, chapter_index, label, offset)
 
 
-def _format_chapter_text(text: str, index: int, label: str) -> str:
-    """格式化章节文本（截断提示）。"""
-    if not text:
-        return f"=== {label} ===\n（该章节无内容）"
+def _format_chapter_text(
+    text: str, chapter_index: int, label: str, offset: int = 0,
+) -> str:
+    """格式化章节文本（分页窗口 + 截断提示）。
 
+    调用方（``_tool_read_chapter``）已用 ``_coerce_offset`` 归一化 ``offset``。
+    offset > 0 时输出显式写明"请求的 offset"与"实际返回的字符区间"，两条 LLM
+    路径的工具结果都会进 trace（``data/audits/{doc_id}/tasks/traces/``），事后
+    据此确认 agent 是否真的翻了页。offset=0 时输出与加 offset 前逐字相同。
+
+    Args:
+        text: 章节原文（未截断）。
+        chapter_index: 章节序号（1 起算），仅用于在提示里回显可复用的调用示例。
+        label: 章节标签，取文档自带的章节名。
+        offset: 章节内起始字符位置（0 起算，非负 int）。
+
+    Returns:
+        供 LLM 阅读的章节文本：标签 + 窗口内容 +（必要时）翻页/已读完提示。
+    """
     header = f"=== {label} ==="
-    if len(text) <= CHAPTER_MAX_CHARS:
-        return f"{header}\n{text}"
+    if not text:
+        return f"{header}\n（该章节无内容）"
 
-    truncated = text[:CHAPTER_MAX_CHARS]
-    remaining = len(text) - CHAPTER_MAX_CHARS
+    if offset >= len(text):
+        return (
+            f"{header}\n（已读完本章节后续内容，无更多内容）\n"
+            f"（本次请求 offset={offset}，本章节共 {len(text)} 字符）"
+        )
+
+    window = text[offset:offset + CHAPTER_MAX_CHARS]
+    end = offset + len(window)
+
+    if offset == 0:
+        body = f"{header}\n{window}"
+    else:
+        body = (
+            f"{header}\n"
+            f"（本次请求 offset={offset}，实际返回第 {offset + 1}-{end} 字符"
+            f" / 本章节共 {len(text)} 字符）\n{window}"
+        )
+
+    if end >= len(text):
+        if offset == 0:
+            return body  # 单页放得下：与加 offset 前逐字相同
+        return f"{body}\n\n…（本章节到此结束，共 {len(text)} 字符）"
+
+    shown = (
+        f"前 {end} 字符" if offset == 0
+        else f"第 {offset + 1}-{end} 字符"
+    )
     return (
-        f"{header}\n{truncated}\n\n"
-        f"…（本段共 {len(text)} 字符，已显示前 {CHAPTER_MAX_CHARS} 字符，"
-        f"剩余约 {remaining} 字符。\n"
+        f"{body}\n\n"
+        f"…（本段共 {len(text)} 字符，已显示{shown}，"
+        f"剩余约 {len(text) - end} 字符。\n"
         f"提示：建议先对已显示内容中的技术关键词调用 search_kb/search_kb_text "
         f"查找标准进行审核，而非逐字通读全文。"
-        f"如确需继续阅读本章后续内容，请再次调用 read_chapter({index})）"
+        f"如确需继续阅读本章后续内容，请调用 read_chapter({chapter_index}, offset={end})）"
     )
 
 
@@ -680,222 +746,241 @@ def _build_result(
 # 原生 Function Calling 路径（DeepSeek thinking 模式）
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_TOOLS_SPEC = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_chapter",
-            "description": (
-                "读取文档指定章节的全文内容。当系统消息中显示的文档片段不足以审核目标章节时使用此工具。"
-                "返回的文本前会标注章节名称标签（=== 章节名 ===），内容最长显示4000字符。"
-                "若内容被截断，返回末尾会显示已读/剩余字符数；此时建议先用更精准的搜索词调用 search_kb "
-                "或 search_kb_text 获取对应标准进行审核，而非逐字通读全文。"
-                "不要使用本工具的情形：(1)系统消息中已包含该章节的足够内容；"
-                "(2)尚未对照 search_kb 结果审核当前可见内容就急于读更多章节；"
-                "(3)已知目标技术关键词时，应优先用 search_kb/search_kb_text 查找标准而非漫无目的地阅读。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "chapter_index": {
-                        "type": "integer",
-                        "description": (
-                            "章节序号，从1开始，对应文档结构列表中各章节的编号。"
-                            "例如，要读第3章则传3。如不确定序号，先查看系统消息中的文档结构列表。"
-                        ),
+def _build_tools_spec() -> list[dict]:
+    """构造 LLM 可见的 native function-calling 工具列表。
+
+    每次调用时重新构造，而非 import 时冻结：read_chapter 描述里的字数上限
+    从当前 ``CHAPTER_MAX_CHARS`` 插值，``.env`` 覆盖能真正流进 LLM 看到的
+    描述，不会像写死字面量那样再次漂移（#123）。
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_chapter",
+                "description": (
+                    "读取文档指定章节的全文内容。当系统消息中显示的文档片段不足以审核目标章节时使用此工具。"
+                    f"返回的文本前会标注章节名称标签（=== 章节名 ===），单次最多返回 {CHAPTER_MAX_CHARS} 字符。"
+                    "若内容被截断，返回末尾会显示已读/剩余字符数并给出下一段的 offset；"
+                    "需要继续读本章后续内容时，用同一 chapter_index 加上该 offset 再次调用（不带 offset 会返回同一段）。"
+                    "此时建议先用更精准的搜索词调用 search_kb "
+                    "或 search_kb_text 获取对应标准进行审核，而非逐字通读全文。"
+                    "不要使用本工具的情形：(1)系统消息中已包含该章节的足够内容；"
+                    "(2)尚未对照 search_kb 结果审核当前可见内容就急于读更多章节；"
+                    "(3)已知目标技术关键词时，应优先用 search_kb/search_kb_text 查找标准而非漫无目的地阅读。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "chapter_index": {
+                            "type": "integer",
+                            "description": (
+                                "章节序号，从1开始，对应文档结构列表中各章节的编号。"
+                                "例如，要读第3章则传3。如不确定序号，先查看系统消息中的文档结构列表。"
+                            ),
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": (
+                                "章节内的起始字符位置，从0开始，默认0（读本章开头）。"
+                                f"仅用于翻页读超长章节：上次调用被截断时，末尾提示中给出的 "
+                                f"offset 即为下一段起点（按 {CHAPTER_MAX_CHARS} 字符递进）。"
+                                "超过本章总字数时返回『已读完』提示。"
+                            ),
+                        },
                     },
+                    "required": ["chapter_index"],
                 },
-                "required": ["chapter_index"],
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_kb",
-            "description": (
-                "在知识库中进行语义向量搜索，查找与查询概念语义相近的标准规范条款。"
-                "适合搜索概念性、描述性的要求（如「质保期要求」、「验收标准」、「防水等级」），"
-                "能够匹配同义词和近义表达，但无法匹配精确的编号或代码。"
-                "返回结果按相关度降序排列，每条包含：【标准文档名称】、条款编号、相关度分数（0~1）、"
-                "以及该条款前500字符的内容。"
-                "与 search_kb_text 的区别：本工具使用语义向量匹配，能理解概念但返回较慢且不保证精确编号命中；"
-                "search_kb_text 使用 rga/rg 精确文本匹配，速度快、不占GPU，适合搜索标准编号（如GB/T 12345）"
-                "及专有名词（如IP65）。"
-                "不要使用本工具的情形：(1)搜索词是精确的标准编号/参数值/专有名词时，请改用 search_kb_text；"
-                "(2)已用同一关键词搜索过且相关度均低于0.3，应换词重搜而非重复相同查询；"
-                "(3)未从文档中提炼到具体技术关键词时。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "搜索关键词或概念描述，从文档当前章节中提取。"
-                            "示例：'质保期'、'防雷接地要求'、'验收标准'。"
-                            "不要输入完整句子，用2-5个词的关键词短语。"
-                        ),
+        {
+            "type": "function",
+            "function": {
+                "name": "search_kb",
+                "description": (
+                    "在知识库中进行语义向量搜索，查找与查询概念语义相近的标准规范条款。"
+                    "适合搜索概念性、描述性的要求（如「质保期要求」、「验收标准」、「防水等级」），"
+                    "能够匹配同义词和近义表达，但无法匹配精确的编号或代码。"
+                    "返回结果按相关度降序排列，每条包含：【标准文档名称】、条款编号、相关度分数（0~1）、"
+                    "以及该条款前500字符的内容。"
+                    "与 search_kb_text 的区别：本工具使用语义向量匹配，能理解概念但返回较慢且不保证精确编号命中；"
+                    "search_kb_text 使用 rga/rg 精确文本匹配，速度快、不占GPU，适合搜索标准编号（如GB/T 12345）"
+                    "及专有名词（如IP65）。"
+                    "不要使用本工具的情形：(1)搜索词是精确的标准编号/参数值/专有名词时，请改用 search_kb_text；"
+                    "(2)已用同一关键词搜索过且相关度均低于0.3，应换词重搜而非重复相同查询；"
+                    "(3)未从文档中提炼到具体技术关键词时。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "搜索关键词或概念描述，从文档当前章节中提取。"
+                                "示例：'质保期'、'防雷接地要求'、'验收标准'。"
+                                "不要输入完整句子，用2-5个词的关键词短语。"
+                            ),
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "description": (
+                                "返回结果数量，默认5。"
+                                "若前次搜索结果相关度过低（<0.3），可提升至8-10以扩大搜索范围。"
+                            ),
+                        },
                     },
-                    "top_k": {
-                        "type": "integer",
-                        "description": (
-                            "返回结果数量，默认5。"
-                            "若前次搜索结果相关度过低（<0.3），可提升至8-10以扩大搜索范围。"
-                        ),
-                    },
+                    "required": ["query"],
                 },
-                "required": ["query"],
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_kb_text",
-            "description": (
-                "在知识库中做精确关键词文本搜索（基于 rga/rg 全文检索，非语义匹配）。"
-                "适合搜索具体的标准编号（如GB/T 12345）、参数值（如3000m²、IP65、≥100dB）、"
-                "专有名词（如'镀锌钢管'、'环氧树脂'）等需要精确命中的术语。"
-                "速度快、不占用GPU，但无法匹配同义词或语义相近的表达——若搜索概念性要求"
-                "（如'防水要求'需要匹配'防渗'、'不透水'等），请改用 search_kb。"
-                "返回结果最多2000字符，格式为 rga/rg 的原始匹配行（含文件名、行号、上下文），"
-                "按文件分组显示匹配片段。"
-                "不要使用本工具的情形：(1)需要搜索概念性或描述性要求时，请用 search_kb；"
-                "(2)搜索词过于宽泛（如单个字'水'），会产生大量噪声结果；"
-                "(3)已用相同关键词搜索过且结果为空，应换用近义术语重搜。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "精确搜索关键词。示例：'GB/T 12345'、'IP65'、'3000m²'、'镀锌钢管'。"
-                            "输入具体的标准编号、参数值或专有术语，而非自然语言描述。"
-                        ),
+        {
+            "type": "function",
+            "function": {
+                "name": "search_kb_text",
+                "description": (
+                    "在知识库中做精确关键词文本搜索（基于 rga/rg 全文检索，非语义匹配）。"
+                    "适合搜索具体的标准编号（如GB/T 12345）、参数值（如3000m²、IP65、≥100dB）、"
+                    "专有名词（如'镀锌钢管'、'环氧树脂'）等需要精确命中的术语。"
+                    "速度快、不占用GPU，但无法匹配同义词或语义相近的表达——若搜索概念性要求"
+                    "（如'防水要求'需要匹配'防渗'、'不透水'等），请改用 search_kb。"
+                    "返回结果最多2000字符，格式为 rga/rg 的原始匹配行（含文件名、行号、上下文），"
+                    "按文件分组显示匹配片段。"
+                    "不要使用本工具的情形：(1)需要搜索概念性或描述性要求时，请用 search_kb；"
+                    "(2)搜索词过于宽泛（如单个字'水'），会产生大量噪声结果；"
+                    "(3)已用相同关键词搜索过且结果为空，应换用近义术语重搜。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "精确搜索关键词。示例：'GB/T 12345'、'IP65'、'3000m²'、'镀锌钢管'。"
+                                "输入具体的标准编号、参数值或专有术语，而非自然语言描述。"
+                            ),
+                        },
                     },
+                    "required": ["query"],
                 },
-                "required": ["query"],
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "flag_issue",
-            "description": (
-                "记录一个审核发现的问题。必须参数：issue_type（问题类型）、severity（严重程度）、"
-                "description（问题描述，应清晰说明文档何处不符合哪条标准）、"
-                "cited_excerpt（从文档原文逐字引用的证据）。"
-                "对于 compliance 类型（违反标准规定），调用前必须已用 search_kb 或 search_kb_text "
-                "获取了相关标准依据，standard_name 和 standard_clause 必须来自搜索结果。"
-                "对于 consistency（内部矛盾）、completeness（缺失必要内容）类型，"
-                "可在文档内容中直接发现，不强制要求外部标准引用。"
-                "强烈建议同时提供：document_position（引用所在的章节名称）、suggestion（修改建议）。"
-                "返回格式为'问题 #N 已记录'，其中N为累计问题编号。可多次调用以记录多个问题。"
-                "不要使用本工具的情形：(1)compliance 类型尚未搜索到相关标准依据时——请先调用 search_kb；"
-                "(2)问题描述模糊、无法指出具体条款时；(3)文档内容实际上合规，不要强行找问题。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "issue_type": {
-                        "type": "string",
-                        "enum": ["compliance", "completeness", "consistency",
-                                 "insufficient_evidence"],
-                        "description": (
-                            "问题类型：compliance=违反标准规定（如数值不达标、方法错误）；"
-                            "completeness=缺少标准要求的必要内容（如缺失质保期条款）；"
-                            "consistency=文档内部数据矛盾或与标准条文不一致；"
-                            "insufficient_evidence=证据不足以确定判断（如信息不完整无法判定合规性）"
-                        ),
+        {
+            "type": "function",
+            "function": {
+                "name": "flag_issue",
+                "description": (
+                    "记录一个审核发现的问题。必须参数：issue_type（问题类型）、severity（严重程度）、"
+                    "description（问题描述，应清晰说明文档何处不符合哪条标准）、"
+                    "cited_excerpt（从文档原文逐字引用的证据）。"
+                    "对于 compliance 类型（违反标准规定），调用前必须已用 search_kb 或 search_kb_text "
+                    "获取了相关标准依据，standard_name 和 standard_clause 必须来自搜索结果。"
+                    "对于 consistency（内部矛盾）、completeness（缺失必要内容）类型，"
+                    "可在文档内容中直接发现，不强制要求外部标准引用。"
+                    "强烈建议同时提供：document_position（引用所在的章节名称）、suggestion（修改建议）。"
+                    "返回格式为'问题 #N 已记录'，其中N为累计问题编号。可多次调用以记录多个问题。"
+                    "不要使用本工具的情形：(1)compliance 类型尚未搜索到相关标准依据时——请先调用 search_kb；"
+                    "(2)问题描述模糊、无法指出具体条款时；(3)文档内容实际上合规，不要强行找问题。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "issue_type": {
+                            "type": "string",
+                            "enum": ["compliance", "completeness", "consistency",
+                                     "insufficient_evidence"],
+                            "description": (
+                                "问题类型：compliance=违反标准规定（如数值不达标、方法错误）；"
+                                "completeness=缺少标准要求的必要内容（如缺失质保期条款）；"
+                                "consistency=文档内部数据矛盾或与标准条文不一致；"
+                                "insufficient_evidence=证据不足以确定判断（如信息不完整无法判定合规性）"
+                            ),
+                        },
+                        "severity": {
+                            "type": "string",
+                            "enum": ["high", "medium", "low"],
+                            "description": (
+                                "严重程度：high=可能导致项目失败或重大法律风险；"
+                                "medium=影响质量或增加成本风险；"
+                                "low=格式或表述瑕疵，不影响实质合规"
+                            ),
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": (
+                                "问题描述，清晰说明：文档中何处（章节/段落）存在什么问题，"
+                                "违反了哪条标准的哪项要求。"
+                                "示例：'第三章技术规格中IP防护等级仅标注IP54，"
+                                "而GB 4208-2008第5.1条要求室外设备不低于IP65。'"
+                            ),
+                        },
+                        "standard_name": {
+                            "type": "string",
+                            "description": (
+                                "标准文档名称，必须来自 search_kb 或 search_kb_text 返回结果中的"
+                                "【文档来源】字段。示例：'CJJ101-2016'、'GB/T 31462-2015'。"
+                                "不可自行编造标准编号。"
+                            ),
+                        },
+                        "standard_clause": {
+                            "type": "string",
+                            "description": (
+                                "标准条款编号，必须来自搜索结果中的'第X条'字段。示例：'3.2.1'、'5.4.2'。"
+                            ),
+                        },
+                        "standard_requirement": {
+                            "type": "string",
+                            "description": "标准条款的原文要求（从搜索结果中摘录）",
+                        },
+                        "cited_excerpt": {
+                            "type": "string",
+                            "description": (
+                                "从待审核文档中逐字引用的原文证据（必须原样复制，不可概括或改写）。"
+                                "示例：'设备防护等级不低于IP54'。"
+                                "这是证明问题存在的核心证据，请务必提供。"
+                            ),
+                        },
+                        "document_position": {
+                            "type": "string",
+                            "description": (
+                                "文档中引用原文所在的章节名称（使用文档实际的章节标题，不要用编号代替）。"
+                                "示例：'第三章 技术规格与参数要求'。"
+                            ),
+                        },
+                        "suggestion": {
+                            "type": "string",
+                            "description": (
+                                "具体的修改建议。"
+                                "示例：'将防护等级从IP54修改为不低于IP65，以满足GB 4208-2008室外设备要求。'"
+                            ),
+                        },
+                        "standard_doc_id": {
+                            "type": "string",
+                            "description": (
+                                "标准文档的 ID，从 search_kb 返回结果的 doc_id 字段获取。"
+                                "可选，但强烈建议提供——使审核结果可跳转到标准 PDF 原文。"
+                            ),
+                        },
+                        "standard_page_number": {
+                            "type": "integer",
+                            "description": (
+                                "标准条款所在页码，从 search_kb 返回结果的页码字段获取。"
+                                "从1开始计数。可选。"
+                            ),
+                        },
+                        "standard_chunk_text": {
+                            "type": "string",
+                            "description": (
+                                "标准条款的原文片段，从 search_kb 返回的内容中摘录。"
+                                "可选，用于在 PDF 中高亮定位。"
+                            ),
+                        },
                     },
-                    "severity": {
-                        "type": "string",
-                        "enum": ["high", "medium", "low"],
-                        "description": (
-                            "严重程度：high=可能导致项目失败或重大法律风险；"
-                            "medium=影响质量或增加成本风险；"
-                            "low=格式或表述瑕疵，不影响实质合规"
-                        ),
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": (
-                            "问题描述，清晰说明：文档中何处（章节/段落）存在什么问题，"
-                            "违反了哪条标准的哪项要求。"
-                            "示例：'第三章技术规格中IP防护等级仅标注IP54，"
-                            "而GB 4208-2008第5.1条要求室外设备不低于IP65。'"
-                        ),
-                    },
-                    "standard_name": {
-                        "type": "string",
-                        "description": (
-                            "标准文档名称，必须来自 search_kb 或 search_kb_text 返回结果中的"
-                            "【文档来源】字段。示例：'CJJ101-2016'、'GB/T 31462-2015'。"
-                            "不可自行编造标准编号。"
-                        ),
-                    },
-                    "standard_clause": {
-                        "type": "string",
-                        "description": (
-                            "标准条款编号，必须来自搜索结果中的'第X条'字段。示例：'3.2.1'、'5.4.2'。"
-                        ),
-                    },
-                    "standard_requirement": {
-                        "type": "string",
-                        "description": "标准条款的原文要求（从搜索结果中摘录）",
-                    },
-                    "cited_excerpt": {
-                        "type": "string",
-                        "description": (
-                            "从待审核文档中逐字引用的原文证据（必须原样复制，不可概括或改写）。"
-                            "示例：'设备防护等级不低于IP54'。"
-                            "这是证明问题存在的核心证据，请务必提供。"
-                        ),
-                    },
-                    "document_position": {
-                        "type": "string",
-                        "description": (
-                            "文档中引用原文所在的章节名称（使用文档实际的章节标题，不要用编号代替）。"
-                            "示例：'第三章 技术规格与参数要求'。"
-                        ),
-                    },
-                    "suggestion": {
-                        "type": "string",
-                        "description": (
-                            "具体的修改建议。"
-                            "示例：'将防护等级从IP54修改为不低于IP65，以满足GB 4208-2008室外设备要求。'"
-                        ),
-                    },
-                    "standard_doc_id": {
-                        "type": "string",
-                        "description": (
-                            "标准文档的 ID，从 search_kb 返回结果的 doc_id 字段获取。"
-                            "可选，但强烈建议提供——使审核结果可跳转到标准 PDF 原文。"
-                        ),
-                    },
-                    "standard_page_number": {
-                        "type": "integer",
-                        "description": (
-                            "标准条款所在页码，从 search_kb 返回结果的页码字段获取。"
-                            "从1开始计数。可选。"
-                        ),
-                    },
-                    "standard_chunk_text": {
-                        "type": "string",
-                        "description": (
-                            "标准条款的原文片段，从 search_kb 返回的内容中摘录。"
-                            "可选，用于在 PDF 中高亮定位。"
-                        ),
-                    },
+                    "required": ["issue_type", "severity", "description", "cited_excerpt"],
                 },
-                "required": ["issue_type", "severity", "description", "cited_excerpt"],
             },
         },
-    },
-]
+    ]
+
 
 NATIVE_SYSTEM_PROMPT = """你是一个严格的技术文档审核专家。你的任务是对照知识库中的标准规范，审核文档是否合规。
 你无法访问互联网或任何外部信息源，只能通过提供的工具搜索知识库中的标准文档。
@@ -972,6 +1057,7 @@ def _dispatch_tool(
         return _tool_read_chapter(
             parsed_content, structure,
             tool_args.get("chapter_index", 1),
+            tool_args.get("offset", 0),
         )
     elif tool_name == "search_kb":
         # 审核路径：宁可同步阻塞重建也不让向量质量不足（ADR-0002 §决策 3）
@@ -1038,7 +1124,7 @@ class NativeLLMStep:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
-            tools=_TOOLS_SPEC,
+            tools=_build_tools_spec(),
             extra_body={"thinking": {"type": "enabled"}},
         )
         msg = response.choices[0].message
@@ -1242,7 +1328,11 @@ def _safe_json_parse(s: str) -> dict:
 def _agent_action_to_args(action: AgentAction) -> dict:
     """将 AgentAction 字段映射为统一的 tool_calls args dict。"""
     if action.action == "read_chapter":
-        return {"chapter_index": action.chapter_index}
+        # chapter_offset 缺省（旧 session / 模型没填）→ 0，与 native 路径同义
+        return {
+            "chapter_index": action.chapter_index,
+            "offset": _coerce_offset(action.chapter_offset),
+        }
     elif action.action == "search_kb":
         return {"query": action.search_query, "top_k": action.search_top_k}
     elif action.action == "search_kb_text":

@@ -954,3 +954,292 @@ class TestBuildUserContent:
                 f"{fn.__name__} 仍含字符串字面量 {long_strings!r} — "
                 f"应只调用 _build_user_content"
             )
+
+
+# ── #123：read_chapter 加 offset 参数 + 描述里的字数上限从 CHAPTER_MAX_CHARS 插值 ──
+
+
+def _make_structure_with_long_chapter(text: str):
+    """构造只含一章、章节原文为 text 的 DocumentStructure（走 _find_chapter_text 策略 1）。"""
+    from models.audit_document import Chapter, DocumentStructure
+
+    return DocumentStructure(
+        title="长文档",
+        chapters=[
+            Chapter(number="一", title="概述", text="short"),
+            Chapter(number="二", title="技术规格", text=text),
+        ],
+        total_clauses=0,
+    )
+
+
+def _read_chapter_param_spec():
+    """从 native function-calling spec 中取出 read_chapter 的 function 定义。"""
+    from services.agentic_audit import _build_tools_spec
+
+    for t in _build_tools_spec():
+        if t["function"]["name"] == "read_chapter":
+            return t["function"]
+    raise AssertionError("read_chapter 不在 _build_tools_spec() 中")
+
+
+class TestReadChapterOffset:
+    """read_chapter 真正支持翻页：offset 参数 + 已读完哨兵。"""
+
+    def test_first_page_unchanged(self):
+        """offset 缺省 → 返回前 CHAPTER_MAX_CHARS 字符（行为不变）。"""
+        from services.agentic_audit import CHAPTER_MAX_CHARS, _tool_read_chapter
+
+        text = "甲" * 12000
+        structure = _make_structure_with_long_chapter(text)
+        out = _tool_read_chapter("", structure, 2)
+
+        assert out.startswith("=== 技术规格 ===")
+        assert text[:CHAPTER_MAX_CHARS] in out
+        assert text[:CHAPTER_MAX_CHARS + 1] not in out
+
+    def test_second_call_without_offset_is_identical(self):
+        """不带 offset 再次调用 → 逐字节相同（无隐藏游标）。"""
+        from services.agentic_audit import _tool_read_chapter
+
+        structure = _make_structure_with_long_chapter("甲" * 12000)
+        assert _tool_read_chapter("", structure, 2) == _tool_read_chapter("", structure, 2)
+
+    def test_offset_returns_requested_window(self):
+        """read_chapter(2, offset=N) → text[N : N + CHAPTER_MAX_CHARS]。"""
+        from services.agentic_audit import CHAPTER_MAX_CHARS, _tool_read_chapter
+
+        # 每个位置字符不同，便于断言窗口边界
+        text = "".join(chr(0x4E00 + i) for i in range(12000))  # 每个位置字符互不相同
+        structure = _make_structure_with_long_chapter(text)
+
+        out = _tool_read_chapter("", structure, 2, offset=1000)
+        expected = text[1000:1000 + CHAPTER_MAX_CHARS]
+        assert expected in out
+        assert text[999:1000 + CHAPTER_MAX_CHARS] not in out
+
+    def test_pages_cover_chapter_without_gap_or_overlap(self):
+        """offset 按 CHAPTER_MAX_CHARS 递进 → 无重叠无缺口地覆盖全章。"""
+        from services.agentic_audit import CHAPTER_MAX_CHARS, _tool_read_chapter
+
+        text = "".join(chr(0x4E00 + i) for i in range(12000))  # 每个位置字符互不相同
+        structure = _make_structure_with_long_chapter(text)
+
+        page1 = _tool_read_chapter("", structure, 2)
+        page2 = _tool_read_chapter("", structure, 2, offset=CHAPTER_MAX_CHARS)
+        assert text[:CHAPTER_MAX_CHARS] in page1
+        assert text[CHAPTER_MAX_CHARS:] in page2
+        # 无缺口：第二页从第一页的下一个字符接上
+        assert text[CHAPTER_MAX_CHARS:CHAPTER_MAX_CHARS + 5] in page2
+        # 无重叠：第一页末尾那个字符不出现在第二页开头
+        boundary = text[CHAPTER_MAX_CHARS - 1:CHAPTER_MAX_CHARS + 5]
+        assert boundary not in page2
+        # 无越界：第一页不含第二页的首字符起的片段
+        assert text[CHAPTER_MAX_CHARS:CHAPTER_MAX_CHARS + 5] not in page1
+
+    def test_offset_beyond_end_returns_sentinel(self):
+        """offset ≥ 章节长度 → 已读完哨兵，而不是重复返回首页。"""
+        from services.agentic_audit import _tool_read_chapter
+
+        structure = _make_structure_with_long_chapter("甲" * 12000)
+        out = _tool_read_chapter("", structure, 2, offset=20000)
+
+        assert "=== 技术规格 ===" in out
+        assert "已读完本章节后续内容，无更多内容" in out
+        assert "甲甲甲" not in out
+
+    def test_negative_and_non_int_offset_degrade_to_zero(self):
+        """LLM 传来脏 offset（负数 / 字符串 / None）→ 退化为 0，不抛异常。"""
+        from services.agentic_audit import _tool_read_chapter
+
+        structure = _make_structure_with_long_chapter("甲" * 12000)
+        baseline = _tool_read_chapter("", structure, 2)
+        for bad in (-5, None, "abc", ""):
+            assert _tool_read_chapter("", structure, 2, offset=bad) == baseline
+
+    def test_truncation_tail_hints_next_offset(self):
+        """截断提示给出可直接复用的下一页 offset（不再是原地踏步的『再次调用』）。"""
+        from services.agentic_audit import CHAPTER_MAX_CHARS, _tool_read_chapter
+
+        structure = _make_structure_with_long_chapter("甲" * 12000)
+        out = _tool_read_chapter("", structure, 2)
+        assert f"read_chapter(2, offset={CHAPTER_MAX_CHARS})" in out
+
+    def test_short_chapter_unaffected_by_offset_zero(self):
+        """章节短于上限时输出与改动前一致：仅标签 + 全文，无翻页噪音。"""
+        from services.agentic_audit import _tool_read_chapter
+
+        short = "短章节内容" * 40  # 200 字，> _find_chapter_text 策略 1 的 100 字门槛
+        structure = _make_structure_with_long_chapter(short)
+        assert _tool_read_chapter("", structure, 2) == f"=== 技术规格 ===\n{short}"
+
+    def test_no_structure_branch_paginates_full_text(self):
+        """无 structure 时按全文翻页，同样能读到 CHAPTER_MAX_CHARS 之后的内容。"""
+        from services.agentic_audit import CHAPTER_MAX_CHARS, _tool_read_chapter
+
+        text = "".join(chr(0x4E00 + i) for i in range(12000))  # 每个位置字符互不相同
+        out = _tool_read_chapter(text, None, 1, offset=CHAPTER_MAX_CHARS)
+        assert text[CHAPTER_MAX_CHARS:] in out
+
+
+class TestReadChapterOffsetAcrossPaths:
+    """native function calling 与 structured_llm 两条路径对同一 (chapter_index, offset) 等价。"""
+
+    def test_dispatch_reads_offset_from_tool_args(self):
+        from services.agentic_audit import CHAPTER_MAX_CHARS, _dispatch_tool, _tool_read_chapter
+
+        structure = _make_structure_with_long_chapter("甲" * 12000)
+        out = _dispatch_tool(
+            "read_chapter",
+            {"chapter_index": 2, "offset": CHAPTER_MAX_CHARS},
+            "", structure, [], "doc", [],
+        )
+        assert out == _tool_read_chapter("", structure, 2, offset=CHAPTER_MAX_CHARS)
+
+    def test_structured_action_maps_offset_to_same_args(self):
+        from models.llm_schemas import AgentAction
+        from services.agentic_audit import _agent_action_to_args
+
+        action = AgentAction(
+            thought="继续读第2章后半", action="read_chapter",
+            chapter_index=2, chapter_offset=8000,
+        )
+        assert _agent_action_to_args(action) == {"chapter_index": 2, "offset": 8000}
+
+    def test_structured_action_without_offset_defaults_to_zero(self):
+        """旧 session / 旧模型不填 offset → 默认 0，两条路径行为一致。"""
+        from models.llm_schemas import AgentAction
+        from services.agentic_audit import _agent_action_to_args
+
+        action = AgentAction(thought="读第2章", action="read_chapter", chapter_index=2)
+        assert _agent_action_to_args(action) == {"chapter_index": 2, "offset": 0}
+
+    def test_two_paths_produce_equivalent_output(self):
+        from models.llm_schemas import AgentAction
+        from services.agentic_audit import _agent_action_to_args, _dispatch_tool
+
+        structure = _make_structure_with_long_chapter("甲" * 12000)
+        native_args = {"chapter_index": 2, "offset": 4000}
+        structured_args = _agent_action_to_args(AgentAction(
+            thought="t", action="read_chapter", chapter_index=2, chapter_offset=4000,
+        ))
+        args = ("", structure, [], "doc", [])
+        assert _dispatch_tool("read_chapter", native_args, *args) == \
+            _dispatch_tool("read_chapter", structured_args, *args)
+
+    def test_fallback_parser_accepts_offset(self):
+        """降级 JSON 解析路径也接受 chapter_offset。"""
+        from services.agentic_audit import _parse_action_fallback
+
+        action = _parse_action_fallback(
+            '{"thought": "翻页", "action": "read_chapter", '
+            '"chapter_index": 2, "chapter_offset": 8000}'
+        )
+        assert action is not None
+        assert action.chapter_offset == 8000
+
+
+class TestReadChapterToolSpec:
+    """LLM 可见的 schema：offset 参数 + 字数上限从 CHAPTER_MAX_CHARS 插值。"""
+
+    def test_native_spec_declares_optional_offset(self):
+        props = _read_chapter_param_spec()["parameters"]["properties"]
+        assert "offset" in props
+        assert props["offset"]["type"] == "integer"
+        assert _read_chapter_param_spec()["parameters"]["required"] == ["chapter_index"]
+
+    def test_structured_schema_declares_optional_offset(self):
+        from models.llm_schemas import AgentAction
+
+        field = AgentAction.model_fields["chapter_offset"]
+        assert field.default in (0, None)
+        assert AgentAction(thought="t", action="read_chapter", chapter_index=1) is not None
+
+    def test_description_interpolates_current_limit(self):
+        from services.agentic_audit import CHAPTER_MAX_CHARS
+
+        desc = _read_chapter_param_spec()["description"]
+        assert str(CHAPTER_MAX_CHARS) in desc
+        assert "4000" not in desc  # 旧硬编码字面量
+
+    def test_description_follows_patched_limit(self):
+        """CHAPTER_MAX_CHARS 变化 → 描述里的数字跟着变（不再漂移）。"""
+        with patch("services.agentic_audit.CHAPTER_MAX_CHARS", 4000):
+            desc = _read_chapter_param_spec()["description"]
+        assert "4000" in desc
+        assert "8000" not in desc
+
+    def test_env_override_flows_into_description(self, monkeypatch):
+        """.env 里 CHAPTER_MAX_CHARS=4000 → settings 读到 4000 且渲染进描述。"""
+        import importlib
+
+        from core import settings as settings_mod
+
+        monkeypatch.setenv("CHAPTER_MAX_CHARS", "4000")
+        importlib.reload(settings_mod)
+        try:
+            assert settings_mod.CHAPTER_MAX_CHARS == 4000
+            with patch("services.agentic_audit.CHAPTER_MAX_CHARS", settings_mod.CHAPTER_MAX_CHARS):
+                assert "4000" in _read_chapter_param_spec()["description"]
+        finally:
+            monkeypatch.delenv("CHAPTER_MAX_CHARS", raising=False)
+            importlib.reload(settings_mod)
+        assert settings_mod.CHAPTER_MAX_CHARS == 8000
+
+    def test_native_step_uses_freshly_built_spec(self):
+        """NativeLLMStep 每轮用 _build_tools_spec() 构造，而非 import 时冻结的字面量。"""
+        import ast
+        import inspect
+
+        from services.agentic_audit import NativeLLMStep
+
+        src = inspect.getsource(NativeLLMStep.step)
+        assert "_build_tools_spec()" in src
+        ast.parse(src.lstrip())
+
+
+class TestReadChapterTrace:
+    """trace 需能证明翻页真的发生：请求 offset 与实际返回区间都落在消息里。"""
+
+    def teardown_method(self):
+        import services.agentic_audit as agentic
+        agentic._task_event_logs.clear()
+
+    @patch("services.agent_trace.save_trace")
+    def test_tool_message_records_offset_and_returned_slice(self, mock_save_trace):
+        from models.llm_schemas import Final, ToolCalls
+        from services.agentic_audit import CHAPTER_MAX_CHARS, run_agent_loop
+
+        structure = _make_structure_with_long_chapter("甲" * 12000)
+
+        class FakeStep:
+            def __init__(self):
+                self.results = [
+                    ToolCalls(calls=[{
+                        "name": "read_chapter",
+                        "args": {"chapter_index": 2, "offset": CHAPTER_MAX_CHARS},
+                        "id": "call_rc",
+                    }]),
+                    Final(answer="done"),
+                ]
+
+            def step(self, messages, emit):
+                return self.results.pop(0)
+
+        task = MagicMock(status="running")
+        with patch("storage.audit_task_repo.get_task", return_value=task):
+            out = run_agent_loop(
+                llm_step=FakeStep(),
+                initial_messages=[{"role": "system", "content": "test"}],
+                parsed_content="",
+                structure=structure, kb_ids=[], doc_name="t",
+                task_id="loop_offset", doc_id="d", max_turns=5,
+            )
+
+        tool_msgs = [m for m in out.messages if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        content = tool_msgs[0]["content"]
+        # 请求的 offset
+        assert f"offset={CHAPTER_MAX_CHARS}" in content
+        # 实际返回的区间（1-based 闭区间）
+        assert f"第 {CHAPTER_MAX_CHARS + 1}-12000 字符" in content

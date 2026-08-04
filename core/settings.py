@@ -197,7 +197,8 @@ def run_reranker(nodes: list, query_str: str, config: dict | None = None) -> lis
 # LLM prompt 拼接的字符阈值（agentic_audit.py 的 user prompt 拼接共用）
 # - PROMPT_FULL_THRESHOLD：文档全文长度 ≤ 该值时，初始 user prompt 嵌入全文；> 该值时改用预览+read_chapter 翻页
 # - PROMPT_PREVIEW_CHARS：> PROMPT_FULL_THRESHOLD 时，初始 user prompt 嵌入的预览字符数
-# - CHAPTER_MAX_CHARS：read_chapter 工具单次返回的章节文本上限（与 PROMPT_PREVIEW_CHARS 默认同值但语义独立）
+# - CHAPTER_MAX_CHARS：read_chapter 工具单次返回的章节文本上限，即章节翻页的页大小
+#   （agent 用 read_chapter(index, offset=N) 翻页，#123；该值也会插值进工具描述给 LLM 看）
 # 注意：PROMPT_FULL_THRESHOLD 设极低（如 0）会关掉预览+read_chapter 路径；调高 PROMPT_PREVIEW_CHARS 不影响 PROMPT_FULL_THRESHOLD 决策点
 PROMPT_FULL_THRESHOLD = int(os.environ.get("LLM_PROMPT_FULL_THRESHOLD", "30000"))
 PROMPT_PREVIEW_CHARS = int(os.environ.get("LLM_PROMPT_PREVIEW_CHARS", "8000"))

@@ -32,7 +32,13 @@ const severityColors: Record<string, string> = {
 }
 
 function formatToolArgs(tool: string, args: Record<string, unknown>): string {
-  if (tool === 'read_chapter') return `第 ${args.chapter_index} 章`
+  if (tool === 'read_chapter') {
+    // offset > 0 表示 agent 在翻页读超长章节（#123），标出起点便于人工追踪
+    const offset = Number(args.offset ?? 0)
+    return offset > 0
+      ? `第 ${args.chapter_index} 章 · 第 ${offset + 1} 字起`
+      : `第 ${args.chapter_index} 章`
+  }
   if (tool === 'search_kb') return `"${args.query}"`
   if (tool === 'flag_issue') return ''
   return ''

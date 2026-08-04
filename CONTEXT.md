@@ -20,7 +20,9 @@
 - **LLM prompt 字符阈值**（Wayfinder #114 / #119，由 `core.settings` 提供，`.env` 可覆盖；**单 provider 标量，无 provider 维度**）：
   - **`PROMPT_FULL_THRESHOLD`**（`LLM_PROMPT_FULL_THRESHOLD`，默认 30000）— 初始 user prompt 的全文/预览分支决策点：`len(parsed_content) ≤` 该值时嵌入文档全文，`>` 时改用预览+`read_chapter` 翻页。structured_llm 与 native function calling 两条路径共用 `_build_user_content()` 拼接模板。
   - **`PROMPT_PREVIEW_CHARS`**（`LLM_PROMPT_PREVIEW_CHARS`，默认 8000）— 走预览分支时，初始 user prompt 嵌入的字符数（`parsed_content[:PROMPT_PREVIEW_CHARS]`）。仅当 `>` `PROMPT_FULL_THRESHOLD` 时生效。
-  - **`CHAPTER_MAX_CHARS`**（`CHAPTER_MAX_CHARS`，默认 8000）— `read_chapter` 工具单次返回的章节文本上限（`_format_chapter_text`）。与 `PROMPT_PREVIEW_CHARS` 默认同值但语义独立——前者约束工具输出，后者约束初始 user prompt 嵌入量。
+  - **`CHAPTER_MAX_CHARS`**（`CHAPTER_MAX_CHARS`，默认 8000）— `read_chapter` 工具**单次返回**的章节文本上限（`_format_chapter_text`），即翻页的页大小。与 `PROMPT_PREVIEW_CHARS` 默认同值但语义独立——前者约束工具输出，后者约束初始 user prompt 嵌入量。该值同时被插值进 LLM 可见的工具描述（`_build_tools_spec()` 每轮重建，`.env` 覆盖直接流进描述，不会再像 #123 那样漂移成写死的"4000字符"）。
+  - **章节翻页 (Chapter Pagination)**（#123）— `read_chapter(chapter_index, offset=0)` 返回 `章节原文[offset : offset + CHAPTER_MAX_CHARS]`。被截断时末尾提示给出下一段的 `offset`；`offset ≥ 章节长度` 返回"已读完"哨兵。native function calling 的 `offset` 参数与 structured_llm 的 `AgentAction.chapter_offset` 同义，缺省均为 0（旧 session 不填也能工作）。工具结果里写明"本次请求 offset / 实际返回第 X-Y 字符"，落进 trace 后可确认翻页是否真的发生。
+    _Avoid_: 把 `CHAPTER_MAX_CHARS` 读成"每章能被审核到的字数上限"——加 offset 之前它确实是那个语义（后半章不可达），现在它只是页大小。
   - **值之间的依赖关系**：把 `PROMPT_FULL_THRESHOLD` 调到 ≤ `len(parsed_content)`（如设为 0）会关掉全文分支；把 `PROMPT_PREVIEW_CHARS` 调大/调小不影响分支决策点；`CHAPTER_MAX_CHARS` 与前两者无函数依赖，但调小会让 read_chapter 工具返回更短、需要更多轮翻页。
   - **现状值 30000/8000/8000** 对 deepseek 128K context 窗口极度保守——如需放宽，改 `.env` 即可观察试验，不必发版。
 

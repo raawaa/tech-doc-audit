@@ -98,6 +98,14 @@ class AgentAction(BaseModel):
             "示例：读第3章时传3"
         ),
     )
+    chapter_offset: Optional[int] = Field(
+        default=0,
+        description=(
+            "read_chapter: 章节内起始字符位置，从0开始，默认0（读本章开头）。"
+            "仅用于翻页读超长章节：上次返回被截断时，末尾提示中给出的 offset "
+            "即为下一段起点；不填等于重读同一段。"
+        ),
+    )
 
     # — search_kb / search_kb_text 共用参数 —
     search_query: Optional[str] = Field(
