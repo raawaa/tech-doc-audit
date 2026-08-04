@@ -1,8 +1,9 @@
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, Upload, FileText, RefreshCw, Trash2, Loader2, RotateCw } from 'lucide-react'
+import { useState } from 'react'
+import { ArrowLeft, Upload, FileText, RefreshCw, Trash2, Loader2, RotateCw, ListRestart } from 'lucide-react'
 import { toast } from 'sonner'
-import type { KBDocument } from '../api/types'
+import type { KBDocument, BulkReparsePreflight } from '../api/types'
 import { kbApi } from '../api/endpoints'
 import { Card, CardHeader, CardBody } from '../components/Card'
 import { Badge } from '../components/Badge'
@@ -11,10 +12,30 @@ const INDEXING_STATUSES = ['pending_index', 'indexing'] as const
 const isIndexingDoc = (d: KBDocument): boolean =>
   (INDEXING_STATUSES as readonly string[]).includes(d.embedding_status)
 
+// 把预检结果铺成 ``window.confirm`` 文案 —— 沿用 per-doc reparse 的形态，
+// 不引入新 UI 语言（spec #102 story 39）。数字必须来自预检，不能拍脑袋写。
+// AC #112 明确要求四项：目标篇数 / 未命中 / 预计 OCR / 超限跳过；其余信息不在
+// issue 授权范围内，不擅自加入对话框。
+const buildBulkReparseConfirmMessage = (p: BulkReparsePreflight): string => {
+  const lines: string[] = [
+    `目标文档：${p.target_count} 篇`,
+    `其中未命中缓存：${p.uncached_docs} 篇（将消耗约 ${p.estimated_ocr_pages} 页 OCR 配额）`,
+  ]
+  if (p.over_page_limit.length > 0) {
+    lines.push(`超页数上限将被跳过：${p.over_page_limit.length} 篇`)
+  }
+  lines.push('')
+  lines.push(p.target_count === 0 ? '当前没有待重新解析的文档。' : '确认开始批量重新解析？')
+  return lines.join('\n')
+}
+
 export function KnowledgeBaseDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const qc = useQueryClient()
+  // 预检请求不在 ``useMutation`` 里（mutation 只装"确认后那一下 POST"），
+  // 这里独立一份状态，防止用户在预检 fetch 期间连点按钮导致两次 POST。
+  const [preflightPending, setPreflightPending] = useState(false)
 
   const { data: kb, isLoading } = useQuery({
     queryKey: ['kb', id],
@@ -70,6 +91,31 @@ export function KnowledgeBaseDetail() {
     onError: (err) => toast.error('重建索引失败：' + (err as Error).message),
   })
 
+  // 批量重新解析（spec #102 / issue #112）—— 预检先行 → 二次确认 → 触发。
+  // 互斥：``reindex`` / ``bulkReparse`` 通过 KB ``index_status`` 字段自然互斥（issue #111
+  // 设计：同一字段守两边），UI 上多按一层 ``isPending`` 防止"POST 在飞、building 还没
+  // 写到 KB"那一瞬被用户连点。
+  const bulkReparse = useMutation({
+    mutationFn: () => kbApi.bulkReparse.trigger(id!),
+    onSuccess: (res) => {
+      toast.success('批量重新解析已启动', {
+        description: `共 ${res.target_count} 篇文档，请观察进度变化`,
+      })
+      qc.invalidateQueries({ queryKey: ['kb', id] })
+      qc.invalidateQueries({ queryKey: ['kb-docs', id] })
+    },
+    onError: (err) => {
+      // axios 拦截器把 ``err.response.data.detail`` 落到 message 上，这里用结构化
+      // status 而非 substring 嗅探 —— 后端 message 文案一旦变动也不会静默失效。
+      const e = err as Error & { response?: { status?: number } }
+      if (e.response?.status === 409) {
+        toast.error('已有索引构建任务在进行中，请等待完成后再试')
+      } else {
+        toast.error('批量重新解析失败：' + (e.message || '未知错误'))
+      }
+    },
+  })
+
   const handleFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || [])
     if (files.length === 0) return
@@ -105,6 +151,32 @@ export function KnowledgeBaseDetail() {
     },
   })
 
+  // 批量重新解析入口：先拉预检（无副作用）→ 在确认对话框里把成本数字摊给用户
+  // （spec #102 story 35）→ 确认后入队。空批次在客户端短路：服务端也会短路
+  // （kb.router _build_preflight_payload 也返 target_count=0），前端直接吞掉
+  // 这次点击，避免一次无意义的 POST / 一条多余 toast。
+  const handleBulkReparse = async () => {
+    if (preflightPending) return
+    setPreflightPending(true)
+    try {
+      const preflight = await kbApi.bulkReparse.preflight(id!)
+      if (preflight.target_count === 0) {
+        toast.info('当前没有待重新解析的文档')
+        return
+      }
+      const ok = window.confirm(buildBulkReparseConfirmMessage(preflight))
+      if (!ok) return
+      bulkReparse.mutate()
+    } catch (err) {
+      // axios 拦截器已把 ``err.response.data.detail`` 落到 message 上。
+      const e = err as Error & { response?: { status?: number } }
+      const detail = e.message || '未知错误'
+      toast.error(e.response?.status === 404 ? '知识库不存在或已被删除' : `预检失败：${detail}`)
+    } finally {
+      setPreflightPending(false)
+    }
+  }
+
   if (isLoading) return <div className="flex justify-center py-20"><Loader2 className="w-6 h-6 animate-spin text-slate-400" /></div>
   if (!kb) return <div className="text-center py-20 text-slate-500">知识库不存在</div>
 
@@ -116,14 +188,26 @@ export function KnowledgeBaseDetail() {
 
       <Card>
         <CardHeader title="基本信息" action={
-          <button
-            className="btn-secondary btn-sm"
-            onClick={() => reindex.mutate()}
-            disabled={kb.index_status === 'building' || reindex.isPending}
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${(kb.index_status === 'building' || reindex.isPending) ? 'animate-spin' : ''}`} />
-            {kb.index_status === 'building' ? '索引中…' : reindex.isPending ? '启动中…' : '重建索引'}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              className="btn-secondary btn-sm"
+              onClick={() => reindex.mutate()}
+              disabled={kb.index_status === 'building' || reindex.isPending || bulkReparse.isPending || preflightPending}
+              title="重建知识库的向量索引（不重新解析文档，不消耗 OCR 配额）"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${(kb.index_status === 'building' || reindex.isPending) ? 'animate-spin' : ''}`} />
+              {kb.index_status === 'building' ? '索引中…' : reindex.isPending ? '启动中…' : '重建索引'}
+            </button>
+            <button
+              className="btn-secondary btn-sm"
+              onClick={handleBulkReparse}
+              disabled={kb.index_status === 'building' || bulkReparse.isPending || preflightPending}
+              title="对 KB 内全部待重新解析文档执行批量重新解析（消耗 OCR 配额，仅缓存未命中时）"
+            >
+              <ListRestart className={`w-3.5 h-3.5 ${(bulkReparse.isPending || preflightPending) ? 'animate-spin' : ''}`} />
+              {preflightPending ? '预检中…' : bulkReparse.isPending ? '启动中…' : '批量重新解析'}
+            </button>
+          </div>
         } />
         <CardBody>
           <div className="grid grid-cols-2 gap-4 text-sm">

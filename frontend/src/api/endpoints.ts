@@ -4,6 +4,10 @@ import type {
   AuditDocument, AuditTask, AuditResult,
   QAResponse, ChatRequest, ChatResponse,
   DocumentStructure,
+  BulkReparsePreflight,
+  BulkReparseTriggerRequest,
+  BulkReparseTriggerResponse,
+  BulkReparseReport,
 } from './types'
 
 // ── 知识库 ──
@@ -18,6 +22,19 @@ export const kbApi = {
     api.delete(`/knowledge-bases/${id}`),
   reindex: (id: string) =>
     api.post(`/knowledge-bases/${id}/reindex`),
+  bulkReparse: {
+    preflight: (id: string, force = false) =>
+      api.get<BulkReparsePreflight>(`/knowledge-bases/${id}/bulk-reparse/preflight`, {
+        params: { force },
+      }).then(r => r.data),
+    trigger: (id: string, req: BulkReparseTriggerRequest = {}) =>
+      api.post<BulkReparseTriggerResponse>(
+        `/knowledge-bases/${id}/bulk-reparse`,
+        req,
+      ).then(r => r.data),
+    report: (id: string) =>
+      api.get<BulkReparseReport>(`/knowledge-bases/${id}/bulk-reparse/report`).then(r => r.data),
+  },
   documents: {
     list: (kbId: string) =>
       api.get<KBDocument[]>(`/knowledge-bases/${kbId}/documents`).then(r => r.data),

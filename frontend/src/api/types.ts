@@ -134,6 +134,98 @@ export type AuditEvent =
   | { type: 'complete'; summary: string; issues_count: number }
   | { type: 'cancelled'; message: string }
   | { type: 'error'; message: string }
+// ── 批量重新解析 (Bulk Reparse) ──
+//
+// 三个端点共用同一形状的源数据（spec #102 / issue #111）：
+//   - GET  /bulk-reparse/preflight  → 预检
+//   - POST /bulk-reparse            → 触发
+//   - GET  /bulk-reparse/report     → 报告
+//
+// ``reason`` 取值见 ``services/bulk_reparse_service``：
+//   入选：not_embedded / missing_pages / empty_layout / forced
+//   跳过：page_limit
+export interface BulkReparseTarget {
+  doc_id: string
+  original_name: string
+  page_count: number | null
+  reason: string
+  cache_state: 'cached' | 'uncached'
+}
+
+export interface BulkReparseOverPageLimit {
+  doc_id: string
+  original_name: string
+  page_count: number
+  reason: string
+}
+
+export interface BulkReparsePreflight {
+  kb_id: string
+  force: boolean
+  target_count: number
+  cached_docs: number
+  uncached_docs: number
+  polluted_cached_docs: number
+  cached_pages: number
+  uncached_pages: number
+  estimated_ocr_pages: number
+  targets: BulkReparseTarget[]
+  over_page_limit: BulkReparseOverPageLimit[]
+}
+
+export interface BulkReparseTriggerRequest {
+  concurrency?: number
+  force?: boolean
+}
+
+export interface BulkReparseTriggerResponse {
+  kb_id: string
+  target_count: number
+  index_status: 'building'
+}
+
+export interface BulkReparseReportPreflight {
+  cached_docs: number
+  uncached_docs: number
+  estimated_cached_pages: number
+  targets: BulkReparseTarget[]
+}
+
+export interface BulkReparseReportEntry {
+  doc_id: string
+  original_name: string
+  reason: string
+  // done 篇携带解析来源与页数；failed 篇仅 reason 必填
+  source?: string
+  pages?: number
+  page_count?: number
+}
+
+export interface BulkReparseReport {
+  schema_version: number
+  kb_id: string
+  started_at: string
+  finished_at: string
+  duration_seconds: number
+  forced: boolean
+  concurrency: number
+  target_count: number
+  // 预检估算 vs 实测并列（spec #102 story 26：差异是信号不是拦截）
+  estimated_ocr_pages: number
+  actual_ocr_pages: number
+  actual_pages_by_source: Record<string, number>
+  actual_docs_by_source: Record<string, number>
+  preflight: BulkReparseReportPreflight
+  counts: {
+    done: number
+    failed: number
+    skipped: number
+  }
+  done: BulkReparseReportEntry[]
+  failed: BulkReparseReportEntry[]
+  skipped: BulkReparseReportEntry[]
+}
+
 export interface QASource {
   kb_id: string
   doc_id: string
