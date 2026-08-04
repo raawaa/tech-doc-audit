@@ -1,12 +1,16 @@
 """对整个 KB 触发批量重新解析 (Bulk Reparse) 的命令行入口（Wayfinder #86 / #89）。
 
 **薄 wrapper**：领域逻辑（待重解析文档选取 / OCR 成本预检 / 页数上限分类 /
-受控并发编排）全部住在 ``services.bulk_reparse_service``，与 HTTP API 共用同一实现
-（issue #108）。本脚本只负责四件事：``.env`` 加载、argparse 契约、终端渲染、退出码。
+受控并发编排 / 实测 OCR 计数与报告落盘）全部住在 ``services.bulk_reparse_service``，
+与 HTTP API 共用同一实现（issue #108 / #110）。本脚本只负责四件事：
+``.env`` 加载、argparse 契约、终端渲染、退出码。
 
 不依赖 HTTP 服务在线 —— 离线运维、无前端环境仍可用。
 
 退出码：0 = 全部成功 / 1 = 有失败（或 KB 不存在 / 参数非法）/ 2 = dry-run 或用户取消。
+
+跑完的结构化报告（预估 vs 实测 OCR 页数、done/failed/skipped 明细）落在
+``data/kbs/{kb_id}/bulk_reparse_report.json``，终端摘要只是它的一个视图。
 
 用法：
   # 仅枚举目标 doc，不触发 reparse
@@ -83,6 +87,16 @@ def _print_summary(result) -> None:
     print(f"  done:    {len(result.done)}")
     print(f"  failed:  {len(result.failed)}")
     print(f"  skipped: {len(result.skipped)} （超 PAGE_LIMIT={bulk_svc.PAGE_LIMIT}）")
+
+    # 预估 vs 实测并排 —— #91 那次"报 1694 页、实际 0 页"的指纹就在这两行的差值里。
+    # 差异不拦截，只呈现（spec #102 story 26）。
+    print(f"\nOCR 页数：预估 {result.estimate.pages_uncached} 页 / 实测 {result.usage.actual_ocr_pages} 页")
+    if result.usage.pages_by_source:
+        print("  实际解析来源分布：")
+        for source, pages in sorted(result.usage.pages_by_source.items()):
+            docs = result.usage.docs_by_source.get(source, 0)
+            print(f"    {source:12s} {docs} 篇 / {pages} 页")
+
     if result.failed:
         print("\n失败列表：")
         for doc_id, reason in result.failed:
@@ -91,6 +105,8 @@ def _print_summary(result) -> None:
         print("\n跳过列表（超 PAGE_LIMIT）：")
         for skipped in result.skipped:
             print(f"  {skipped.doc.id}  （约 {skipped.page_count} 页）")
+    if result.report_path:
+        print(f"\n报告已写入: {result.report_path}")
     print("=" * 70)
 
 
@@ -160,6 +176,7 @@ def bulk_reparse(
     result = bulk_svc.run_bulk_reparse(
         kb_id, targets,
         concurrency=concurrency,
+        forced=force,
         on_doc_complete=_on_doc_complete,
     )
 
