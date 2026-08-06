@@ -944,9 +944,12 @@ class TestBuildUserContent:
                 n for n in ast.walk(tree)
                 if isinstance(n, ast.FunctionDef) and n.name == fn.__name__
             )
+            # 排除 docstring：非空 docstring 也是 ast.Constant，AST 层面无法靠真假过滤。
+            docstring = ast.get_docstring(target)
             strings = [
                 v.value for v in ast.walk(target)
                 if isinstance(v, ast.Constant) and isinstance(v.value, str) and v.value
+                and v.value != docstring
             ]
             # 允许空字符串（docstring 等），但不应含 f-string 模板
             long_strings = [s for s in strings if len(s) > 30]
