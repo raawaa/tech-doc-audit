@@ -7,7 +7,10 @@ from typing import Optional
 from models.audit_document import AuditDocument
 from storage import validate_id
 
-DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
+
+def get_data_dir() -> Path:
+    """解析数据根目录；每次调用读取 env（issue #137 per-test 隔离）。"""
+    return Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 
 
 def _ensure_dir(path: Path) -> None:
@@ -16,7 +19,7 @@ def _ensure_dir(path: Path) -> None:
 
 def _doc_dir(doc_id: str) -> Path:
     validate_id(doc_id, "doc_id")
-    return DATA_DIR / "audits" / doc_id / "doc"
+    return get_data_dir() / "audits" / doc_id / "doc"
 
 
 def _doc_file(doc_id: str, file_type: str) -> Path:
@@ -24,7 +27,7 @@ def _doc_file(doc_id: str, file_type: str) -> Path:
 
 
 def _meta_file(doc_id: str) -> Path:
-    return DATA_DIR / "audits" / doc_id / "meta.json"
+    return get_data_dir() / "audits" / doc_id / "meta.json"
 
 
 def _doc_to_json(doc: AuditDocument) -> dict:
@@ -55,7 +58,7 @@ def get_doc(doc_id: str) -> Optional[AuditDocument]:
 
 def list_docs() -> list[AuditDocument]:
     """列出所有待审核文档（仅元数据，不含大字段）。"""
-    audits_dir = DATA_DIR / "audits"
+    audits_dir = get_data_dir() / "audits"
     _ensure_dir(audits_dir)
     results = []
     for d in audits_dir.iterdir():
@@ -81,7 +84,7 @@ def update_doc(doc: AuditDocument) -> AuditDocument:
 
 def delete_doc(doc_id: str) -> bool:
     """删除文档及其文件。"""
-    audit_dir = DATA_DIR / "audits" / doc_id
+    audit_dir = get_data_dir() / "audits" / doc_id
     if audit_dir.exists():
         import shutil
         shutil.rmtree(audit_dir)

@@ -6,21 +6,10 @@ fake_models neutralize 成 identity（返回原序），故可稳定测合并/�
 
 注意：被索引文本必须 >= 20 字符（index_document 的最小长度门槛），否则不建索引。
 """
-import os
-import shutil
-
 import pytest
 
 from core.index_manager import index_document
 from core.retriever import CrossKBRetriever
-
-
-@pytest.fixture(autouse=True)
-def _cleanup():
-    yield
-    data_dir = os.environ["AUDIT_DATA_DIR"]
-    if os.path.exists(data_dir):
-        shutil.rmtree(data_dir)
 
 
 @pytest.fixture(autouse=True)

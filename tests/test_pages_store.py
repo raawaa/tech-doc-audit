@@ -9,19 +9,10 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
 
 import pytest
 
 from core import pages_store
-
-
-@pytest.fixture(autouse=True)
-def _isolated_data_dir(tmp_path, monkeypatch):
-    """每个测试在 tmp_path 下跑，不污染 AUDIT_DATA_DIR。"""
-    monkeypatch.setattr(pages_store, "DATA_DIR", tmp_path)
-    yield tmp_path
 
 
 @pytest.fixture

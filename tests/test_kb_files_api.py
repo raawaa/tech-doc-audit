@@ -16,13 +16,6 @@ from core import pages_store
 client = TestClient(app)
 
 
-@pytest.fixture(autouse=True)
-def _isolated_data_dir(tmp_path, monkeypatch):
-    """每个测试在 tmp_path 下跑，不污染 ``AUDIT_DATA_DIR``。"""
-    monkeypatch.setattr(pages_store, "DATA_DIR", tmp_path)
-    yield tmp_path
-
-
 def _create_doc(tmp_path):
     """造一条 KB 文档元数据，返回 (doc_id, kb_id)。"""
     from storage import kb_repo, doc_repo

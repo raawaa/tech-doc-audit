@@ -9,8 +9,15 @@ import shutil
 from models.knowledge_base import KnowledgeBase
 from storage import validate_id
 
-DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
-KBS_DIR = DATA_DIR / "kbs"
+
+def get_data_dir() -> Path:
+    """解析数据根目录；每次调用读取 env（issue #137 per-test 隔离）。"""
+    return Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
+
+
+def get_kbs_dir() -> Path:
+    return get_data_dir() / "kbs"
+
 
 _write_lock = threading.Lock()
 
@@ -21,7 +28,7 @@ def _ensure_dir(path: Path) -> None:
 
 def _kb_dir(kb_id: str) -> Path:
     validate_id(kb_id, "kb_id")
-    return KBS_DIR / kb_id
+    return get_kbs_dir() / kb_id
 
 
 def _kb_file(kb_id: str) -> Path:
@@ -49,10 +56,11 @@ def get(kb_id: str) -> Optional[KnowledgeBase]:
 
 
 def list_all() -> list[KnowledgeBase]:
-    if not KBS_DIR.exists():
+    kbs_dir = get_kbs_dir()
+    if not kbs_dir.exists():
         return []
     results = []
-    for kb_dir in KBS_DIR.iterdir():
+    for kb_dir in kbs_dir.iterdir():
         if kb_dir.is_dir():
             kb_file = kb_dir / "kb.json"
             if kb_file.exists():

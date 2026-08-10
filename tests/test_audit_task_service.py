@@ -6,9 +6,6 @@ structure_svc.analyze_document_structure、doc_repo.get_doc，
 repo.get_task / repo.save_task 走真实文件系统（AUDIT_DATA_DIR 隔离）。
 """
 
-import os
-import shutil
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,15 +14,6 @@ import services.audit_task_service as ats
 import storage.audit_task_repo as repo
 from models.audit_task import AuditTask, AuditIssue, IssueLocation, AuditResult, ResultSummary
 from models.audit_document import AuditDocument
-
-
-@pytest.fixture(autouse=True)
-def cleanup():
-    """每个测试后清理 audits 目录。"""
-    yield
-    audits = Path(os.environ["AUDIT_DATA_DIR"]) / "audits"
-    if audits.exists():
-        shutil.rmtree(audits)
 
 
 def _make_doc(doc_id="doc1", parsed="招标文件内容，含增值税与保证金条款。"):

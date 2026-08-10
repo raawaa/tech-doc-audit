@@ -139,7 +139,7 @@ def test_pdf_cache_hit_skips_paddleocr(tmp_path, monkeypatch):
     # 重定向缓存目录到 tmp_path
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setattr(cache_module, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(cache_module, "get_cache_dir", lambda: cache_dir)
 
     # 预置缓存条目（手写）
     cached_payload = {
@@ -172,7 +172,7 @@ def test_pdf_cache_miss_with_paddleocr_success(tmp_path, monkeypatch):
 
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setattr(cache_module, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(cache_module, "get_cache_dir", lambda: cache_dir)
 
     expected = ParseResult(
         by_page=[PageText(page=0, text="paddleocr text")],
@@ -233,7 +233,7 @@ def test_pdf_use_cache_false_skips_cache_lookup(tmp_path, monkeypatch):
     from core import paddleocr_cache as cache_module
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setattr(cache_module, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(cache_module, "get_cache_dir", lambda: cache_dir)
     # 应当看到 get_cached 调用一次都不发生
     def _must_not_call(*a, **k):
         raise AssertionError("get_cached should not be called")
@@ -753,7 +753,7 @@ def test_routing_scanned_with_paddleocr_uses_paddleocr(tmp_path, monkeypatch):
     from core import paddleocr_cache as cache_module
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setattr(cache_module, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(cache_module, "get_cache_dir", lambda: cache_dir)
 
     monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: True)
 
@@ -798,7 +798,7 @@ def test_routing_text_layer_writes_pymupdf_cache_source(tmp_path, monkeypatch):
     from core import paddleocr_cache as cache_module
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setattr(cache_module, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(cache_module, "get_cache_dir", lambda: cache_dir)
     monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: False)
 
     parse_document(
@@ -820,7 +820,7 @@ def test_routing_pymupdf_unavailable_falls_back_to_paddleocr(
     from core import paddleocr_cache as cache_module
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setattr(cache_module, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(cache_module, "get_cache_dir", lambda: cache_dir)
 
     # 强制 pymupdf 不可用
     monkeypatch.setattr(pd_module, "_pymupdf_available", lambda: False)
@@ -898,7 +898,7 @@ def test_routing_old_paddleocr_cache_hit_returns(tmp_path, monkeypatch):
     from core import paddleocr_cache as cache_module
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setattr(cache_module, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(cache_module, "get_cache_dir", lambda: cache_dir)
 
     pr_seed = ParseResult(
         by_page=[PageText(page=0, text="old cached")],
@@ -934,7 +934,7 @@ def test_routing_new_pymupdf_cache_hit_returns(tmp_path, monkeypatch):
     from core import paddleocr_cache as cache_module
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setattr(cache_module, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(cache_module, "get_cache_dir", lambda: cache_dir)
     monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: False)
 
     # 第一次跑触发 parse + cache write

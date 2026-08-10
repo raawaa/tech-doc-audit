@@ -8,7 +8,10 @@ import shutil
 from models.document import KBDocument
 from storage import validate_id
 
-DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
+
+def get_data_dir() -> Path:
+    """解析数据根目录；每次调用读取 env（issue #137 per-test 隔离）。"""
+    return Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 
 
 def _ensure_dir(path: Path) -> None:
@@ -17,11 +20,11 @@ def _ensure_dir(path: Path) -> None:
 
 def _kb_docs_dir(kb_id: str) -> Path:
     validate_id(kb_id, "kb_id")
-    return DATA_DIR / "kbs" / kb_id / "docs"
+    return get_data_dir() / "kbs" / kb_id / "docs"
 
 
 def _doc_meta_dir(kb_id: str) -> Path:
-    return DATA_DIR / "kbs" / kb_id / "meta"
+    return get_data_dir() / "kbs" / kb_id / "meta"
 
 
 def _doc_meta_file(kb_id: str, doc_id: str) -> Path:
@@ -98,7 +101,7 @@ def find_doc_by_id(doc_id: str) -> Optional[KBDocument]:
     扫描 data/kbs/ 下所有 KB 目录的 meta 文件。
     """
     validate_id(doc_id, "doc_id")
-    for kb_dir in DATA_DIR.glob("kbs/*"):
+    for kb_dir in get_data_dir().glob("kbs/*"):
         if not kb_dir.is_dir():
             continue
         kb_id = kb_dir.name

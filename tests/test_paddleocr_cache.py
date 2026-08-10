@@ -22,7 +22,7 @@ from core import paddleocr_cache
 def cache_dir(monkeypatch, tmp_path):
     """重定向缓存根目录到临时目录。"""
     root = tmp_path / "paddleocr_cache"
-    monkeypatch.setattr(paddleocr_cache, "CACHE_DIR", root)
+    monkeypatch.setattr(paddleocr_cache, "get_cache_dir", lambda: root)
     return root
 
 
@@ -31,7 +31,7 @@ def cache_dir(monkeypatch, tmp_path):
 
 def test_get_cached_returns_none_when_cache_dir_missing(tmp_path, monkeypatch):
     """缓存目录不存在 → get_cached 返回 None，不抛异常。"""
-    monkeypatch.setattr(paddleocr_cache, "CACHE_DIR", tmp_path / "nope")
+    monkeypatch.setattr(paddleocr_cache, "get_cache_dir", lambda: tmp_path / "nope")
     pdf = tmp_path / "x.pdf"
     pdf.write_bytes(b"%PDF-1.4\nfake")
 

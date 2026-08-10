@@ -1,12 +1,14 @@
 """共享测试夹具与配置。
 
-AUDIT_DATA_DIR 必须在任何 storage 模块被 import 之前设置——
-``storage/kb_repo.py``、``storage/audit_doc_repo.py`` 等在 import 时通过
-``os.environ.get("AUDIT_DATA_DIR")`` 绑定 ``DATA_DIR`` 路径对象，之后再改
-环境变量不会生效（见 review_report.md #5 的 import 顺序依赖问题）。
-
-因此在 conftest 模块级（pytest 收集阶段最先执行）统一设置，取代各测试文件里
-脆弱的模块级 ``os.environ`` 赋值。
+数据目录双层隔离（issue #137）：
+1. 模块级兜底：``AUDIT_DATA_DIR`` 在 conftest 模块级指向 session 临时目录。
+   历史上一度要求"先于 storage 模块 import"（模块 import 时绑定 ``DATA_DIR``
+   常量）；storage/core/api 已全部改为每次调用 ``get_data_dir()`` 解析 env，
+   这里保留模块级赋值是为了防止尚未迁移的 services 层在 import 时读到生产
+   ``./data``。
+2. per-test 隔离：``_per_test_data_dir`` autouse fixture 把每条用例的
+   ``AUDIT_DATA_DIR`` 指到 pytest ``tmp_path``，存储层按调用解析 →
+   异步索引线程只能写自己用例的目录，teardown 竞态（Errno 39）结构上消失。
 """
 
 import hashlib
@@ -38,8 +40,30 @@ os.environ["AUDIT_DATA_DIR"] = str(_TEST_DATA_DIR)
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """整个测试会话结束后清理临时数据目录。"""
-    shutil.rmtree(_TEST_DATA_DIR, ignore_errors=True)
+    """整个测试会话结束后清理临时数据目录。
+
+    issue #137：per-test env 还原后，仍存活的 daemon 索引线程下次调用
+    ``get_data_dir()`` 会解析回 session 目录，若它恰好在 rmtree 期间写文件，
+    ``os.rmdir`` 抛 Errno 39，被 ``ignore_errors`` 吞掉后留下孤儿目录
+    （/tmp/jishu_shenhe_test_*）。因此先 join 完所有 daemon 线程再删，
+    仍不死心的线程由重试兜底。
+    """
+    import threading
+    import time as _t
+
+    main_thread = threading.current_thread()
+    for t in threading.enumerate():
+        if t is main_thread or not t.is_alive() or not t.daemon:
+            continue
+        try:
+            t.join(timeout=60)
+        except Exception:
+            pass
+    for _ in range(3):
+        shutil.rmtree(_TEST_DATA_DIR, ignore_errors=True)
+        if not _TEST_DATA_DIR.exists():
+            break
+        _t.sleep(1)
 
 
 # ── 共享 mock_llm 夹具 ─────────────────────────────────────────────────────────
@@ -209,6 +233,25 @@ def seed_searchable_kb():
         return kb_id
 
     yield _seed
+
+
+@pytest.fixture(autouse=True)
+def _per_test_data_dir(tmp_path, monkeypatch):
+    """每个测试独立的 AUDIT_DATA_DIR（issue #137）。
+
+    之前整个套件共享一个 session 级目录 + 各测试文件自己的 rmtree cleanup，
+    daemon 索引线程与 teardown 清理会撞（OSError Errno 39）。现在每条用例的
+    目录由 pytest ``tmp_path`` 派生并 monkeypatch 到 env —— 存储层
+    ``get_data_dir()`` 每次调用解析 env，异步线程只能写自己用例的目录，
+    跨用例竞态从结构上消失；测试体里读 ``os.environ["AUDIT_DATA_DIR"]``
+    看到的就是本用例的 ``tmp_path``。
+
+    必须声明在 ``_wait_for_async_rebuild_threads`` **之前**：pytest 按声明顺序
+    setup、逆序 teardown，这样 join 先于 env 还原 / 目录清理，防再引入
+    "清理跑在线程写完之前"。
+    """
+    monkeypatch.setenv("AUDIT_DATA_DIR", str(tmp_path))
+    yield tmp_path
 
 
 @pytest.fixture(autouse=True)

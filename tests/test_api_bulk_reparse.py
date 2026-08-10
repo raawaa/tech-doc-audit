@@ -13,8 +13,6 @@ issue #111 — 把批量重新解析 (Bulk Reparse) 从 CLI 升级为产品入�
 from __future__ import annotations
 
 import json
-import os
-import shutil
 import threading
 import time
 from pathlib import Path
@@ -28,19 +26,6 @@ client = TestClient(app)
 
 
 # ── fixtures：清理数据 + 假模型 + 等待异步线程 ─────────────────────────────
-
-
-@pytest.fixture(autouse=True)
-def cleanup():
-    """每个测试后清理数据目录。"""
-    yield
-    test_dir = os.environ["AUDIT_DATA_DIR"]
-    for item in os.listdir(test_dir):
-        path = os.path.join(test_dir, item)
-        if os.path.isdir(path):
-            shutil.rmtree(path)
-        else:
-            os.remove(path)
 
 
 @pytest.fixture(autouse=True)
@@ -230,7 +215,7 @@ def test_preflight_has_zero_side_effects():
         embedding_status="failed", page_count=3, content_hash="h_pure",
     )
     pages_dir = pages_store._pages_dir(kb_id)
-    cache_dir = paddleocr_cache.CACHE_DIR
+    cache_dir = paddleocr_cache.get_cache_dir()
     cache_before = (
         set(p.name for p in cache_dir.glob(f"h_pure_*")) if cache_dir.exists() else set()
     )
@@ -577,7 +562,7 @@ def test_report_actual_ocr_pages_bucket_matches_cached_sources(monkeypatch):
 
     def _write_cache(content_hash, source):
         p = (
-            paddleocr_cache.CACHE_DIR
+            paddleocr_cache.get_cache_dir()
             / f"{content_hash}_{paddleocr_cache._MODEL_VERSION}.json"
         )
         p.parent.mkdir(parents=True, exist_ok=True)

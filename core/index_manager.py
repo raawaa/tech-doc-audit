@@ -30,7 +30,10 @@ from core.parse_document import PageText, PageLayout
 from core.text_norm import lcs_len, norm
 
 
-DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
+def get_data_dir() -> Path:
+    """解析数据根目录；每次调用读取 env（issue #137 per-test 隔离）。"""
+    return Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
+
 
 # 内存缓存: kb_id -> VectorStoreIndex
 _index_cache: dict[str, VectorStoreIndex] = {}
@@ -52,7 +55,7 @@ def _get_index_lock(kb_id: str) -> threading.RLock:
 # ── 内部路径 ────────────────────────────────────────────────────────────────────
 
 def _vectors_dir(kb_id: str) -> Path:
-    return DATA_DIR / "kbs" / kb_id / "vectors"
+    return get_data_dir() / "kbs" / kb_id / "vectors"
 
 
 def _ensure_dir(path: Path):

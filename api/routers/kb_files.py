@@ -1,6 +1,5 @@
 """KB 文档文件服务 — PDF 预览、文本降级、元数据查询、重新解析。"""
 
-import os
 import mimetypes
 import re
 from pathlib import Path
@@ -9,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 import storage.doc_repo as doc_repo
+from api.deps import get_data_dir
 from storage import validate_id
 
 router = APIRouter(prefix="/api/v1/kb-documents", tags=["kb-documents"])
@@ -43,7 +43,7 @@ def get_document_file(doc_id: str, request: Request):
         raise HTTPException(status_code=404, detail="文件不存在")
 
     # 路径穿越校验：确保文件在 data/kbs/ 目录下
-    data_dir = Path(os.environ.get("AUDIT_DATA_DIR", "./data")).resolve()
+    data_dir = get_data_dir().resolve()
     try:
         file_path.resolve().relative_to(data_dir)
     except ValueError:

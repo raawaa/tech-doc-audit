@@ -1,20 +1,10 @@
 """待审核文档服务单元测试"""
 
 import os
-import shutil
 
 import pytest
 
 import services.audit_doc_service as audit_doc_svc
-
-
-@pytest.fixture(autouse=True)
-def cleanup():
-    """每个测试后清理数据"""
-    yield
-    import storage.audit_doc_repo as audit_doc_repo
-    if audit_doc_repo.DATA_DIR.exists():
-        shutil.rmtree(audit_doc_repo.DATA_DIR)
 
 
 def test_upload_document():

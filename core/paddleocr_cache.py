@@ -16,9 +16,14 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-# 缓存根目录：项目 data/.cache/paddleocr/。模块级常量，方便测试 monkeypatch。
-_DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "data"))
-CACHE_DIR: Path = _DATA_DIR / ".cache" / "paddleocr"
+def get_data_dir() -> Path:
+    """解析数据根目录；每次调用读取 env（issue #137 per-test 隔离）。"""
+    return Path(os.environ.get("AUDIT_DATA_DIR", "data"))
+
+
+def get_cache_dir() -> Path:
+    """缓存根目录：``data/.cache/paddleocr/``。每次调用解析，测试可 monkeypatch。"""
+    return get_data_dir() / ".cache" / "paddleocr"
 
 # 模型版本：与 core.text_extraction 保持同源（env var）。升级即失效。
 _MODEL_VERSION = os.environ.get("PADDLEOCR_MODEL", "PaddleOCR-VL-1.6")
@@ -35,7 +40,7 @@ def _file_hash(file_path: str) -> str:
 
 def _cache_path(file_path: str, model_version: str = _MODEL_VERSION) -> Path:
     """``{sha256}_{model_version}.json``。"""
-    return CACHE_DIR / f"{_file_hash(file_path)}_{model_version}.json"
+    return get_cache_dir() / f"{_file_hash(file_path)}_{model_version}.json"
 
 
 def get_cached(file_path: str) -> Optional[dict]:
@@ -54,7 +59,7 @@ def get_cached(file_path: str) -> Optional[dict]:
     命中逻辑：``entry.version == _MODEL_VERSION AND entry.file_hash == current_hash``，
     任一不匹配返回 None（不抛）。
     """
-    if not CACHE_DIR.exists():
+    if not get_cache_dir().exists():
         return None
     path = _cache_path(file_path)
     if not path.exists():
@@ -107,7 +112,7 @@ def _entry_by_hash(content_hash: str, version: str) -> Optional[dict]:
     """
     if not content_hash:
         return None
-    path = CACHE_DIR / f"{content_hash}_{version}.json"
+    path = get_cache_dir() / f"{content_hash}_{version}.json"
     if not path.exists():
         return None
     try:
@@ -190,8 +195,9 @@ def clear_cache() -> int:
     """清空整个缓存目录，返回删除的文件数。
 
     运维工具（CLI 暂未做，预埋）。目录不存在时返回 0，不抛。"""
-    if not CACHE_DIR.exists():
+    cache_dir = get_cache_dir()
+    if not cache_dir.exists():
         return 0
-    count = sum(1 for _ in CACHE_DIR.iterdir())
-    shutil.rmtree(CACHE_DIR)
+    count = sum(1 for _ in cache_dir.iterdir())
+    shutil.rmtree(cache_dir)
     return count

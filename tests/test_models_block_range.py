@@ -8,7 +8,7 @@
    ``standard_reference=None`` 时返回 ``None``（向后兼容旧 issue）。
 
 不依赖 GPU / bge-m3 / 真实 LLM：纯 Pydantic schema + FastAPI 路由组装。
-``AUDIT_DATA_DIR`` 由 conftest 模块级 fixture 隔离，不污染生产数据。
+``AUDIT_DATA_DIR`` 由 conftest per-test fixture 隔离（issue #137），不污染生产数据。
 """
 
 from datetime import datetime

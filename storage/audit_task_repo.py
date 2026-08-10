@@ -7,7 +7,10 @@ from typing import Optional
 from models.audit_task import AuditTask
 from storage import validate_id
 
-DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
+
+def get_data_dir() -> Path:
+    """解析数据根目录；每次调用读取 env（issue #137 per-test 隔离）。"""
+    return Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 
 
 def _ensure_dir(path: Path) -> None:
@@ -16,7 +19,7 @@ def _ensure_dir(path: Path) -> None:
 
 def _task_dir(doc_id: str) -> Path:
     validate_id(doc_id, "document_id")
-    return DATA_DIR / "audits" / doc_id / "tasks"
+    return get_data_dir() / "audits" / doc_id / "tasks"
 
 
 def _task_file(doc_id: str, task_id: str) -> Path:
@@ -26,7 +29,7 @@ def _task_file(doc_id: str, task_id: str) -> Path:
 
 def _locate_task(task_id: str) -> Optional[Path]:
     """Search audits/*/tasks/ for a task by ID."""
-    audits_dir = DATA_DIR / "audits"
+    audits_dir = get_data_dir() / "audits"
     if not audits_dir.exists():
         return None
     for d in audits_dir.iterdir():
@@ -58,7 +61,7 @@ def get_task(task_id: str) -> Optional[AuditTask]:
 
 def list_tasks(document_id: Optional[str] = None) -> list[AuditTask]:
     """列出审核任务。"""
-    audits_dir = DATA_DIR / "audits"
+    audits_dir = get_data_dir() / "audits"
     _ensure_dir(audits_dir)
     results = []
     if document_id:

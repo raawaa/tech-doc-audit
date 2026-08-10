@@ -31,18 +31,12 @@ from models.knowledge_base import KnowledgeBase
 
 
 @pytest.fixture
-def isolated_data_dir(tmp_path, monkeypatch):
-    """把所有按 import 绑定 ``DATA_DIR`` 的模块指到 tmp_path。
+def isolated_data_dir(tmp_path):
+    """数据目录隔离由 conftest 的 per-test ``AUDIT_DATA_DIR`` 保证（issue #137）。
 
-    ``storage.kb_repo`` / ``storage.doc_repo`` / ``core.pages_store`` /
-    ``core.paddleocr_cache`` 都在 import 时读 ``AUDIT_DATA_DIR``，
-    改环境变量无效（见 tests/conftest.py 顶部说明），只能 monkeypatch 属性。
+    存储层 ``get_data_dir()`` 每次调用解析 env，无需再 monkeypatch 模块属性。
+    保留此 fixture 只为给测试一个指向本用例数据目录的 Path。
     """
-    monkeypatch.setattr(doc_repo, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(kb_repo, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(kb_repo, "KBS_DIR", tmp_path / "kbs")
-    monkeypatch.setattr(pages_store, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(paddleocr_cache, "CACHE_DIR", tmp_path / ".cache" / "paddleocr")
     return tmp_path
 
 
@@ -83,7 +77,7 @@ def _good_pages() -> dict:
 def _write_cache_entry(content_hash: str, *, source: str) -> Path:
     """按 (content_hash, model_version) 写一条缓存条目。"""
     path = (
-        paddleocr_cache.CACHE_DIR
+        paddleocr_cache.get_cache_dir()
         / f"{content_hash}_{paddleocr_cache._MODEL_VERSION}.json"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -221,7 +215,7 @@ def test_estimate_counts_corrupt_cache_entry_as_uncached(kb):
     from services import bulk_reparse_service as svc
 
     _add_doc(kb.id, "corrupt.pdf", embedding_status="failed", page_count=6, content_hash="h_bad")
-    path = paddleocr_cache.CACHE_DIR / f"h_bad_{paddleocr_cache._MODEL_VERSION}.json"
+    path = paddleocr_cache.get_cache_dir() / f"h_bad_{paddleocr_cache._MODEL_VERSION}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{not json", encoding="utf-8")
 

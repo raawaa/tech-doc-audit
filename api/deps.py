@@ -4,11 +4,10 @@ from fastapi import Depends
 from pathlib import Path
 import os
 
-DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
-
 
 def get_data_dir() -> Path:
-    return DATA_DIR
+    """解析数据根目录；每次调用读取 env（issue #137 per-test 隔离）。"""
+    return Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 
 
 DataDirDep = Annotated[Path, Depends(get_data_dir)]

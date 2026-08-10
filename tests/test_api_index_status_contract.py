@@ -11,8 +11,6 @@
 """
 
 import io
-import os
-import shutil
 import time
 
 import pytest
@@ -21,19 +19,6 @@ from fastapi.testclient import TestClient
 from api.main import app
 
 client = TestClient(app)
-
-
-@pytest.fixture(autouse=True)
-def cleanup():
-    """每个测试后清理数据。"""
-    yield
-    test_dir = os.environ["AUDIT_DATA_DIR"]
-    for item in os.listdir(test_dir):
-        path = os.path.join(test_dir, item)
-        if os.path.isdir(path):
-            shutil.rmtree(path)
-        else:
-            os.remove(path)
 
 
 @pytest.fixture(autouse=True)

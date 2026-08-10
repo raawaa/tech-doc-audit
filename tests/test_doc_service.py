@@ -1,6 +1,5 @@
 """文档服务单元测试"""
 
-import shutil
 import time
 
 import pytest
@@ -88,15 +87,6 @@ def stub_pdf_parse(monkeypatch):
         return empty
 
     monkeypatch.setattr("core.parse_document.parse_document", _fake_parse)
-
-
-@pytest.fixture(autouse=True)
-def cleanup():
-    """每个测试后清理数据"""
-    yield
-    import storage.kb_repo as kb_repo
-    if kb_repo.KBS_DIR.exists():
-        shutil.rmtree(kb_repo.KBS_DIR)
 
 
 def test_import_document():

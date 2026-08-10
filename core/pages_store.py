@@ -22,12 +22,14 @@ from core.logger import get_logger
 _logger = get_logger(__name__)
 
 
-DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
+def get_data_dir() -> Path:
+    """解析数据根目录；每次调用读取 env（issue #137 per-test 隔离）。"""
+    return Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 
 
 def _pages_dir(kb_id: str) -> Path:
     """``data/kbs/{kb_id}/pages/``。"""
-    return DATA_DIR / "kbs" / kb_id / "pages"
+    return get_data_dir() / "kbs" / kb_id / "pages"
 
 
 def _pages_file(kb_id: str, doc_id: str) -> Path:

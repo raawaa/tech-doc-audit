@@ -6,6 +6,7 @@ from typing import Literal
 
 import services.kb_service as kb_svc
 import storage.doc_repo as doc_repo
+from api.deps import get_data_dir
 from core import bulk_reparse_report_store
 from core.logger import get_logger
 from services.bulk_reparse_service import (
@@ -32,11 +33,9 @@ def _get_actually_indexed_doc_ids(kb_id: str) -> set[str]:
     1. 新格式（rebuild 产物）：docstore/data → 每个节点 metadata.doc_id
     2. 旧格式（增量索引）：docstore/ref_doc_info → {doc_id: {node_ids: [...]}}
     """
-    from pathlib import Path
     import json as _json
-    import os as _os
 
-    vectors_dir = Path(_os.environ.get("AUDIT_DATA_DIR", "data")) / "kbs" / kb_id / "vectors"
+    vectors_dir = get_data_dir() / "kbs" / kb_id / "vectors"
     docstore_path = vectors_dir / "docstore.json"
     if not docstore_path.exists():
         return set()

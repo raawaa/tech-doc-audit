@@ -26,7 +26,10 @@ from core.logger import get_logger
 _logger = get_logger(__name__)
 
 
-DATA_DIR = Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
+def get_data_dir() -> Path:
+    """解析数据根目录；每次调用读取 env（issue #137 per-test 隔离）。"""
+    return Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
+
 
 # 报告文件名。模块级常量：测试与 #111 的报告端点都据此定位，不各自拼字符串。
 REPORT_FILENAME = "bulk_reparse_report.json"
@@ -34,7 +37,7 @@ REPORT_FILENAME = "bulk_reparse_report.json"
 
 def _report_file(kb_id: str) -> Path:
     """``data/kbs/{kb_id}/bulk_reparse_report.json``（``pages/`` 的兄弟）。"""
-    return DATA_DIR / "kbs" / kb_id / REPORT_FILENAME
+    return get_data_dir() / "kbs" / kb_id / REPORT_FILENAME
 
 
 def save_report(kb_id: str, report: dict) -> Path:

@@ -9,22 +9,12 @@
 通过 fake_models 夹具，避免加载 bge-m3，并人工控制 kb 元数据与磁盘文件。
 """
 
-import os
 import shutil
-from pathlib import Path
 
 import pytest
 
 import services.kb_service as kb_svc
 import storage.kb_repo as kb_repo
-
-
-@pytest.fixture(autouse=True)
-def cleanup():
-    yield
-    data_dir = os.environ["AUDIT_DATA_DIR"]
-    if os.path.exists(data_dir):
-        shutil.rmtree(data_dir)
 
 
 @pytest.fixture(autouse=True)

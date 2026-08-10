@@ -34,14 +34,12 @@ from models.knowledge_base import KnowledgeBase
 
 
 @pytest.fixture
-def isolated_data_dir(tmp_path, monkeypatch):
-    """把所有按 import 绑定 ``DATA_DIR`` 的模块指到 tmp_path（同 test_bulk_reparse_service）。"""
-    monkeypatch.setattr(doc_repo, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(kb_repo, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(kb_repo, "KBS_DIR", tmp_path / "kbs")
-    monkeypatch.setattr(pages_store, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(bulk_reparse_report_store, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(paddleocr_cache, "CACHE_DIR", tmp_path / ".cache" / "paddleocr")
+def isolated_data_dir(tmp_path):
+    """数据目录隔离由 conftest 的 per-test ``AUDIT_DATA_DIR`` 保证（issue #137）。
+
+    存储层 ``get_data_dir()`` 每次调用解析 env，无需再 monkeypatch 模块属性。
+    保留此 fixture 只为给测试一个指向本用例数据目录的 Path。
+    """
     return tmp_path
 
 
@@ -78,7 +76,7 @@ def _pages(page_count: int = 3) -> dict:
 
 
 def _write_cache_entry(content_hash: str, *, source: str) -> None:
-    path = paddleocr_cache.CACHE_DIR / f"{content_hash}_{paddleocr_cache._MODEL_VERSION}.json"
+    path = paddleocr_cache.get_cache_dir() / f"{content_hash}_{paddleocr_cache._MODEL_VERSION}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps({"version": paddleocr_cache._MODEL_VERSION, "source": source, "result": {}}),

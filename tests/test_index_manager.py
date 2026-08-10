@@ -4,9 +4,6 @@
 FAISS 建索引/查询走假向量（断言结构与计数，不依赖语义相关性）。
 """
 
-import os
-import shutil
-
 import pytest
 
 from core.index_manager import (
@@ -21,15 +18,6 @@ from core.index_manager import (
     _chunk_prefix,
 )
 from core.parse_document import PageText
-
-
-@pytest.fixture(autouse=True)
-def cleanup():
-    """每个测试后清理索引数据。"""
-    yield
-    data_dir = os.environ["AUDIT_DATA_DIR"]
-    if os.path.exists(data_dir):
-        shutil.rmtree(data_dir)
 
 
 @pytest.fixture(autouse=True)

@@ -11,9 +11,6 @@
 调用方不必再记得写字段。
 """
 
-import os
-import shutil
-
 import pytest
 
 import services.doc_service as doc_svc
@@ -26,14 +23,6 @@ from core.index_manager import (
     index_document,
 )
 from models.knowledge_base import KnowledgeBase
-
-
-@pytest.fixture(autouse=True)
-def cleanup():
-    yield
-    data_dir = os.environ["AUDIT_DATA_DIR"]
-    if os.path.exists(data_dir):
-        shutil.rmtree(data_dir)
 
 
 @pytest.fixture(autouse=True)

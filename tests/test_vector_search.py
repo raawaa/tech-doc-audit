@@ -4,9 +4,6 @@
 （index_document → vec_search 往返）；ripgrep 路径用 monkeypatch _run_rga
 测解析逻辑（无需 rga/rg 二进制）。
 """
-import os
-import shutil
-
 import pytest
 
 from services import vector_search
@@ -21,14 +18,6 @@ from services.vector_search import (
     search_by_keywords,
     search_doc_by_text,
 )
-
-
-@pytest.fixture(autouse=True)
-def _cleanup():
-    yield
-    data_dir = os.environ["AUDIT_DATA_DIR"]
-    if os.path.exists(data_dir):
-        shutil.rmtree(data_dir)
 
 
 @pytest.fixture(autouse=True)

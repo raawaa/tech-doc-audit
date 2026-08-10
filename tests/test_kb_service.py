@@ -1,19 +1,8 @@
 """知识库服务单元测试"""
 
-import shutil
-
 import pytest
 
 import services.kb_service as kb_svc
-
-
-@pytest.fixture(autouse=True)
-def cleanup():
-    """每个测试后清理数据"""
-    yield
-    import storage.kb_repo as kb_repo
-    if kb_repo.KBS_DIR.exists():
-        shutil.rmtree(kb_repo.KBS_DIR)
 
 
 def test_create_kb():

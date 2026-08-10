@@ -43,7 +43,8 @@ def recover_stuck_indexes():
         kb_repo.update(kb)
         print(f"[startup] 恢复卡住的 KB: {kb.name} ({kb.id}) → index_status=none")
 
-    for kb_dir in (kb_repo.KBS_DIR.iterdir() if kb_repo.KBS_DIR.exists() else []):
+    kbs_dir = kb_repo.get_kbs_dir()
+    for kb_dir in (kbs_dir.iterdir() if kbs_dir.exists() else []):
         if not kb_dir.is_dir():
             continue
         all_docs = doc_repo.list_docs(kb_dir.name)

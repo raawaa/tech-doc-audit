@@ -78,23 +78,19 @@ def text_pdf_bytes() -> bytes:
     return path.read_bytes()
 
 
-def _make_reparse_target(tmp_path, monkeypatch, pdf_bytes: bytes):
+def _make_reparse_target(pdf_bytes: bytes):
     """创建 KB + 已落盘的 PDF doc + 已知 content_hash。
 
     返回 ``(kb, doc, content_hash)``。doc 的状态初始为 ``embedded``，
     模拟已经导入但 pages 数据缺损的场景。
-    """
-    monkeypatch.setenv("AUDIT_DATA_DIR", str(tmp_path))
-    # 重 import 一次，让 AUDIT_DATA_DIR 生效
-    import importlib
 
+    ``AUDIT_DATA_DIR`` 已由 conftest per-test fixture 指到本用例的 tmp_path
+    （issue #137），存储层 ``get_data_dir()`` 每次调用解析 env，无需再
+    setenv / reload 模块。
+    """
     import storage.kb_repo
     import storage.doc_repo
     import services.kb_service
-
-    importlib.reload(storage.kb_repo)
-    importlib.reload(storage.doc_repo)
-    importlib.reload(services.kb_service)
 
     kb = services.kb_service.create_kb(name="e2e-reparse", category="national")
     doc = storage.doc_repo.save_doc(
@@ -111,15 +107,15 @@ def _make_reparse_target(tmp_path, monkeypatch, pdf_bytes: bytes):
 
 
 @pytest.fixture
-def reparse_target_kb(tmp_path, monkeypatch, blank_pdf_bytes):
+def reparse_target_kb(blank_pdf_bytes):
     """空白 PDF 目标（空文本守卫用例，#135）。"""
-    return _make_reparse_target(tmp_path, monkeypatch, blank_pdf_bytes)
+    return _make_reparse_target(blank_pdf_bytes)
 
 
 @pytest.fixture
-def reparse_target_kb_text(tmp_path, monkeypatch, text_pdf_bytes):
+def reparse_target_kb_text(text_pdf_bytes):
     """文字层 PDF 目标（正路 pending_index → embedded 用例，#135）。"""
-    return _make_reparse_target(tmp_path, monkeypatch, text_pdf_bytes)
+    return _make_reparse_target(text_pdf_bytes)
 
 
 # doc 状态机的终态（与 services/reparse_service 的写入一致）

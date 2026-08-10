@@ -11,25 +11,14 @@
 通过 fake_models + 假文件布局，不触发真实 embedding。
 """
 
-import os
-import shutil
 import time
 import threading
-from pathlib import Path
 
 import pytest
 
 import storage.kb_repo as kb_repo
 from core.index_manager import _vectors_dir, get_kb_index_built
 from models.knowledge_base import KnowledgeBase
-
-
-@pytest.fixture(autouse=True)
-def cleanup():
-    yield
-    data_dir = os.environ["AUDIT_DATA_DIR"]
-    if os.path.exists(data_dir):
-        shutil.rmtree(data_dir)
 
 
 @pytest.fixture(autouse=True)

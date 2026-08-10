@@ -1,23 +1,8 @@
 """端到端集成测试"""
 
 import os
-import shutil
 
 import pytest
-
-
-@pytest.fixture(autouse=True)
-def cleanup():
-    """每个测试后清理数据"""
-    yield
-    # 清理数据目录
-    test_dir = os.environ["AUDIT_DATA_DIR"]
-    for item in os.listdir(test_dir):
-        path = os.path.join(test_dir, item)
-        if os.path.isdir(path):
-            shutil.rmtree(path)
-        else:
-            os.remove(path)
 
 
 def test_full_workflow():
