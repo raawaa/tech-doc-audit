@@ -148,6 +148,43 @@ def fake_models(monkeypatch):
         _LISettings.llm = prev_llm
 
 
+# ── PaddleOCR 网络守卫（issue #136）──────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _block_live_paddleocr_calls(monkeypatch):
+    """autouse：测试期间禁止真实 PaddleOCR HTTP 调用（issue #136）。
+
+    背景：fake/corrupt PDF 在 ``core.parse_document`` 里会落到 PaddleOCR 分支
+    （文字层检测失败 → OCR 路由），一旦开发者 ``.env`` 配了 OCR 凭证，测试就会
+    真的向第三方 OCR 服务发 HTTP（120s 提交超时 + 600s 轮询上限）——套件结果
+    取决于 ``.env``，这就是 test_import_document_async 间歇失败的环境根因。
+
+    本 fixture 把 ``_paddleocr_call``（提交 job / 轮询 / 取 JSONL 的 HTTP seam）
+    替换为直接抛错的守卫：任何没 opt-in 的测试一碰到 OCR 调用就带着守卫名
+    失败，而不是发起网络请求。
+
+    可覆盖性：monkeypatch 撤销是 LIFO —— 测试体内自己的
+    ``monkeypatch.setattr(pd_module, "_paddleocr_call", fake)``（test_parse_document
+    等既有惯例）在测试执行期间覆盖本守卫。
+
+    为什么不是清 env：``_PADDLEOCR_API_TOKEN`` / ``_PADDLEOCR_API_URL`` 在
+    ``core.parse_document`` import 时已绑定为模块常量，fixture 里清环境变量
+    不生效——必须替换调用 seam 本身。
+    """
+    import core.parse_document as _pd
+
+    def _guard(*args, **kwargs):
+        raise RuntimeError(
+            "PaddleOCR 网络守卫（issue #136）：测试期间禁止真实 OCR HTTP 调用。"
+            "需要 OCR 行为请在测试里 opt-in：monkeypatch "
+            "core.parse_document._paddleocr_call / _paddleocr_parse"
+            "（或 stub core.parse_document.parse_document）。"
+        )
+
+    monkeypatch.setattr(_pd, "_paddleocr_call", _guard)
+
+
 # ── 知识库元数据播种：让直接调用 index_document / search 的测试也能跑 ──────
 
 

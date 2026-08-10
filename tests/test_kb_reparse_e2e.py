@@ -234,7 +234,7 @@ def test_reparse_end_to_end_stores_pages_and_reindexes(reparse_target_kb_text):
 
 
 @requires_paddleocr
-def test_reparse_blank_pdf_marks_failed(reparse_target_kb):
+def test_reparse_blank_pdf_marks_failed(reparse_target_kb, monkeypatch):
     """空文本守卫（#100/#135）：空白 PDF → ``failed`` + KB 级失败标记。
 
     #135：空白 PDF 是守卫的靶心场景 —— PaddleOCR 返回空文本 → guard 抛
@@ -243,8 +243,19 @@ def test_reparse_blank_pdf_marks_failed(reparse_target_kb):
     1. doc.embedding_status == "failed"
     2. KB index_status == "failed"
     3. KB index_current_doc 记录守卫错误信息
+
+    issue #136：不连真实 OCR —— 测试自己 opt-in：把 ``_paddleocr_call``
+    （conftest 网络守卫替换掉的 HTTP seam）换成「总是返回空文本」的桩，模拟
+    OCR 对空白页返回空文本，网络守卫保持在场但不会被触发。
     """
+    import core.parse_document as pd_module
+    from core.parse_document import PageText, ParseResult
     from services.reparse_service import reparse_document as _reparse
+
+    def _empty_ocr_result(file_path, orientation_classify=False):
+        return ParseResult(by_page=[PageText(page=0, text="")], full_text="", layout=[])
+
+    monkeypatch.setattr(pd_module, "_paddleocr_call", _empty_ocr_result)
 
     kb, doc, _ = reparse_target_kb
 

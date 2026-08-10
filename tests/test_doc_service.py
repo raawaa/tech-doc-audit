@@ -9,6 +9,87 @@ import services.kb_service as kb_svc
 import services.doc_service as doc_svc
 
 
+# ── 共享异步等待 helper（issue #136）──────────────────────────────────────────
+#
+# 旧实现给后台索引线程写死轮询预算（50/100 次 × 0.1s），预算本身是拍脑袋的，
+# 且失败断言只报布尔 —— 超时拿到中间态 ``indexing`` 时无从排查。统一换成
+# 有上限的条件等待：上限给 30s（stub 掉 parse 层后后台线程毫秒级完成，超时
+# 只在真坏掉时发生），失败信息带上最后观测到的状态。
+
+TERMINAL_STATES = ("embedded", "failed")
+
+
+def _wait_docs_terminal(kb_id: str, doc_ids: list[str], *, timeout_s: float = 30.0) -> dict[str, str]:
+    """轮询直到全部 doc 的 ``embedding_status`` 到终态，返回最后观测的 status 映射。
+
+    注意磁盘元数据可能有瞬时竞态（写 truncate vs 读），捕获异常并重试。
+    超时抛 ``TimeoutError``，信息里带上最后观测到的状态，不只报布尔。
+    """
+    import storage.doc_repo as doc_repo
+
+    deadline = time.monotonic() + timeout_s
+    last: dict[str, str] = {}
+    while time.monotonic() < deadline:
+        try:
+            statuses = {}
+            for doc_id in doc_ids:
+                fresh = doc_repo.get_doc(kb_id, doc_id)
+                statuses[doc_id] = fresh.embedding_status if fresh else "doc 不可读"
+            last = statuses
+        except Exception:
+            time.sleep(0.1)
+            continue
+        if all(s in TERMINAL_STATES for s in statuses.values()):
+            return statuses
+        time.sleep(0.1)
+    raise TimeoutError(
+        f"文档 {timeout_s:.0f}s 内未全部到达终态 {TERMINAL_STATES}，"
+        f"最后观测到 {last}"
+    )
+
+
+def _wait_kb_searchable(kb_id: str, *, timeout_s: float = 30.0) -> None:
+    """轮询直到 KB 的 ``index_status`` 落到 searchable；失败带上最后观测状态。"""
+    import storage.kb_repo as kb_repo
+
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            kb = kb_repo.get(kb_id)
+            last = kb.index_status if kb is not None else "KB 不可读"
+        except Exception:
+            time.sleep(0.1)
+            continue
+        if last == "searchable":
+            return
+        time.sleep(0.1)
+    raise TimeoutError(
+        f"KB {kb_id} {timeout_s:.0f}s 内未到达 searchable，最后 index_status={last!r}"
+    )
+
+
+@pytest.fixture
+def stub_pdf_parse(monkeypatch):
+    """把 ``core.parse_document.parse_document`` 替换为「空 ParseResult」桩。
+
+    issue #136：fake/corrupt PDF 的真实解析路径会落到 PaddleOCR 分支（文字层
+    检测失败 → OCR 路由），测试里等于连第三方 OCR 服务，成败还取决于 ``.env``
+    是否配了凭证。异步导入测试验证的契约本不在解析内容 —— 桩掉解析入口后：
+    不触发任何 PDF 路由 / OCR / embedding 模型（空 full_text 触发
+    ``vector_search.index_document`` 的 20 字符 early-return），后台线程只走
+    状态机推进，毫秒级完成。
+    """
+    from core.parse_document import PageText, ParseResult
+
+    empty = ParseResult(by_page=[PageText(page=0, text="")], full_text="", layout=[])
+
+    def _fake_parse(file_path: str, **kwargs) -> ParseResult:
+        return empty
+
+    monkeypatch.setattr("core.parse_document.parse_document", _fake_parse)
+
+
 @pytest.fixture(autouse=True)
 def cleanup():
     """每个测试后清理数据"""
@@ -31,8 +112,13 @@ def test_import_document():
     assert doc.kb_id == kb.id
 
 
-def test_import_document_async():
-    """测试异步导入文档（async_index=True 生产路径）。"""
+def test_import_document_async(stub_pdf_parse):
+    """测试异步导入文档（async_index=True 生产路径）。
+
+    issue #136：stub 掉 parse 层（见 ``stub_pdf_parse``），后台线程只推进
+    索引状态机，毫秒级完成 —— 不再有写死 5 秒预算撞上中间态 ``indexing`` 的
+    flake，结果也不依赖 ``.env`` 是否配了 OCR 凭证。
+    """
     import storage.kb_repo as kb_repo
 
     kb = kb_svc.create_kb(name="测试异步", category="national")
@@ -43,21 +129,8 @@ def test_import_document_async():
     # async 导入返回时可能仍在 pending_index，也可能已被后台线程标记为 indexing
     assert doc.embedding_status in ("pending_index", "indexing")
 
-    # 等待后台线程完成（fake PDF 空文本 → 快速返回）
-    import storage.doc_repo as _dr
-    for _ in range(50):
-        try:
-            doc = _dr.get_doc(kb.id, doc.id)
-        except Exception:
-            time.sleep(0.1)
-            continue
-        if doc and doc.embedding_status in ("embedded", "failed"):
-            break
-        time.sleep(0.1)
-
-    assert doc.embedding_status in ("embedded", "failed"), (
-        f"expected embedded/failed, got {doc.embedding_status}"
-    )
+    # 等待后台线程完成（stub 空文本 → early-return → embedded/failed）
+    _wait_docs_terminal(kb.id, [doc.id])
 
     # 验证 document_ids 包含该文档
     kb = kb_repo.get(kb.id)
@@ -65,11 +138,15 @@ def test_import_document_async():
     assert doc.id in kb.document_ids
 
     # 验证 KB 状态恢复 searchable
-    assert kb.index_status == "searchable"
+    _wait_kb_searchable(kb.id)
 
 
-def test_import_document_async_multiple():
-    """测试多次异步导入（防 document_ids 被覆盖）。"""
+def test_import_document_async_multiple(stub_pdf_parse):
+    """测试多次异步导入（防 document_ids 被覆盖）。
+
+    issue #136：stub 掉 parse 层后 5 个后台线程只走状态机推进，毫秒级完成；
+    等待用共享的有界轮询 helper，超时报出最后观测到的状态。
+    """
     import storage.kb_repo as kb_repo
 
     kb = kb_svc.create_kb(name="测试并发异步", category="national")
@@ -80,12 +157,8 @@ def test_import_document_async_multiple():
         doc = doc_svc.import_document(kb.id, f"test_{i}.pdf", content, async_index=True)
         docs.append(doc)
 
-    # 等待所有后台线程完成（状态变为 embedded 或 failed）
-    for _ in range(100):
-        not_done = [d for d in docs if d.embedding_status not in ("embedded", "failed")]
-        if not not_done:
-            break
-        time.sleep(0.1)
+    # 等待所有后台线程完成（从 repo 重读，状态变为 embedded 或 failed）
+    _wait_docs_terminal(kb.id, [d.id for d in docs])
 
     # 验证所有文档 id 都在 kb.document_ids 中
     kb = kb_repo.get(kb.id)
@@ -95,12 +168,7 @@ def test_import_document_async_multiple():
 
     # 异步路径在每篇 doc 索引完成时都会把 KB 写 searchable，但并发调度下
     # 最后一个线程可能把自己的状态写完后整体可见——轮询直到 searchable
-    for _ in range(100):
-        kb = kb_repo.get(kb.id)
-        if kb.index_status == "searchable":
-            break
-        time.sleep(0.1)
-    assert kb.index_status == "searchable"
+    _wait_kb_searchable(kb.id)
 
 
 def test_batch_import_documents_async():
