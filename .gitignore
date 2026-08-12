@@ -61,3 +61,7 @@ test-results/
 
 # Agent session metadata (settings, worktrees, hook output)
 /.claude/
+
+# Wayfinder #141 / #142 一次性探针脚本 — 跑完即扔,不进 git
+scripts/_t3_probe_siliconflow.py
+scripts/_t4_spike.py
