@@ -219,7 +219,14 @@ def seed_searchable_kb():
     ADR-0002 后，``core.index_manager.search()`` / ``get_kb_index_built()``
     直接读 ``kb.index_status``。生产路径经 doc_svc 自然维护这个状态，
     单元测试若绕过 doc_svc 直接调底层 ``index_document``，需要手工 seed。
+
+    ``index_document`` 现在还会断言 ``vectors/index.meta.json``（issues/144
+    AC#3）；本 fixture 同步写一份 BAAI/bge-m3 + dim=1024 的 meta 让旧测试
+    不需要再为每个 KB 显式 seed meta。生产索引由 ``scripts/backfill_kb_meta.py``
+    一次性回填。
     """
+    from core.index_manager import _write_index_meta
+
     seeded: list[str] = []
 
     def _seed(kb_id: str):
@@ -230,6 +237,11 @@ def seed_searchable_kb():
         kb.document_ids = []
         kb_repo.update(kb)
         seeded.append(kb_id)
+        # issues/144 写入前的硬关（issues/144 AC#3）—— 测试 fixture 同步
+        # 提供生产体系元数据（生产路径由 doc_svc 落，或由 backfill 回填）。
+        _write_index_meta(
+            kb_id, model_id="BAAI/bge-m3", dim=1024, force=True,
+        )
         return kb_id
 
     yield _seed

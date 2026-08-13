@@ -18,8 +18,25 @@ def _use_fake_models(fake_models):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _auto_seed_meta():
+    """issues/144 AC#3 ``index_document`` 写入前断言 meta 存在；本文件绕过
+    doc_svc 直接调 index_document，由本 fixture 自动按 KB 写出 meta。
+
+    取测试调用的 ``kb_id`` set 需要函数体运行后才能收集到,所以这里只给每条
+    KB 创建一份(用 ``_index`` 同步带 meta 写入)。
+    """
+    from core.index_manager import _write_index_meta
+    yield  # meta 由 _index() 内部的 wrapper 直接写
+
+
 def _index(kb_id: str, docs: list[tuple[str, str]]):
-    """建索引：docs = [(doc_id, text), ...]（text 需 >=20 字符）。"""
+    """建索引：docs = [(doc_id, text), ...]（text 需 >=20 字符）。
+
+    issues/144 AC#3 先写 meta 再 index_document。
+    """
+    from core.index_manager import _write_index_meta
+    _write_index_meta(kb_id, model_id="BAAI/bge-m3", dim=1024, force=True)
     for doc_id, text in docs:
         index_document(kb_id, doc_id, text, source_name=f"{doc_id}.txt")
 

@@ -57,64 +57,118 @@ _init()
 
 _embed_model = None
 _embed_model_lock = threading.Lock()
-# 全局 GPU 推理锁：HuggingFaceEmbedding / SentenceTransformerRerank 的 GPU
-# forward 非线程安全。此锁确保同时只有一个线程执行模型前向传播，
-# 避免 N 个并发线程各自分配完整激活张量撑爆显存。
+
+# 全局 GPU 推理锁（可选 local 后端入口）。
+# 当前主路径是 SiliconFlow 在线 embedding / rerank，不走 GPU。
+# 保留这把锁是为了：
+# (a) ``EMBED_PROVIDER=local``（本机 bge-m3 + bge-reranker-v2-m3）回退路径仍能
+#     维持"HuggingFaceEmbedding / SentenceTransformerRerank 的 GPU forward 非
+#     线程安全"约束；
+# (b) 未来随时可加回 local 后端，不必重构任何持锁代码。
+# 本机默认不跑 torch，锁当前 unused。详见 issues/138 / #144。
 _gpu_inference_lock = threading.RLock()
 
 # 代理环境变量操作锁：_create_safe_ollama 和 deepseek provider 需要临时
 # 移除 ALL_PROXY 环境变量。此锁确保移除→恢复期间不会有其他线程读到中间状态。
+# SiliconFlow 客户端也共用这把锁（T3 §4.2 四处统一模式）。
 _proxy_env_lock = threading.Lock()
 
 
 def get_gpu_inference_lock() -> threading.RLock:
-    """获取全局 GPU 推理锁。"""
+    """获取全局 GPU 推理锁。
+
+    主路径（``EMBED_PROVIDER=siliconflow``）不持锁；本函数仍可调用，仅当
+    ``EMBED_PROVIDER=local`` 回退时本锁才被 index_manager 实际持有。
+    """
     return _gpu_inference_lock
 
 
+# ── Embed / Rerank provider 抽象（由 #138 map 锁定，#143 T5 收尾）───────────
+# 与 ``LLM_PROVIDER`` 同模式：
+# - env ``EMBED_PROVIDER`` 取值 ``local``（本机 bge-m3 + bge-reranker-v2-m3）或
+#   ``siliconflow``（线上 API）；
+# - 默认 ``siliconflow``（issue #144 acceptance criteria 第 3-5 项要求该路径生效）；
+# - provider 加载失败降级为 None，上游调用方负责 raise。
+EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "siliconflow").lower().strip()
+# 默认值与 siliconflow_client 锁定常量一致（issue #144 AC#1）。
+DEFAULT_EMBEDDING_MODEL_ID = "BAAI/bge-m3"
+DEFAULT_EMBEDDING_DIM = 1024
+
+
 def get_embed_model():
-    """线程安全地延迟加载 embedding 模型（首次调用时加载 ~2GB bge-m3）。
+    """线程安全地延迟加载 embedding 适配器（首次调用时构造）。
 
-    get_embed_model 可能被多个线程同时调用（例如 ThreadPoolExecutor
-    中 8 个 topic audit 并行），必须保证模型只被加载一次。
+    Provider 路由（issue #144 acceptance criteria 第 3 项）:
 
-    加载失败时降级为 None（与 get_reranker() 行为一致），不抛异常。
-    上游调用方（index_manager 等）需检查返回值并处理。
+    - ``siliconflow``（默认）:返回 ``core.siliconflow_client.SiliconFlowEmbedding``
+      适配器,后端走 SiliconFlow 在线 API。需要 ``SILICONFLOW_API_KEY``;
+      缺 key 时降级为 None(同 local 路径语义)。
+    - ``local``:返回本机 ``HuggingFaceEmbedding(BAAI/bge-m3, normalize=True,
+      max_length=512)``,沿用 V0 行为,作回退。模型文件未下载时降级为 None。
+
+    不论 provider,返回值都实现 ``BaseEmbedding``(``get_text_embedding_batch``
+    / ``_get_text_embeddings``),``index_document`` / ``as_retriever()`` 无需
+    改动即可调用。但只有 ``siliconflow`` 路径在 issue #144 验收通过时才被
+    主生产链路使用。
+
+    加载失败时降级为 None(与旧行为一致),不抛异常。上游调用方
+    ``index_document`` 检查返回值并 ``raise RuntimeError``(沿旧合约)。
     """
     global _embed_model
     if _embed_model is not None:
         return _embed_model
     with _embed_model_lock:
-        # 双检锁：避免多个线程同时进入后各自加载一份模型
+        # 双检锁:避免多个线程同时进入后各自加载一份模型
         if _embed_model is not None:
             return _embed_model
-        from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-        _modelscope_path = os.path.expanduser("~/.cache/modelscope/hub/BAAI/bge-m3")
-        if os.path.isdir(_modelscope_path):
-            # ModelScope 本地缓存优先（无网络环境）
-            _model_path = _modelscope_path
+        if EMBED_PROVIDER == "siliconflow":
+            from core.siliconflow_client import SiliconFlowEmbedding
+            try:
+                _embed_model = SiliconFlowEmbedding(
+                    model_name=DEFAULT_EMBEDDING_MODEL_ID,
+                    embed_dim=DEFAULT_EMBEDDING_DIM,
+                )
+            except Exception as e:
+                _logger.warning(
+                    "SiliconFlow embedding init failed (%s). "
+                    "确认 .env 有 SILICONFLOW_API_KEY,或临时设 EMBED_PROVIDER=local 回退",
+                    e,
+                )
+                _embed_model = None  # type: ignore[assignment]
+        elif EMBED_PROVIDER == "local":
+            from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+            _modelscope_path = os.path.expanduser("~/.cache/modelscope/hub/BAAI/bge-m3")
+            if os.path.isdir(_modelscope_path):
+                # ModelScope 本地缓存优先（无网络环境）
+                _model_path = _modelscope_path
+            else:
+                _model_path = "BAAI/bge-m3"
+            try:
+                _embed_model = HuggingFaceEmbedding(
+                    model_name=_model_path,
+                    normalize=True,
+                    device=os.getenv("EMBED_DEVICE", None),
+                    embed_batch_size=int(os.environ.get("EMBED_BATCH_SIZE", "8")),
+                    # bge-m3 ~2GB VRAM，batch_size=8 峰值约 3-4GB。
+                    # 显存紧张时设 EMBED_BATCH_SIZE=2
+                    max_length=512,       # 匹配 chunk_size，防止超长序列拉高内存
+                )
+            except Exception as e:
+                _logger.warning(
+                    "embed_model init failed (%s). "
+                    "Please download bge-m3 first: "
+                    "modelscope download BAAI/bge-m3 --local_dir %s  "
+                    "or set HF_HUB_OFFLINE=0 HF_ENDPOINT=https://hf-mirror.com in .env",
+                    e, _modelscope_path,
+                )
+                _embed_model = None  # type: ignore[assignment]
         else:
-            _model_path = "BAAI/bge-m3"
-        try:
-            _embed_model = HuggingFaceEmbedding(
-                model_name=_model_path,
-                normalize=True,
-                device=os.getenv("EMBED_DEVICE", None),
-                embed_batch_size=int(os.environ.get("EMBED_BATCH_SIZE", "8")),
-                # bge-m3 ~2GB VRAM，batch_size=8 峰值约 3-4GB。
-                # 显存紧张时设 EMBED_BATCH_SIZE=2
-                max_length=512,       # 匹配 chunk_size，防止超长序列拉高内存
-            )
+            raise ValueError(f"Unknown EMBED_PROVIDER: {EMBED_PROVIDER}")
+
+        # 同步到 LlamaIndex 全局 Settings,让 as_retriever() 等不走 get_embed_model()
+        # 的路径也看到一致 embed_model
+        if _embed_model is not None:
             Settings.embed_model = _embed_model
-        except Exception as e:
-            _logger.warning(
-                "embed_model init failed (%s). "
-                "Please download bge-m3 first: "
-                "modelscope download BAAI/bge-m3 --local_dir %s  "
-                "or set HF_HUB_OFFLINE=0 HF_ENDPOINT=https://hf-mirror.com in .env",
-                e, _modelscope_path,
-            )
-            _embed_model = None  # type: ignore[assignment]
     return _embed_model
 
 
@@ -134,21 +188,34 @@ def get_reranker_config() -> dict:
 
 
 def run_reranker(nodes: list, query_str: str, config: dict | None = None) -> list:
-    """按需加载 reranker → 推理 → 立即卸载释放显存。
+    """按需 rerank → 返回 top_n 节点。
 
-    在 GPU 锁内调用（调用方负责持锁），确保不会与 embed 模型并发推理。
-    加载 ~1.3s、推理 ~0.2s、卸载 ~0s，总开销可接受。
+    Provider 路由（issue #144 acceptance criteria 第 5 项）:
+
+    - ``siliconflow``（默认）:走 ``core.siliconflow_client.rerank_with_siliconflow``。
+      HTTP 调用、无 GPU、top_n 取 ``RERANKER_TOP_N`` 环境变量。
+    - ``local``:按需加载 ``CrossEncoder`` → 推理 → 立即卸载释放显存。
+      在 GPU 锁内调用（调用方负责持锁），确保不会与 embed 模型并发推理。
+      加载 ~1.3s、推理 ~0.2s、卸载 ~0s，总开销可接受。
 
     Args:
         nodes: NodeWithScore 列表（LlamaIndex 格式）。
         query_str: 查询字符串。
-        config: get_reranker_config() 返回的配置，None 则自动获取。
+        config: get_reranker_config() 返回的配置，仅 local 路径使用；SF 路径
+                直接读环境变量。
 
     Returns:
         重排序后的 NodeWithScore 列表（取 top_n），失败时返回原始列表。
     """
     if not nodes:
         return nodes
+
+    if EMBED_PROVIDER == "siliconflow":
+        from core.siliconflow_client import rerank_with_siliconflow as _sf_rerank
+        top_n = int(os.environ.get("RERANKER_TOP_N", "5")) if config is None else int(config.get("top_n", 5))
+        return _sf_rerank(nodes, query_str, top_n=top_n)
+
+    # local 路径(回退)
     if config is None:
         config = get_reranker_config()
 

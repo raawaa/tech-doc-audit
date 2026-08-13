@@ -172,12 +172,15 @@ class TestV8S4FlagIssueBlockRange:
         kb_id = "test_kb_v8s4_lookup"
         import storage.kb_repo as _kb_repo
         from models.knowledge_base import KnowledgeBase
+        from core.index_manager import _write_index_meta
         kb = KnowledgeBase(id=kb_id, name="v8s4", category="national")
         _kb_repo.update(kb)
         kb = _kb_repo.get(kb_id)
         kb.document_ids = ["doc_v8s4"]
         kb.index_status = "searchable"
         _kb_repo.update(kb)
+        # issues/144 AC#3
+        _write_index_meta(kb_id, model_id="BAAI/bge-m3", dim=1024, force=True)
 
         full_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
         index_document(
@@ -232,12 +235,15 @@ class TestV8S4FlagIssueBlockRange:
         kb_id = "test_kb_v8s4_p0"
         import storage.kb_repo as _kb_repo
         from models.knowledge_base import KnowledgeBase
+        from core.index_manager import _write_index_meta
         kb = KnowledgeBase(id=kb_id, name="v8s4p0", category="national")
         _kb_repo.update(kb)
         kb = _kb_repo.get(kb_id)
         kb.document_ids = ["doc_v8s4p0"]
         kb.index_status = "searchable"
         _kb_repo.update(kb)
+        # issues/144 AC#3
+        _write_index_meta(kb_id, model_id="BAAI/bge-m3", dim=1024, force=True)
 
         full_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
         index_document(
@@ -267,12 +273,15 @@ class TestV8S4FlagIssueBlockRange:
         kb_id = "test_kb_v8s4_mismatch"
         import storage.kb_repo as _kb_repo
         from models.knowledge_base import KnowledgeBase
+        from core.index_manager import _write_index_meta
         kb = KnowledgeBase(id=kb_id, name="v8s4mm", category="national")
         _kb_repo.update(kb)
         kb = _kb_repo.get(kb_id)
         kb.document_ids = ["doc_v8s4mm"]
         kb.index_status = "searchable"
         _kb_repo.update(kb)
+        # issues/144 AC#3
+        _write_index_meta(kb_id, model_id="BAAI/bge-m3", dim=1024, force=True)
 
         full_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
         index_document(
@@ -303,12 +312,16 @@ class TestV8S4FlagIssueBlockRange:
         kb_id = "test_kb_v8s4_flag"
         import storage.kb_repo as _kb_repo
         from models.knowledge_base import KnowledgeBase
+        from core.index_manager import _write_index_meta
         kb = KnowledgeBase(id=kb_id, name="v8s4flag", category="national")
         _kb_repo.update(kb)
         kb = _kb_repo.get(kb_id)
         kb.document_ids = ["doc_flag"]
         kb.index_status = "searchable"
         _kb_repo.update(kb)
+        # issues/144 AC#3：production 路径走 services.kb_service.create_kb
+        # 自动落 meta;此处直接建 KB 元数据,显式 seed。
+        _write_index_meta(kb_id, model_id="BAAI/bge-m3", dim=1024, force=True)
 
         full_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
         index_document(

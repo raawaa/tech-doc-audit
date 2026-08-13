@@ -62,6 +62,108 @@ def _ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
 
+# ── 索引元数据 sidecar：存放 embedding 体系元信息 ────────────────────────────
+# 由 issue #144 acceptance criteria 第 1 项 + 第 2 项引入。
+# 每个 KB 索引目录必须有 ``index.meta.json``，含 ``embedding_model_id`` +
+# ``embedding_dim`` + ``created_at``；写入新 chunk 前断言一致，防止
+# ``repro_kb/d1.npy`` 这种"非 bge-m3 向量混入生产路径"的事件再次发生
+# (T4 §5.1 spike 已观察到一次)。
+#
+# 不变量：
+# - ``embedding_model_id``:当前生产路径写 ``"BAAI/bge-m3"``(无论 local / SF,
+#   模型本身相同,字面 ID 一致);
+# - ``embedding_dim``:1024(SF 与本机 bge-m3 实测一致,T3 §1.2);
+# - ``created_at``:meta 首次落盘时间,AtomicWrite,不可回改。
+#
+# 旧 KB(144 之前生产索引)在 #144 验收前由一次性脚本
+# ``scripts/backfill_kb_meta.py`` 写入；新写入的 KB 由 ``_save_index_meta``
+# 自动创建。
+
+#: ``index.meta.json`` 的文件名——与 ``default__vector_store.json`` 同级。
+INDEX_META_FILENAME = "index.meta.json"
+
+
+def _index_meta_path(kb_id: str) -> Path:
+    return _vectors_dir(kb_id) / INDEX_META_FILENAME
+
+
+def _read_index_meta(kb_id: str) -> Optional[dict]:
+    """读取 KB 的 ``index.meta.json``；缺失返回 None(backfill 待补)。"""
+    p = _index_meta_path(kb_id)
+    if not p.exists():
+        return None
+    try:
+        return _json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        _logger.warning("failed to read index.meta.json for kb %s: %s", kb_id, e)
+        return None
+
+
+def _write_index_meta(kb_id: str, *, model_id: str, dim: int,
+                     created_at: Optional[str] = None,
+                     force: bool = False) -> None:
+    """原子写入 ``index.meta.json``。
+
+    Args:
+        model_id / dim: 来自 provider 的当前标识(``BAAI/bge-m3`` / 1024)。
+        created_at: ISO8601 字符串;None 时自动生成当前时间。
+        force: True 时强制覆盖(给 backfill 脚本用);False 时已存在则保留原
+               ``created_at`` 不变(只更新 ``updated_at``)。
+    """
+    from datetime import datetime, timezone
+    p = _index_meta_path(kb_id)
+    _ensure_dir(p.parent)
+    now = (created_at or datetime.now(timezone.utc).isoformat())
+    if force:
+        payload = {
+            "embedding_model_id": model_id,
+            "embedding_dim": dim,
+            "created_at": now,
+        }
+    else:
+        existing = _read_index_meta(kb_id) or {}
+        payload = {
+            "embedding_model_id": model_id,
+            "embedding_dim": dim,
+            "created_at": existing.get("created_at", now),
+        }
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(_json.dumps(payload, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    tmp.rename(p)
+
+
+def _assert_kb_embedding_system_matches(kb_id: str, *, model_id: str,
+                                        dim: int) -> None:
+    """断言 KB 索引体系的 ``embedding_model_id`` / ``embedding_dim`` 与
+    当前 provider 给定的一致(写入新 chunk 前必调,issues/144 AC#3)。
+
+    Contract:
+      - meta 文件缺失:**raise RuntimeError**("需先跑 backfill 写入")——
+        缺失意味着当前 KB 还没建立"该用什么向量"的明确立场,任何"看起来
+        安全"的隐式假定都是错的(spec 措辞"否则 raise,不入库")。
+        推荐先跑 ``scripts/backfill_kb_meta.py``。
+      - 已有 meta 但 model_id / dim 不符:**raise RuntimeError**,不入库。
+        这是防止"非 bge-m3 向量混入生产路径"的硬关(T4 §5.1 spike 复盘)。
+    """
+    meta = _read_index_meta(kb_id)
+    if meta is None:
+        raise RuntimeError(
+            f"kb {kb_id} 缺 index.meta.json;index_document 不入库。"
+            f"请先跑 scripts/backfill_kb_meta.py 一次性回填"
+            f"(model_id={model_id}, dim={dim})."
+        )
+    existing_id = meta.get("embedding_model_id")
+    existing_dim = meta.get("embedding_dim")
+    if existing_id != model_id or existing_dim != dim:
+        raise RuntimeError(
+            f"kb {kb_id} embedding 体系不一致:index.meta.json 记录 "
+            f"({existing_id!r}, dim={existing_dim}),"
+            f"当前 provider 要求 ({model_id!r}, dim={dim})."
+            f"可能混入非 {model_id} 向量(T4 §5.1 spike 复盘);禁止入库。"
+        )
+
+
 # ── 索引创建 / 加载 / 缓存 ─────────────────────────────────────────────────────
 
 def _create_index(dim: int = 1024) -> VectorStoreIndex:
@@ -412,6 +514,15 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = "",
         if embed_model is None:
             raise RuntimeError("Embedding model not loaded, cannot index document")
 
+        # issues/144 AC#3：写入新 chunk 前断言 KB 索引体系的
+        # ``embedding_model_id`` / ``embedding_dim`` 与当前 provider 一致,
+        # 否则 raise 不入库(防 repro_kb 那种"非 bge-m3 向量混入"事件)。
+        # KB 当前生产 provider 是 bge-m3(无论走 local SF,模型字面 ID 一致),
+        # 所以这里直接读 provider 常量。
+        _assert_kb_embedding_system_matches(
+            kb_id, model_id="BAAI/bge-m3", dim=1024,
+        )
+
         index = get_kb_index(kb_id)
 
         # 整篇切 chunk（V4：不再按页硬切）
@@ -512,6 +623,11 @@ def index_documents_batch(
         embed_model = get_embed_model()
         if embed_model is None:
             raise RuntimeError("Embedding model not loaded, cannot index documents")
+
+        # issues/144 AC#3：批量写入前断言 KB 索引体系一致(同上 index_document)。
+        _assert_kb_embedding_system_matches(
+            kb_id, model_id="BAAI/bge-m3", dim=1024,
+        )
 
         index = get_kb_index(kb_id)
         total = len(docs)
@@ -620,9 +736,21 @@ def remove_document(kb_id: str, doc_id: str):
         vectors_dir = _vectors_dir(kb_id)
 
         if not remaining_ids:
-            # 无剩余文档，清理所有索引文件
+            # 无剩余文档，清理所有索引文件。但 ``index.meta.json`` 是
+            # production KB 元数据,问题描述"该 KB 用什么 embedding"
+            # 不能随向量被物理删除(issues/144 AC#3);留 meta,
+            # 等下次 ``index_document`` 写入前断言可过。
             if vectors_dir.exists():
+                meta_p = _index_meta_path(kb_id)
+                meta_existed = meta_p.exists()
                 shutil.rmtree(str(vectors_dir))
+                if meta_existed:
+                    # 重建空 vectors/(已经在 rmtree 里被删);只保留 meta
+                    _ensure_dir(vectors_dir)
+                    _write_index_meta(
+                        kb_id, model_id="BAAI/bge-m3", dim=1024,
+                        force=True,
+                    )
             return
 
         # 从向量缓存重建（_rebuild_from_vectors 成功后 _persist 会覆盖旧 FAISS 文件；
@@ -713,6 +841,14 @@ def _rebuild_from_vectors(kb_id: str, doc_ids: list[str], progress_callback=None
             gc.collect()
 
     _persist(kb_id, new_index)
+    # issues/144 AC#3：rebuild 路径不写新 chunk(向量从 .npy 重用),但必须确保
+    # ``index.meta.json`` 存在,后续 ``index_document`` 写入前断言可过。
+    # 留用现有 meta;若没有(极端:纯裸重建)写一份(给生产体系 = bge-m3)。
+    meta = _read_index_meta(kb_id)
+    if meta is None:
+        _write_index_meta(
+            kb_id, model_id="BAAI/bge-m3", dim=1024, force=True,
+        )
     _logger.info("rebuilt index for kb %s from %d/%d docs (cached vectors)", kb_id, loaded, len(doc_ids))
 
 

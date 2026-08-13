@@ -73,8 +73,11 @@ def test_rebuild_failure_writes_failed_with_error():
     函数顶层 try/except 把字段写回 'failed' 并保留错误信息。
     """
     import unittest.mock as mock
+    from core.index_manager import _write_index_meta
 
     kb = kb_svc.create_kb(name="fail KB", category="national")
+    # issues/144 AC#3：让 doc_svc.import_document 不被新断言阻断
+    _write_index_meta(kb.id, model_id="BAAI/bge-m3", dim=1024, force=True)
     doc_svc.import_document(
         kb.id, "x.md",
         "# 重建失败测试\n\n## 一章\n\n用于触发 KB rebuild 的失败路径。".encode(),

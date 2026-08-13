@@ -37,7 +37,13 @@ def seed_searchable_kb():
     ADR-0002 单真相后，``search()`` 直接读 ``kb.index_status``——
     之前测试因为 dual-source 而无需建元数据即可搜，现必须显式 seed 一个 KB + 标记 searchable。
     生产路径走 doc_service 自然会维护这个状态；此处手工 mirror 即可。
+
+    issues/144 AC#3:`index_document` 写入前会断言 ``vectors/index.meta.json``
+    与 provider 一致。本 fixture 同步写一份 ``BAAI/bge-m3 + dim=1024`` 让
+    旧测试不需要每 KB 显式 seed meta。生产 meta 由 doc_svc 或
+    ``scripts/backfill_kb_meta.py`` 维护。
     """
+    from core.index_manager import _write_index_meta
     seeded: list[str] = []
 
     def _seed(kb_id: str):
@@ -50,6 +56,9 @@ def seed_searchable_kb():
         kb.document_ids = []
         _kb_repo.update(kb)
         seeded.append(kb_id)
+        _write_index_meta(
+            kb_id, model_id="BAAI/bge-m3", dim=1024, force=True,
+        )
         return kb_id
 
     yield _seed
@@ -166,7 +175,11 @@ def test_rebuild_kb_index():
     # 先通过 doc_svc.import_document 导入文档（自动处理 doc_id → document_ids 映射）
     import services.doc_service as doc_svc
     import services.kb_service as kb_svc
+    from core.index_manager import _write_index_meta
     kb = kb_svc.create_kb(name="测试重建", category="national")
+    # issues/144 AC#3:production 索引路径在 import 时由 doc_svc 维护 meta,
+    # 单元测试绕过 doc_svc,显式 seed。
+    _write_index_meta(kb.id, model_id="BAAI/bge-m3", dim=1024, force=True)
 
     doc_001 = doc_svc.import_document(
         kb.id, "设计说明.md",
@@ -304,8 +317,11 @@ def test_async_md_index_builds_faiss():
     import services.kb_service as kb_svc
     import services.doc_service as doc_svc
     import storage.kb_repo as kb_repo
+    from core.index_manager import _write_index_meta
 
     kb = kb_svc.create_kb(name="异步MD建索引", category="national")
+    # issues/144 AC#3（见上）
+    _write_index_meta(kb.id, model_id="BAAI/bge-m3", dim=1024, force=True)
     content = (
         "# 技术规范\n\n## 第一章 总则\n\n本规范规定技术要求与验收标准内容。\n\n"
         "## 第二章 要求\n\n各项参数应符合国家标准规定要求。"
@@ -332,9 +348,17 @@ def test_async_md_index_builds_faiss():
 
 def test_save_and_cleanup_doc_vectors():
     """索引文档后验证 .npy 和 _nodes.json 文件落盘，删除后验证清理。"""
-    from core.index_manager import _save_doc_vectors, _cleanup_doc_vectors, _vectors_dir
+    from core.index_manager import (
+        _save_doc_vectors,
+        _cleanup_doc_vectors,
+        _vectors_dir,
+        _write_index_meta,
+    )
 
     kb_id = "test_kb_vectors_persist"
+    # issues/144 AC#3:index_document 写入前断言 meta 一致;production 路径
+    # 由 doc_svc 自然维护或 backfill 一次性回填。这里直接写测试用 meta。
+    _write_index_meta(kb_id, model_id="BAAI/bge-m3", dim=1024, force=True)
 
     # 索引文档
     index_document(
@@ -472,8 +496,11 @@ def test_rebuild_kb_index_mixed_vectors():
     import services.doc_service as doc_svc
     import storage.kb_repo as kb_repo
     import storage.doc_repo as doc_repo
+    from core.index_manager import _write_index_meta
 
     kb = kb_svc.create_kb(name="混合重建", category="national")
+    # issues/144 AC#3
+    _write_index_meta(kb.id, model_id="BAAI/bge-m3", dim=1024, force=True)
 
     # doc_A：正常导入（会建索引 + 向量缓存）
     doc_a = doc_svc.import_document(
