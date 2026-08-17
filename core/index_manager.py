@@ -13,7 +13,15 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import (
+    Retrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+# OpenAI SDK 的连接层错误类型(ADR-0007 §2 重试白名单)。openai 是硬依赖
+# (pyproject.toml),缺包时 import 即崩;不留 fallback 兜底,故障定位更直接。
+from openai import APIConnectionError, APITimeoutError
 
 from core.logger import get_logger
 
@@ -295,18 +303,58 @@ def _cleanup_doc_vectors(kb_id: str, doc_id: str):
             f.unlink()
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=30),
-    reraise=True,
-)
-def _embed_batch_with_retry(embed_model, texts: list[str]) -> list:
-    """批量 embedding，瞬态错误自动重试（最多 3 次，指数退避）。
+# ── 批量 embedding 重试层（issues/145 / ADR-0007 §2）────────────────────────
+#
+# 协议：
+# - HTTP 层错误（429/408/409/5xx）由 OpenAI SDK 内置重试（``max_retries=2``，
+#   尊重 ``retry-after`` + jitter）在 ``core.siliconflow_client.make_siliconflow_client``
+#   里负责 —— 撞墙 → SDK 重试 → SDK 实在扛不住才上抛。
+# - 连接层错误（``APIConnectionError`` / ``APITimeoutError``）由本层 tenacity
+#   负责，仅批量路径：3 次，2s→30s 指数退避（``stop_after_attempt(3)`` +
+#   ``wait_exponential(multiplier=2, min=2, max=30)``）。
+# - 查询路径零附加重试：``_embed_with_siliconflow`` 无 tenacity 包裹。
+# - 不可重试错误（模型缺失 / ValueError / RuntimeError 等）**不**进入本层
+#   重试 —— ``retry_if_exception_type((APIConnectionError, APITimeoutError))``
+#   严格白名单。
+#
+# 之所以用 ``Retrying(...)`` 而非 ``@retry`` 装饰器：常量在调用时解析，测试
+# 可 monkeypatch 三个 ``_EMBED_BATCH_RETRY_*`` 常量把等待压缩到 0，避免 2s+4s
+# 的真实 wall-time。装饰器版本会把值烘在装饰时，测试改不动。
 
-    可重试的错误：GPU 瞬态错误、CUDA 异常。
-    不可重试的错误（如模型未加载、ValueError）会直接抛出。
+#: 批量 embedding 连接层重试次数（ADR-0007 §2:3 次）。
+_EMBED_BATCH_RETRY_ATTEMPTS = 3
+#: 指数退避下界（秒）。第二次起按 2× 翻倍，封顶 ``_EMBED_BATCH_RETRY_MAX_S``。
+_EMBED_BATCH_RETRY_MIN_S = 2
+#: 指数退避上界（秒）。2 × 2^(n-1) 不会真的超过 30s。
+_EMBED_BATCH_RETRY_MAX_S = 30
+
+
+def _embed_batch_with_retry(embed_model, texts: list[str]) -> list:
+    """批量 embedding，**连接层**瞬态错误自动重试（最多 3 次，2s→30s 指数退避）。
+
+    仅 ``APIConnectionError`` / ``APITimeoutError`` 重试 —— HTTP 层错误
+    （429/408/409/5xx）由 OpenAI SDK 内置 ``max_retries=2`` 负责（见
+    ``make_siliconflow_client``）。其他错误（模型缺失 / ValueError / CUDA
+    OOM 等）**不**进重试，立即抛出给调用方按 ADR-0007 §1（无自动兜底）、
+    §3（每稿隔离）处置。
+
+    查询路径不调用本函数：``search()`` → ``retriever.retrieve()`` →
+    ``encode_query_for_siliconflow`` → 直接 ``_embed_with_siliconflow``
+    无 tenacity 包裹 —— 用户在等，长退避体感即挂死。
     """
-    return embed_model.get_text_embedding_batch(texts)
+    retrying = Retrying(
+        stop=stop_after_attempt(_EMBED_BATCH_RETRY_ATTEMPTS),
+        wait=wait_exponential(
+            multiplier=2,
+            min=_EMBED_BATCH_RETRY_MIN_S,
+            max=_EMBED_BATCH_RETRY_MAX_S,
+        ),
+        retry=retry_if_exception_type(
+            (APIConnectionError, APITimeoutError)
+        ),
+        reraise=True,
+    )
+    return retrying(embed_model.get_text_embedding_batch, texts)
 
 
 # ── 文档索引 ────────────────────────────────────────────────────────────────────
@@ -593,6 +641,46 @@ def _enrich_chunk_metadata(
         node.metadata.setdefault("doc_id", doc_id)
         node.metadata.setdefault("source", source_name)
 
+
+def _mark_doc_embedding_failed(kb_id: str, doc_id: str, err: Exception) -> None:
+    """把单篇 doc 的 ``embedding_status`` 标 ``failed``(ADR-0007 §3)。
+
+    失败信息通过 ``doc.metadata["embedding_error"]`` 落到 doc_repo,best-effort
+    —— doc 不在 repo(脚本直调 ``index_documents_batch`` 等场景)时 log warning
+    后跳过,**不**抛——避免让批量流程挂在 doc 元数据写不上。
+
+    调用方 ``index_documents_batch`` 拿到失败后用本函数记账,然后 ``continue``
+    跳过这一稿、其余稿按正常流程跑。
+    """
+    import storage.doc_repo as doc_repo
+    try:
+        doc = doc_repo.get_doc(kb_id, doc_id)
+    except Exception as e:
+        _logger.warning(
+            "_mark_doc_embedding_failed: failed to load doc %s for failure mark: %s",
+            doc_id, e,
+        )
+        return
+    if doc is None:
+        _logger.warning(
+            "_mark_doc_embedding_failed: doc %s not in doc_repo; "
+            "cannot persist embedding_status=failed (caller may be a script)",
+            doc_id,
+        )
+        return
+    doc.embedding_status = "failed"
+    if not isinstance(doc.metadata, dict):
+        doc.metadata = {}
+    doc.metadata["embedding_error"] = f"{type(err).__name__}: {err}"
+    try:
+        doc_repo._save_doc_meta(doc)
+    except Exception as e:
+        _logger.warning(
+            "_mark_doc_embedding_failed: failed to persist failure mark for %s: %s",
+            doc_id, e,
+        )
+
+
 def index_documents_batch(
     kb_id: str,
     docs: list,  # [(doc_id, text, source_name, by_page?, by_layout?)] — 兼容 3/4/5 元组
@@ -664,15 +752,21 @@ def index_documents_batch(
             if not all_nodes:
                 continue
 
-            # 批量 embedding 本稿件所有 chunk（GPU 锁内，失败自动重试）
+            # 批量 embedding 本稿件所有 chunk（GPU 锁内，连接层失败自动重试）
+            # ADR-0007 §3：单稿 embedding 失败不中止整批(每稿隔离)。失败稿
+            # 标 ``embedding_status=failed``,原因 best-effort 落到 doc_repo,
+            # 其余稿继续。追跑走 reparse 通道(OCR 缓存命中零配额)。
             node_texts = [node.text or "" for node in all_nodes]
             try:
                 with get_gpu_inference_lock():
                     embeddings = _embed_batch_with_retry(embed_model, node_texts)
             except Exception as e:
-                _logger.error("embedding failed for doc %s after retries: %s", doc_id, e)
+                _logger.error(
+                    "embedding failed for doc %s after retries: %s", doc_id, e,
+                )
+                _mark_doc_embedding_failed(kb_id, doc_id, e)
                 del all_nodes
-                raise
+                continue
 
             for node, emb in zip(all_nodes, embeddings):
                 node.embedding = emb

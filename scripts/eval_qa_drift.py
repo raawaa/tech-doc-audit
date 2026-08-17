@@ -207,6 +207,12 @@ def main():
             json.dumps(result, ensure_ascii=False, indent=2)
         )
         print(f"\n落盘: {args.output}")
+
+    # ADR-0009:run 末打印 ``total_prompt_tokens=N``(免费档 baseline)
+    from core.metrics import get_embedding_tokens_total
+    total = get_embedding_tokens_total()
+    print(f"\ntotal_prompt_tokens={total}")
+
     return 0
 
 

@@ -38,6 +38,14 @@
   _Avoid_: "就绪""ready"——必须与文档向量化层的终态严格区分。
 - **两者关系** — 文档向量化是知识库检索索引的**构成材料**（前置条件），不是同一回事：全部文档已向量化 ≠ 该库可检索，仍需合并建索引。类比："砖都烧好了 ≠ 墙砌好了"。
 
+## 线上 Embedding/Rerank 降级语义（ADR-0007）
+
+- **降级语义 (Degradation Semantics)** — 线上 embedding/rerank 服务失败时的整体行为契约：embedding 失败即抛（**无自动兜底**），rerank 失败优雅降级回原始排序。运维级兜底 = 重启切换 `EMBED_PROVIDER`。
+  _Avoid_: 把"降级"理解为自动切换 provider —— ADR-0007 明确拒绝自动回退 local bge-m3 / 双供应商（跨供应商向量漂移会污染共享索引）。
+- **瞬态失败 (Transient Failure)** — 线上调用失败的两个子类：**HTTP 层错误**（429/408/409/5xx，由 OpenAI SDK 内置重试负责，尊重 `retry-after`）与**连接层错误**（`APIConnectionError`/`APITimeoutError`，由调用方 tenacity 层负责，仅批量路径）。每一类只有一个重试 owner，不得另起一层；查询路径零附加重试。
+  _Avoid_: 把"瞬态失败"当"任何异常都重试"——不可重试错误（模型缺失、ValueError）禁止进入重试。
+- **每稿隔离 (Per-Doc Isolation)** — 批量建库中单稿 embedding 失败不中止整批：该稿记 `failed`、原因进批量报表 failed 明细，其余稿继续。**reparse 即追跑通道**（OCR 缓存命中零配额），不设死信暂存。
+
 ## Chunk → Layout 映射与高亮坐标（V8 PRD #49）
 
 - **block_range** — KB chunk 在 `node.metadata` 上的字段，类型 `Optional[tuple[int, int]] = None`，记 `(start_block_order, end_block_order)` 闭区间（同一 page 内），表示该 chunk 文本覆盖到的 KB layout blocks（参见 `core.parse_document.Block.block_order`）。`start_block_order` 取 chunk 文本首次出现在 page 内的那一个 layout block；`end_block_order` 取最后一次。索引阶段由 `core.index_manager._inject_block_range(nodes, by_page)` 写入，与 `page_number` 同级（同一处调用点）。`None` 表示：注入失败 / KB 非 PDF（如 `.md`）/ 旧 KB 未触发 reparse——这种情况下高亮走原有 `matchHighlightToShapes` 字符串匹配 fallback。V8-S1 实现为 no-op，所有 chunk 的 `block_range` 暂时一律 `None`。

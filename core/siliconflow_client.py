@@ -60,8 +60,6 @@ RERANK_MODEL_ID = "BAAI/bge-reranker-v2-m3"
 #: §5.2 实测 74421 字符被拒),但本地路径已经是 512;保持 512 = 锁同边界,
 #: 跨 provider 一致性 ≠ 服务端限制由前端薄包硬编码。
 MAX_TOKENS_PER_CHUNK = 512
-#: 批量 embedding 单次最多条数(SF API 文档建议)。
-EMBED_BATCH_SIZE = 32
 
 
 # 代理锁的物理位置在 ``core.settings`` —— 沿用 ``make_deepseek_client`` /
@@ -123,7 +121,13 @@ def make_siliconflow_client(*, timeout: int = 60) -> "OpenAI":
     with _proxy_env_lock:
         saved = _strip_proxy_env()
         try:
-            return OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+            # ADR-0007 §2:HTTP 层错误(429/408/409/5xx)由 OpenAI SDK 内置重试
+            # 负责,``max_retries=2``,尊重 ``retry-after`` + jitter。
+            # SDK 默认就是 2,显式传 —— 未来 SDK 改默认值时守住我们的语义。
+            return OpenAI(
+                api_key=api_key, base_url=base_url, http_client=http_client,
+                max_retries=2,
+            )
         finally:
             _restore_proxy_env(saved)
 
@@ -205,12 +209,32 @@ def _embed_with_siliconflow(texts: list[str]) -> list[list[float]]:
 
     内部会按 ``MAX_TOKENS_PER_CHUNK`` 预截断;**不调 normalize_l2**(T3 §1.3);
     **不加/剥 query instruction 前缀**(T3 §3.3)。
+
+    ## ADR-0009:prompt_tokens 累加
+
+    调用返回后读 ``resp.usage.prompt_tokens`` 累加到 ``core.metrics`` 的
+    线程本地累加器,免费档永久 baseline。失败 / ``usage`` 为 ``None`` /
+    ``prompt_tokens`` 为 ``None`` 时静默跳过(不抛、不补默认值)。
+
+    ## ADR-0008:per-doc 整 list 单请求、不切子批
+
+    整篇文档的所有 chunk 一次性塞进 ``client.embeddings.create`` —— SF
+    限流按 HTTP 请求数 + token 数计,不限 list 长度只限总 token;切片只会
+    增加复杂度,不会减少撞墙概率。
     """
     if not texts:
         return []
     truncated = truncate_batch(texts)
     client = make_siliconflow_client()
     resp = client.embeddings.create(model=EMBED_MODEL_ID, input=truncated)
+    # ADR-0009:累加 prompt_tokens 到 thread-local metrics,免费档 baseline。
+    # ``usage`` 为 None / ``prompt_tokens`` 为 None 静默跳过 —— 不抛、不补默认值。
+    from core.metrics import record_embedding_tokens
+    usage = getattr(resp, "usage", None)
+    if usage is not None:
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        if prompt_tokens is not None:
+            record_embedding_tokens(prompt_tokens)
     return [list(d.embedding) for d in resp.data]
 
 

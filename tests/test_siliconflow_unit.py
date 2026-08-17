@@ -305,3 +305,256 @@ def test_siliconflow_embedding_subclass_of_base_embedding():
     from core.siliconflow_client import SiliconFlowEmbedding
 
     assert issubclass(SiliconFlowEmbedding, BaseEmbedding)
+
+
+# ── prompt_tokens 累加(ADR-0009)──────────────────────────────────────────────
+
+
+class _FakeUsage:
+    """``client.embeddings.create(...)`` 返回的 ``resp.usage`` 形状。"""
+
+    def __init__(self, prompt_tokens: int | None):
+        self.prompt_tokens = prompt_tokens
+
+
+class _FakeEmbedding:
+    """``resp.data[i].embedding`` 的形状。"""
+
+    def __init__(self, embedding: list[float]):
+        self.embedding = embedding
+
+
+class _FakeEmbeddingsResponse:
+    def __init__(self, data: list[_FakeEmbedding], usage: _FakeUsage | None):
+        self.data = data
+        self.usage = usage
+
+
+class _FakeEmbeddingsAPI:
+    """``client.embeddings`` 的 fake,只对外契约。"""
+
+    def __init__(self, response: _FakeEmbeddingsResponse):
+        self._response = response
+        self.calls: list[dict] = []
+
+    def create(self, *, model: str, input):
+        self.calls.append({"model": model, "input": list(input)})
+        return self._response
+
+
+class _FakeSFClient:
+    def __init__(self, response: _FakeEmbeddingsResponse):
+        self.embeddings = _FakeEmbeddingsAPI(response)
+
+
+@pytest.fixture(autouse=True)
+def _reset_embedding_metrics():
+    """每条用例前清零 metrics(thread-local 在测试间复用同一线程)。"""
+    from core import metrics
+    metrics.reset_embedding_tokens_total()
+    yield
+    metrics.reset_embedding_tokens_total()
+
+
+def _patch_sf_client(monkeypatch, response: _FakeEmbeddingsResponse):
+    """把 ``core.siliconflow_client.make_siliconflow_client`` 替换为 fake,
+    避免构造真实 OpenAI 客户端/出网;``truncate_batch`` 同步 stub 成 no-op,
+    跳过 XLM-R tokenizer 加载。
+    """
+    fake_client = _FakeSFClient(response)
+    monkeypatch.setattr(
+        "core.siliconflow_client.make_siliconflow_client",
+        lambda **kwargs: fake_client,
+    )
+    monkeypatch.setattr(
+        "core.siliconflow_client.truncate_batch",
+        lambda texts, max_tokens=512: list(texts),
+    )
+    return fake_client
+
+
+def test_embed_records_prompt_tokens_from_usage(monkeypatch):
+    """``_embed_with_siliconflow`` 读 ``resp.usage.prompt_tokens`` 累加进 metrics。
+
+    ADR-0009 接口契约:``resp.usage.prompt_tokens`` 是免费档的永久 baseline,
+    在 ``scripts/eval_qa_drift.py`` run 末打印,撞墙 / 升 Pro / 第一次账单来
+    时已有数据。
+    """
+    from core import metrics
+    from core.siliconflow_client import _embed_with_siliconflow
+
+    fake_client = _patch_sf_client(
+        monkeypatch,
+        _FakeEmbeddingsResponse(
+            data=[_FakeEmbedding([0.0] * 4)],
+            usage=_FakeUsage(prompt_tokens=123),
+        ),
+    )
+
+    out = _embed_with_siliconflow(["hello"])
+
+    assert len(out) == 1
+    assert metrics.get_embedding_tokens_total() == 123
+    # fake 收到一次调用,模型名是 BAAI/bge-m3
+    assert fake_client.embeddings.calls[0]["model"] == "BAAI/bge-m3"
+
+
+def test_embed_accumulates_prompt_tokens_across_calls(monkeypatch):
+    """多次调用累加(同线程 thread-local 累加器语义)。"""
+    from core import metrics
+    from core.siliconflow_client import _embed_with_siliconflow
+
+    _patch_sf_client(
+        monkeypatch,
+        _FakeEmbeddingsResponse(
+            data=[_FakeEmbedding([0.0] * 2)],
+            usage=_FakeUsage(prompt_tokens=11),
+        ),
+    )
+
+    _embed_with_siliconflow(["hello"])
+    _embed_with_siliconflow(["world"])
+    _embed_with_siliconflow(["!"])
+
+    assert metrics.get_embedding_tokens_total() == 33
+
+
+def test_embed_skips_token_recording_when_usage_missing(monkeypatch):
+    """``resp.usage`` 缺失或 ``prompt_tokens`` 为 None 时静默跳过累加。
+
+    接口契约:失败 / ``usage`` 为 None 静默跳过(不影响主路径)。
+    """
+    from core import metrics
+    from core.siliconflow_client import _embed_with_siliconflow
+
+    _patch_sf_client(
+        monkeypatch,
+        _FakeEmbeddingsResponse(
+            data=[_FakeEmbedding([0.0] * 2)],
+            usage=None,  # 极端情况:服务端没返回 usage
+        ),
+    )
+
+    out = _embed_with_siliconflow(["hello"])
+    assert len(out) == 1
+    assert metrics.get_embedding_tokens_total() == 0
+
+
+def test_embed_skips_token_recording_when_usage_has_none_prompt_tokens(monkeypatch):
+    """``resp.usage`` 存在但 ``prompt_tokens = None`` → 静默跳过累加。"""
+    from core import metrics
+    from core.siliconflow_client import _embed_with_siliconflow
+
+    _patch_sf_client(
+        monkeypatch,
+        _FakeEmbeddingsResponse(
+            data=[_FakeEmbedding([0.0] * 2)],
+            usage=_FakeUsage(prompt_tokens=None),
+        ),
+    )
+
+    _embed_with_siliconflow(["hello"])
+    assert metrics.get_embedding_tokens_total() == 0
+
+
+def test_embed_propagates_exception_does_not_corrupt_metrics(monkeypatch):
+    """SF 调用抛异常时 metrics 计数器不增;主路径仍按 ADR-0007 抛给调用方。"""
+    from core import metrics
+    from core.siliconflow_client import _embed_with_siliconflow
+
+    class _Boom(_FakeEmbeddingsAPI):
+        def create(self, *, model, input):
+            raise RuntimeError("simulated SF outage")
+
+    fake_client = _FakeSFClient(_FakeEmbeddingsResponse([], _FakeUsage(0)))
+    fake_client.embeddings = _Boom([])
+    monkeypatch.setattr(
+        "core.siliconflow_client.make_siliconflow_client",
+        lambda **kwargs: fake_client,
+    )
+    monkeypatch.setattr(
+        "core.siliconflow_client.truncate_batch",
+        lambda texts, max_tokens=512: list(texts),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated SF outage"):
+        _embed_with_siliconflow(["hello"])
+    # 失败路径不应"补一个好看数字"——计数器保持 0
+    assert metrics.get_embedding_tokens_total() == 0
+
+
+# ── max_retries=2 显式设置(ADR-0007)──────────────────────────────────────────
+
+
+def test_make_siliconflow_client_passes_max_retries_2(monkeypatch):
+    """ADR-0007 §2:HTTP 层错误(429/408/409/5xx)由 OpenAI SDK 内置重试负责,
+    ``max_retries=2``,尊重 ``retry-after`` + jitter。
+
+    OpenAI SDK 默认就是 2,但要显式传 —— 未来若 SDK 改默认值,这条契约守住
+    我们的语义:HTTP 层重试次数 = 2(批量路径在 SDK 之上还有一层连接层 tenacity,
+    见 ``_embed_batch_with_retry``)。
+    """
+    import httpx as _httpx
+
+    captured: dict = {}
+
+    class _FakeOpenAI:
+        def __init__(self, *, api_key, base_url, http_client, max_retries):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            captured["http_client"] = http_client
+            captured["max_retries"] = max_retries
+
+    # ``OpenAI`` 在 ``make_siliconflow_client`` 函数体里 import,patch 模块属性
+    # 失效,必须 patch ``openai.OpenAI`` 的源头。
+    monkeypatch.setattr("openai.OpenAI", _FakeOpenAI)
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "sk-test-key")
+    monkeypatch.setattr("core.siliconflow_client._strip_proxy_env", lambda: (None, None))
+    monkeypatch.setattr("core.siliconflow_client._restore_proxy_env", lambda saved: None)
+
+    from core.siliconflow_client import make_siliconflow_client
+
+    client = make_siliconflow_client()
+    assert client is not None
+    assert captured["max_retries"] == 2, (
+        f"OpenAI SDK max_retries 必须显式 == 2,实际 {captured['max_retries']}"
+    )
+    # 防御退化:确保 max_retries 不是从默认里继承的——通过传值校验显式语义
+    assert "max_retries" in captured, "max_retries 必须显式传给 OpenAI() 构造器"
+    # http_client 必须 trust_env=False(代理绕过)
+    assert isinstance(captured["http_client"], _httpx.Client)
+    assert captured["http_client"].trust_env is False
+
+
+def test_make_siliconflow_client_rejects_missing_api_key(monkeypatch):
+    """``SILICONFLOW_API_KEY`` 缺失 → ``RuntimeError``,**不**静默回退。
+
+    沿用 issues/144 #137 既有契约:`get_embed_model()` 缺 key 时降级为 None
+    (双层结构),但 ``make_siliconflow_client()`` 直接构造 → 抛清晰错误,
+    让上层明确知道为什么 SF 不可用。
+    """
+    monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
+    from core.siliconflow_client import make_siliconflow_client
+
+    with pytest.raises(RuntimeError, match="SILICONFLOW_API_KEY"):
+        make_siliconflow_client()
+
+
+# ── EMBED_BATCH_SIZE 孤儿常量删除(ADR-0008 §1)────────────────────────────────
+
+
+def test_siliconflow_client_does_not_export_embed_batch_size():
+    """ADR-0008 §1:``EMBED_BATCH_SIZE = 32`` 是孤儿常量,生产路径不会切子批。
+
+    per-doc 整 list 单请求是 SF 限流下的最优切法 —— 限流按 HTTP 请求数 +
+    token 数计,不限 list 长度。切子批(25 chunks/doc 切 32-batch = 切 1 批)
+    徒增复杂度,等于啥也没干。
+
+    spiek 脚本 ``scripts/rerank_cross_provider_spike.py`` 自己有自己的常量化
+    理由(一次性预嵌入 ~3976 chunks),本测试只盯生产 client 模块的导出表。
+    """
+    import core.siliconflow_client as sf
+
+    assert not hasattr(sf, "EMBED_BATCH_SIZE"), (
+        "EMBED_BATCH_SIZE 是孤儿常量(ADR-0008),不应再挂在 SF client 模块"
+    )

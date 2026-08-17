@@ -134,29 +134,37 @@ def _get_top_docs_for_query(
 
 
 def _prefetch_chunk_vectors(chunks: list[str]) -> "np.ndarray":
-    """一次性把所有 chunk 送去 SF embed(按 ``EMBED_BATCH_SIZE`` 分批)。
+    """一次性把所有 chunk 送去 SF embed(按 32 一批分次请求)。
 
     siliconflow_client 内置的 ``_embed_with_siliconflow`` 用单次
     ``client.embeddings.create(...)`` 把整个 ``texts`` list 一次送出 —— 当
     列表长度上千时 SF 端可能返回 400(单请求 input 长度超限)。spike 一次性
     预嵌入把全量生产 chunks(≈ 3976)按 32 一批切片,降低单次 request 体量。
+
+    为什么 32 在这里:本脚本是一次性诊断工具(≈ 3976 chunks 全量预嵌入),
+    与生产 ``index_document`` 走的 per-doc 整 list 单请求路径不同 —— 一次性
+    整 list 一次性塞 ~4000 chunks 会撞 SF 端 input 长度上限。这里仍按 32
+    切片是有意义的。
+
+    ADR-0008 §1 已删除 ``core.siliconflow_client.EMBED_BATCH_SIZE``,本
+    spike 是仅存 caller,故此处定义自己的局部常量。
     """
     from core.siliconflow_client import (
         make_siliconflow_client,
         EMBED_MODEL_ID,
         truncate_batch,
-        EMBED_BATCH_SIZE,
     )
     import numpy as np
     import httpx
 
+    SPIKE_EMBED_BATCH_SIZE = 32
     truncated = truncate_batch(chunks)
     all_vecs: list[list[float]] = []
-    print(f"  预嵌入 {len(chunks)} 个 chunk,批 {EMBED_BATCH_SIZE} ...")
+    print(f"  预嵌入 {len(chunks)} 个 chunk,批 {SPIKE_EMBED_BATCH_SIZE} ...")
     t0 = time.time()
     client = make_siliconflow_client(timeout=300)
-    for i in range(0, len(truncated), EMBED_BATCH_SIZE):
-        batch = truncated[i: i + EMBED_BATCH_SIZE]
+    for i in range(0, len(truncated), SPIKE_EMBED_BATCH_SIZE):
+        batch = truncated[i: i + SPIKE_EMBED_BATCH_SIZE]
         # 显式重试 3 次(SF 偶发 5xx)
         last_err = None
         for attempt in range(3):
@@ -170,7 +178,7 @@ def _prefetch_chunk_vectors(chunks: list[str]) -> "np.ndarray":
                 time.sleep(min(2 ** attempt, 10))
         if last_err is not None:
             raise last_err
-        done = min(i + EMBED_BATCH_SIZE, len(truncated))
+        done = min(i + SPIKE_EMBED_BATCH_SIZE, len(truncated))
         if done % 256 == 0 or done == len(truncated):
             print(f"    {done}/{len(truncated)} ({time.time() - t0:.1f}s)")
     print(f"  嵌入完成,耗时 {time.time() - t0:.1f}s")
