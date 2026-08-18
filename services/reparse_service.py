@@ -79,9 +79,9 @@ def _reparse_async(
 ) -> None:
     """后台执行：parse → save_pages → 重建索引 → 更新状态。
 
-    KB 级状态字段走 writer —— 单篇路径 writer 由 ``reparse_document`` 构造，
-    批量路径 writer 由编排层构造并注入。两种情形都是"先 begin / finish 一条线"，
-    没有 caller_manages_kb_status 这种布尔分支。
+    KB 级状态字段全部走 writer：单篇路径 writer 由 ``reparse_document`` 构造
+    并 ``begin()``，批量路径 writer 由编排层注入、begin()/finish() 都归
+    编排层管 —— 本函数只调 ``note_in_flight`` / ``finish`` / ``fail_doc``。
     """
     doc = doc_repo.get_doc(kb_id, doc_id)
     if not doc or not doc.file_path:
@@ -156,14 +156,11 @@ def _reparse_async(
 def _mark_failed(
     kb_id: str, doc_id: str, err: str, *, kb_writer: KbIndexStatusWriter
 ) -> None:
-    """doc 失败 → 写 ``embedding_status="failed"`` + 走 writer 写 KB 终态。
+    """doc 失败 → 写 ``embedding_status="failed"`` + 走 writer 收尾。
 
-    writer 是 KB 级检索状态的唯一写入者（issue #148）。单篇路径下 kb_writer
-    由 ``reparse_document`` 内部构造（total=1），``finish(failed=[...])`` 直接
-    把 KB 写成 ``failed`` + 一行失败摘要；批量路径下 kb_writer 由编排层注入
-    （total=N），单篇失败不调 ``finish()``（避免整批期间 KB 在中途跳到
-    ``failed``），只把错误信息塞进 ``index_current_doc``，终态由编排层在
-    批次末尾通过同一个 writer 统一写。
+    KB 级终态由 writer 自己决定（``fail_doc`` 公开方法，单篇 / 批量各走各的
+    路径 —— ``total=1`` 写终态 ``failed``，``total>1`` 只把错误摘要写到
+    ``index_current_doc``，保留 ``status=building`` 让编排层收尾）。
     """
     doc = doc_repo.get_doc(kb_id, doc_id)
     if doc is not None:
@@ -171,12 +168,4 @@ def _mark_failed(
         doc_repo._save_doc_meta(doc)
 
     doc_name = doc.original_name if doc is not None and doc.original_name else doc_id
-    if kb_writer._total == 1:
-        # 单篇路径：直接写终态 failed。字面前缀仍是 writer 的
-        # ``_format_failure_summary``（"批量重新解析失败 1/1 篇..."），已知语义小漂移，
-        # 见 #149 PR description 备注。
-        kb_writer.finish(failed=[(doc_name, err)])
-    else:
-        # 批量路径：单篇失败不代表整批失败；只把错误摘要写到 current_doc，
-        # 保留 status=building 不变，由编排层在批次末尾统一 finish()。
-        kb_writer.note_in_flight(f"reparse 错误: {err}")
+    kb_writer.fail_doc(doc_name, err)

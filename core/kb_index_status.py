@@ -94,6 +94,25 @@ class KbIndexStatusWriter:
         else:
             self._write(status="searchable", progress=1.0, current_doc="")
 
+    def fail_doc(self, name: str, err: str) -> None:
+        """单篇失败的统一入口。
+
+        ``total == 1``（自己造的 writer）→ ``finish(failed=[(name, err)])``
+        把 KB 写成 ``failed`` + 一行摘要；``total > 1``（编排层注入的 writer）
+        → 只把错误摘要写到 ``index_current_doc``，保留 ``status=building`` 不变，
+        由编排层在批次末尾统一 ``finish()``。
+
+        之所以把"该不该写终态"的判断收归 writer：调用方
+        （``reparse_service._mark_failed``）只知道"我失败了"，不知道"我是单篇
+        还是批量里的一篇"。把 ``_total`` 这种私有细节挪到 writer 自己后，
+        调用方就只剩一行 ``kb_writer.fail_doc(name, err)`` —— issue #150 的
+        "无脑调 writer API" 在这里真正落地。
+        """
+        if self._total == 1:
+            self.finish(failed=[(name, err)])
+        else:
+            self.note_in_flight(f"reparse 错误: {err}")
+
     def clear_building(self) -> None:
         """把 KB 状态拉回 ``none``（崩溃自愈 / 运维解卡）。"""
         self._write(status="none", progress=None, current_doc="")
