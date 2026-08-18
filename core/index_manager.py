@@ -36,6 +36,7 @@ from llama_index.vector_stores.faiss import FaissVectorStore
 from core.settings import get_embed_model, get_gpu_inference_lock
 from core.parse_document import PageText, PageLayout
 from core.text_norm import lcs_len, norm
+from core.kb_index_status import KbIndexStatusWriter
 
 
 def get_data_dir() -> Path:
@@ -961,6 +962,13 @@ def rebuild_kb_index(kb_id: str, progress_callback=None):
     不依赖任何调用方记得写字段——这是为何把"写回字段"内置在重建函数里，
     而不是分散在 reindex 按钮 / auto-rebuild / 批量导入等调用方。
 
+    Issue #149：本函数是首批持有 per-KB 锁（``_get_index_lock``，保护 FAISS
+    资源）的写入者之一——FAISS 锁继续保留。KB 检索状态字段（``index_status``
+    / ``index_progress`` / ``index_current_doc``）则统一交给
+    ``KbIndexStatusWriter``（issue #148），本函数不再直接赋值这三个字段。
+    两种锁是不同资源：FAISS 锁保护 ``_load_index`` / ``_persist`` / 缓存
+    失效，writer 的 per-instance 锁保护 KB 状态字段的 read-modify-write。
+
     Args:
         kb_id: 知识库 ID。
         progress_callback: 可选回调 (current_index, total, doc_name) → None，
@@ -976,10 +984,9 @@ def rebuild_kb_index(kb_id: str, progress_callback=None):
 
         # 内置契约：开锁前先标记 building，让 UI/其他线程看见的中间态。
         # 这一写也在锁内，免与并发 _ensure_kb_index 交错。
-        kb.index_status = "building"
-        kb.index_progress = 0.0
-        kb.index_current_doc = ""
-        kb_repo.update(kb)
+        # Issue #149：KB 检索状态字段交给 KbIndexStatusWriter 写。
+        kb_writer = KbIndexStatusWriter(kb_id)
+        kb_writer.begin()
 
         try:
             vectors_dir = _vectors_dir(kb_id)
@@ -1035,23 +1042,24 @@ def rebuild_kb_index(kb_id: str, progress_callback=None):
                 # 无文档，清理 + 仍标 searchable（空库也是合法"无文档"状态）
                 if vectors_dir.exists():
                     shutil.rmtree(str(vectors_dir))
-                kb.index_status = "searchable"
-                kb.index_progress = 1.0
-                kb_repo.update(kb)
+                kb_writer.finish()
                 return
 
             # 内置契约：重建成功 → 字段 searchable（无需调用方再写）
-            kb.index_status = "searchable"
-            kb.index_progress = 1.0
-            kb.index_current_doc = ""
-            kb_repo.update(kb)
+            kb_writer.finish()
         except Exception as e:
-            # 内置契约：失败 → 字段 failed（保留错误信息在 current_doc）
-            kb = kb_repo.get(kb_id)
-            if kb is not None:
-                kb.index_status = "failed"
-                kb.index_current_doc = f"错误: {e}"
-                kb_repo.update(kb)
+            # 内置契约：失败 → 字段 failed（保留错误信息在 current_doc）。
+            # Issue #149：失败摘要走 writer 的 ``finish(failed=...)`` 通道，
+            # 不再直接写 ``kb.index_current_doc``。KB 已删 → writer 的
+            # ``_write`` 内部对 ``kb_repo.get`` 返 ``None`` 静默 return。
+            #
+            # 已知语义小漂移：writer 的 ``_format_failure_summary`` 字面前缀
+            # 仍是 ``"批量重新解析失败 N/M 篇（…）"``(#148 ship 时未实现
+            # 单篇 ``"失败: <err>"`` 格式,#147 §User Stories 第 14 条
+            # 列入后续 ticket);此处重建失败单事件会被套上批量前缀,
+            # 见 #149 PR description 备注。contract test 的 ``"disk" in
+            # current_doc`` 断言仍通过(异常文本里就含该子串)。
+            kb_writer.finish(failed=[("重建", str(e))])
             raise
 
 
