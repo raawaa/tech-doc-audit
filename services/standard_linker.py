@@ -14,6 +14,8 @@ StandardRef（doc_id / page_number / chunk_text）。best-effort：
 
 import json
 import os
+import re
+import unicodedata
 from typing import Callable
 
 from core.logger import get_logger
@@ -27,6 +29,43 @@ _logger = get_logger(__name__)
 # 默认实现 = extract_standards_deepseek。测试可注入返回 canned dict 的假实现，
 # 从而脱离 LLM 单测关联策略（搜索→验证→回填）。
 ExtractFn = Callable[[list[AuditIssue]], "dict[int, ExtractedStandard]"]
+
+# #27 提取器后处理：常见 LLM 抽取错误。
+# 标准前缀直接跟首数字(无分隔) → 补空格（``IEC61547`` → ``IEC 61547``）。
+# 注意：lookahead 只允许数字,**不**允许字母 —— ``GBT 20145-2006`` 的 ``T``
+# 是标准类型（与 ``GB/T`` 等价），不应被拆成 ``GB T ...``。
+_STD_PREFIX_RE = re.compile(
+    r"^(IEC|ISO|CIE|GB|CJJ|JGJ|JG|BS|EN|NF|DIN|JIS|KS|TJ)(?=\d)",
+    re.IGNORECASE,
+)
+# 数字段中孤立的 ``-`` 紧邻 ``.`` → 删 ``-``（``GB 7000-.202`` → ``GB 7000.202``）
+_DASH_BEFORE_DOT_RE = re.compile(r"(\d)-(?=\.\d)")
+# 任意连续空白挤成单空格
+_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_extracted_number(num: str) -> str:
+    """轻量规整 LLM 输出的标准编号（#27）。
+
+    仅做两类保守修正，不动结构清晰的输入：
+    1. 标准前缀（``IEC`` / ``GB`` / ``CJJ`` 等）直接与首数字粘连 → 补空格
+       （``IEC61547`` → ``IEC 61547``；``GBT 20145`` 不动）。
+    2. 数字段中孤立的 ``-`` 紧邻 ``.`` → 删 ``-``
+       （``GB 7000-.202`` → ``GB 7000.202``）。
+
+    与 ``vector_search._normalize_for_standard_match`` 互补：搜索端用归一化匹配
+    兜底已知/未知格式差异；提取端把"明显有误"的格式提前修正，降低对兜底的
+    依赖，改善 ``standard_name`` / ``chunk_text`` 回填的可读性。
+    """
+    if not num:
+        return num
+    s = unicodedata.normalize("NFKC", num).strip()
+    s = _WS_RE.sub(" ", s)
+    # 规则1：补前缀后的空格（仅当首字符为数字）
+    s = _STD_PREFIX_RE.sub(lambda m: f"{m.group(1)} ", s, count=1)
+    # 规则2：删 ``-.`` 中的 ``-``
+    s = _DASH_BEFORE_DOT_RE.sub(r"\1", s)
+    return s
 
 
 def extract_standards_deepseek(issues: list[AuditIssue]) -> dict[int, ExtractedStandard]:
@@ -111,8 +150,10 @@ def extract_standards_deepseek(issues: list[AuditIssue]) -> dict[int, ExtractedS
             iss_id = item.get("id")
             if iss_id is None:
                 continue
-            nums = item.get("standard_numbers", []) or []
+            nums_raw = item.get("standard_numbers", []) or []
             names = item.get("standard_names", []) or []
+            # #27 后处理：把 LLM 抽出的明显错误编号格式修正为接近正文的写法
+            nums = [_normalize_extracted_number(n) for n in nums_raw]
             if nums or names:
                 output[iss_id] = ExtractedStandard(numbers=nums, names=names)
 

@@ -9,7 +9,9 @@
 """
 
 import os
+import re
 import threading
+import unicodedata
 from pathlib import Path
 
 import storage.kb_repo as kb_repo
@@ -27,8 +29,53 @@ from core.pages_store import load_pages
 _logger = get_logger(__name__)
 
 
+# #27 容错匹配用的剥离集：空白 + ``-`` + ``.`` + ``/``。
+# 这四类字符在标准编号里常被互换或漏写（``IEC61547`` / ``IEC 61547``、
+# ``GB 7000-.202`` / ``GB 7000.202``、``GBT 20145`` / ``GB/T 20145``）。
+# ``/`` 表达"推荐"语义（``GB/T``），但归一化后 ``GB/T`` ≡ ``GBT`` ——
+# 既然两边同进归一化，剥掉不会引入误匹配；区分度仍由数字部分承担。
+_STD_NORM_STRIP_RE = re.compile(r"[\s　 \-./]+")
+
+# 常见标准前缀集合（与 ``standard_linker._STD_PREFIX_RE`` 共用同一张表），
+# 用于 #27 兜底匹配的开关判断。
+_STD_PREFIX_NAMES = (
+    "IEC", "ISO", "CIE", "GB", "CJJ", "JGJ", "JG",
+    "BS", "EN", "NF", "DIN", "JIS", "KS", "TJ",
+)
+_STD_PREFIX_GROUP = "|".join(_STD_PREFIX_NAMES)
+# 前缀与首数字粘连（``IEC61547`` ↔ ``IEC 61547``）→ 启用兜底
+_STD_PREFIX_NO_SEP_RE = re.compile(
+    rf"^(?:{_STD_PREFIX_GROUP})\d",
+    re.IGNORECASE,
+)
+
+
+def _normalize_for_standard_match(s: str) -> str:
+    """标准编号容错匹配用的归一化串：NFKC + casefold + 去空白/``-``/``.``/``/``。
+
+    与 ``core.text_norm.norm()`` 的区别：本函数**只**剥离空白与 ``-`` / ``.`` / ``/``，
+    不动其它字符 —— chunk↔block 匹配的 ``norm()`` 会把所有标点（含中英括号、
+    书名号等）一并吃掉，对标准编号来说过激进。``GB/T 20145-2006`` 经本函数
+    归一化后是 ``gbt201452006``，``IEC 61547`` 是 ``iec61547``，
+    ``GB 7000.202`` 是 ``gb7000202``。
+
+    用于 #27 标准编号格式不匹配（``IEC61547`` ↔ ``IEC 61547``、
+    ``GB 7000-.202`` ↔ ``GB 7000.202``）的兜底匹配。
+    """
+    if not s:
+        return ""
+    return _STD_NORM_STRIP_RE.sub("", unicodedata.normalize("NFKC", s).casefold())
+
+
 def _pages_search_doc(keyword: str, kb_ids: list[str], *, max_hits: int = 5) -> list[dict]:
     """遍历所有 KB 的 pages/{doc_id}.json，对每页文本做大小写不敏感的 ``str.find``。
+
+    #27 容错匹配：精确 ``str.find`` 无命中时,退化到归一化匹配
+    （needle 与 page text 都过 ``_normalize_for_standard_match``）—— 解决
+    ``IEC61547`` ↔ ``IEC 61547``、``GB 7000-.202`` ↔ ``GB 7000.202`` 等格式
+    不匹配场景。归一化匹配仅作为兜底,精确路径仍走原大小写不敏感匹配;
+    snippet 兜底路径上按 ``len(raw_text)/len(page_norm)`` 比例把归一化坐标
+    缩回原文坐标,``±200`` 窗口足以覆盖标准编号的展示。
 
     Args:
         keyword: 待搜索字符串。
@@ -48,6 +95,20 @@ def _pages_search_doc(keyword: str, kb_ids: list[str], *, max_hits: int = 5) -> 
         return []
 
     needle = keyword.lower()
+    needle_norm = _normalize_for_standard_match(keyword)
+    # 容错匹配兜底：仅当精确匹配失败才付归一化开销。启用条件：
+    # - needle 本身含可剥离字符（空白 / ``-`` / ``.``）；或
+    # - needle 形似标准编号且前缀与首数字之间缺分隔（``IEC61547`` ↔ ``IEC 61547``）。
+    # 正常路径只多算一次 needle 归一化。
+    has_strippable = bool(_STD_NORM_STRIP_RE.search(keyword))
+    looks_like_std_no_sep = (
+        not has_strippable
+        and bool(needle_norm)
+        and _STD_PREFIX_NO_SEP_RE.match(keyword) is not None
+    )
+    fallback_enabled = bool(needle_norm) and (has_strippable or looks_like_std_no_sep)
+    fallback_needle = needle_norm if fallback_enabled else ""
+
     hits: list[dict] = []
 
     for kb_id in target_kbs:
@@ -61,12 +122,23 @@ def _pages_search_doc(keyword: str, kb_ids: list[str], *, max_hits: int = 5) -> 
             by_page = pages.get("by_page") or []
             for entry in by_page:
                 page = entry.get("page")
-                text = (entry.get("text") or "").lower()
-                idx = text.find(needle)
-                if idx == -1:
+                raw_text = entry.get("text") or ""
+                page_text = raw_text.lower()
+                idx = page_text.find(needle)
+                # 精确命中失败 → 走归一化兜底
+                if idx == -1 and fallback_needle:
+                    page_norm = _normalize_for_standard_match(raw_text)
+                    norm_idx = page_norm.find(fallback_needle)
+                    if norm_idx == -1:
+                        continue
+                    # 把归一化坐标按比例缩回原文坐标 —— 原文 / 归一化串 的
+                    # 长度比 = 单位字符对应的原文字符数。snippet 是 ``±200`` 宽
+                    # 窗口,几十字符内的偏移不影响展示标准编号。
+                    ratio = len(raw_text) / max(len(page_norm), 1)
+                    idx = int(norm_idx * ratio)
+                elif idx == -1:
                     continue
                 # 取上下文窗口（取原始字符串中含命中处左右 200 字符）
-                raw_text = entry.get("text") or ""
                 lo = max(0, idx - 80)
                 hi = min(len(raw_text), idx + len(keyword) + 200)
                 snippet = raw_text[lo:hi]

@@ -542,3 +542,102 @@ def test_strategy1_vec_hit_with_none_block_range_yields_none(monkeypatch):
     )
     sr = issue.standard_reference
     assert sr.block_range is None
+
+
+# ── #27: 提取器后处理与端到端关联 ──────────────────────────────────────
+
+
+def test_normalize_extracted_number_inserts_space_after_prefix():
+    """#27: ``IEC61547`` → ``IEC 61547``（前缀与首数字粘连）。"""
+    assert standard_linker._normalize_extracted_number("IEC61547") == "IEC 61547"
+
+
+def test_normalize_extracted_number_strips_dash_before_dot():
+    """#27: ``GB 7000-.202`` → ``GB 7000.202``（数字段里孤立 ``-``）。"""
+    assert standard_linker._normalize_extracted_number("GB 7000-.202") == "GB 7000.202"
+
+
+def test_normalize_extracted_number_preserves_clean_input():
+    """#27: 结构清晰的输入原样返回,不破坏。"""
+    assert standard_linker._normalize_extracted_number("GB/T 20145-2006") == "GB/T 20145-2006"
+    assert standard_linker._normalize_extracted_number("IEC 61547") == "IEC 61547"
+    assert standard_linker._normalize_extracted_number("CJJ 101-2016") == "CJJ 101-2016"
+
+
+def test_normalize_extracted_number_preserves_gbt_aliased_form():
+    """#27 回归: ``GBT 20145-2006`` 是 ``GB/T 20145-2006`` 的同义别名形式,
+    应原样保留,不能被规则1误判成 ``GB T 20145-2006``（前缀后的 ``T`` 是
+    标准类型字母,不是首数字）。"""
+    assert standard_linker._normalize_extracted_number("GBT 20145-2006") == "GBT 20145-2006"
+
+
+def test_normalize_extracted_number_handles_nfkc_and_whitespace():
+    """#27: NFKC 把全角空格/连字符归一,且连续空白挤成单空格。"""
+    assert standard_linker._normalize_extracted_number("  IEC　61547  ") == "IEC 61547"
+    # 末尾段落里的换行/全角空格也归一
+    assert standard_linker._normalize_extracted_number("GB/T\n20145-2006") == "GB/T 20145-2006"
+
+
+def test_normalize_extracted_number_empty_input():
+    """#27: 空输入原样返回(避免后续 None 报错)。"""
+    assert standard_linker._normalize_extracted_number("") == ""
+
+
+def test_link_standards_end_to_end_with_iec_no_space_extractor_output(monkeypatch):
+    """#27 端到端：即便 extractor 输出 ``IEC61547``（缺空格, 绕开后处理),
+    搜索端归一化匹配兜底仍命中正文 ``IEC 61547`` 文档,关联成功。
+
+    注：单测 fake extractor 不会走 ``extract_standards_deepseek`` 内的后处理,
+    这里验证的是 #27 **搜索端容错** 在关联主路径上的回填效果。
+    提取器后处理由 ``test_normalize_extracted_number_*`` 覆盖。
+    """
+    issue = _issue(1)
+    monkeypatch.setattr(standard_linker, "_doc_repo", _fake_repo(["d1"]))
+    monkeypatch.setattr(
+        standard_linker, "search_doc_by_text",
+        # 直接返回命中,模拟容错匹配已生效
+        lambda n, k: [{"doc_id": "d1", "page_number": 0, "content": "..."}],
+    )
+    monkeypatch.setattr(standard_linker, "vec_search", lambda kb_ids, q, top_k=5: [])
+    standard_linker.link_standards(
+        [issue], ["kb1"],
+        extractor=lambda pending: dict([_ext(1, ["IEC61547"])]),
+    )
+    sr = issue.standard_reference
+    assert sr.doc_id == "d1", (
+        f"#27: 归一化匹配应命中,实际 doc_id={sr.doc_id}"
+    )
+    # chunk_text 与 standard_name 用的是原始(未后处理)编号 —— 这正是为什么
+    # 提取器后处理要做:让最终显示的编号更接近正文。
+    assert sr.chunk_text == "IEC61547"
+    assert sr.standard_name == "IEC61547"
+
+
+def test_link_standards_end_to_end_with_post_processing_combined(monkeypatch):
+    """#27 端到端：把 ``_normalize_extracted_number`` 包进 extractor,
+    模拟真实生产路径(LLM 抽出 → 后处理 → 搜索 → 回填)。
+
+    与 ``test_link_standards_end_to_end_with_iec_no_space_extractor_output``
+    互补：后者验证搜索端单独生效,本测试验证提取器后处理+搜索端共同生效。
+    """
+    issue = _issue(1)
+    monkeypatch.setattr(standard_linker, "_doc_repo", _fake_repo(["d1"]))
+    monkeypatch.setattr(
+        standard_linker, "search_doc_by_text",
+        lambda n, k: [{"doc_id": "d1", "page_number": 0, "content": "..."}],
+    )
+    monkeypatch.setattr(standard_linker, "vec_search", lambda kb_ids, q, top_k=5: [])
+    extractor = lambda pending: dict([
+        (1, ExtractedStandard(
+            numbers=[standard_linker._normalize_extracted_number(n) for n in ["GB 7000-.202"]],
+            names=[],
+        )),
+    ])
+    standard_linker.link_standards(
+        [issue], ["kb1"], extractor=extractor,
+    )
+    sr = issue.standard_reference
+    assert sr.doc_id == "d1"
+    # 后处理把 ``GB 7000-.202`` → ``GB 7000.202``,故最终 chunk_text 更接近正文
+    assert sr.chunk_text == "GB 7000.202"
+    assert sr.standard_name == "GB 7000.202"

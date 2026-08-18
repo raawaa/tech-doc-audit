@@ -257,3 +257,83 @@ def test_search_doc_by_text_empty_inputs():
     assert search_doc_by_text("", ["kb1"]) == []
     assert search_doc_by_text("kw", []) == []
 
+
+# ── #27 容错匹配：标准编号格式不匹配时仍能命中 ────────────────────────────────
+
+
+def test_search_doc_by_text_tolerates_missing_space_in_prefix():
+    """#27: 提取器产出 ``IEC61547``（缺空格），文档正文写 ``IEC 61547`` →
+    大小写不敏感的精确 ``str.find`` 失败,需走归一化匹配兜底命中。"""
+    _seed_doc_with_pages("vs_t27_a", "doc_a", [
+        {"page": 0, "text": "应符合 IEC 61547 对灯具电磁兼容的要求"},
+    ])
+    hits = search_doc_by_text("IEC61547", ["vs_t27_a"])
+    assert len(hits) == 1, f"归一化匹配未命中,实际 hits={hits}"
+    assert hits[0]["doc_id"] == "doc_a"
+    assert hits[0]["page_number"] == 0
+    assert "IEC 61547" in hits[0]["content"]
+
+
+def test_search_doc_by_text_tolerates_dash_vs_dot_separator():
+    """#27: 提取器产出 ``GB 7000-.202``（多余横线），文档正文写 ``GB 7000.202`` →
+    归一化匹配需把 ``-`` 与 ``.`` 都视为等价分隔符并命中。"""
+    _seed_doc_with_pages("vs_t27_b", "doc_b", [
+        {"page": 0, "text": "本标准与 GB 7000.202 灯具标准配套使用"},
+    ])
+    hits = search_doc_by_text("GB 7000-.202", ["vs_t27_b"])
+    assert len(hits) == 1, f"归一化匹配未命中,实际 hits={hits}"
+    assert hits[0]["doc_id"] == "doc_b"
+    assert hits[0]["page_number"] == 0
+    assert "GB 7000.202" in hits[0]["content"]
+
+
+def test_search_doc_by_text_normalization_does_not_split_unrelated_digits():
+    """#27 容错不能误命中:不同编号 ``GB 50016`` 不应匹配 ``GB 50034`` 文档。"""
+    _seed_doc_with_pages("vs_t27_c", "doc_c", [
+        {"page": 0, "text": "建筑照明设计标准 GB 50034 全文"},
+    ])
+    assert search_doc_by_text("GB 50016", ["vs_t27_c"]) == [], (
+        "归一化匹配需保持足够区分度,不应把不同编号视为同一串"
+    )
+
+
+def test_search_doc_by_text_exact_match_still_wins():
+    """#27: 归一化匹配是兜底,不破坏原有精确匹配路径。"""
+    _seed_doc_with_pages("vs_t27_d", "doc_d", [
+        {"page": 0, "text": "网络等级保护 GB/T 22239-2019 要求"},
+    ])
+    # 精确匹配(原路径)正常命中
+    hits = search_doc_by_text("GB/T 22239-2019", ["vs_t27_d"])
+    assert len(hits) == 1
+    assert hits[0]["page_number"] == 0
+
+
+def test_search_doc_by_text_normalized_strips_slash_in_gb_t():
+    """#27: 归一化剥离 ``/`` 后,``GB/T 20145-2006`` 与 ``GB T 20145 2006``
+    归一化串等价 —— needle 写错成 ``GB T 20145 2006``(缺斜线) 也能命中正文。
+    """
+    _seed_doc_with_pages("vs_t27_e", "doc_e", [
+        {"page": 0, "text": "光生物安全 GB/T 20145-2006 标准全文"},
+    ])
+    # 极端:needle 写错成 ``GB T 20145 2006``(剥空白+``/``+``-`` 等价于原文)
+    hits = search_doc_by_text("GB T 20145 2006", ["vs_t27_e"])
+    assert len(hits) == 1
+    assert "GB/T 20145-2006" in hits[0]["content"]
+
+
+def test_search_doc_by_text_fallback_snippet_contains_match():
+    """#27 snippet 钳位回归：归一化命中后,``idx = min(norm_idx, len(raw_text))``
+    必须保证 snippet 仍包含标准编号（不能让 ``norm_idx > len(raw_text)`` 导致
+    切片为空）。"""
+    _seed_doc_with_pages("vs_t27_f", "doc_f", [
+        # 多分母文本: needle ``IEC61547`` 命中位置 ≈ 距 page 末尾 30 字符。
+        # 归一化剥空白 + ``.`` 后, raw_text 与 page_norm 长度差会放大 norm_idx,
+        # 但钳位后 idx ≤ len(raw_text), snippet 仍能取到原文。
+        {"page": 0, "text": "前言 本章 与 ... 标准 ... 与 " * 50 + "IEC 61547 兼容要求 ..."},
+    ])
+    hits = search_doc_by_text("IEC61547", ["vs_t27_f"])
+    assert len(hits) == 1
+    assert "IEC 61547" in hits[0]["content"], (
+        f"snippet 应含编号,实际 {hits[0]['content']!r}"
+    )
+
