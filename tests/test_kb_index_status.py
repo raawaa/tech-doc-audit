@@ -194,6 +194,33 @@ def test_clear_building_writes_none_and_clears(stub_and_writer):
     assert kb.index_current_doc == ""
 
 
+def test_clear_building_clears_non_default_progress(stub_and_writer):
+    """``clear_building()`` 必须把非 None 的 ``index_progress`` 也清空。
+
+    老 ``_write`` 用 ``progress=None`` 表达"未给出"，导致 ``clear_building``
+    拿 ``_write(progress=None)`` 想"清空"时反而被吞掉 —— 残留的上次非零
+    进度（崩溃时正在跑的 0.42 等）留下来。#153 在 ``recover_stuck_indexes``
+    里第一次踩到这条语义，专门加这条单测守住。
+    """
+    stub, writer = stub_and_writer
+
+    # 模拟"上次跑到一半崩了"：KB 仍带 index_progress=0.42 + current_doc="foo.pdf"
+    stub._kb.index_status = "building"
+    stub._kb.index_progress = 0.42
+    stub._kb.index_current_doc = "foo.pdf"
+    stub.updates.clear()  # 抹掉 seeding 期间的 update 记录
+
+    writer.clear_building()
+
+    kb = _latest_update(stub)
+    assert kb.index_status == "none"
+    assert kb.index_progress is None, (
+        f"clear_building 必须把 progress 显式置 None（即使旧值非零）；"
+        f"实际 {kb.index_progress!r}"
+    )
+    assert kb.index_current_doc == ""
+
+
 # ── 不变式 8: KB 已删 → 静默 return ────────────────────────────────
 
 

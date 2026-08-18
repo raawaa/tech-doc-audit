@@ -237,6 +237,91 @@ def test_recover_stuck_indexes():
     assert doc_ready_after.embedding_status == "embedded", "embedded 状态的文档不应被改动"
 
 
+# ── 启动恢复改走 KbIndexStatusWriter（issue #153）────────────────────────────
+
+
+def test_recover_stuck_indexes_uses_writer_clear_building():
+    """``recover_stuck_indexes`` 必须走 ``KbIndexStatusWriter.clear_building()``，不
+    直写 ``kb.index_status/index_progress/index_current_doc``（issue #147 / #153）。
+
+    验证两层：
+    1. 卡在 ``building`` 的 KB —— writer 构造一次 + ``clear_building()`` 调一次 + 终
+       态 ``index_status="none"`` + ``index_progress=None`` + ``index_current_doc=""``。
+    2. 不卡住的 KB（``searchable`` / ``none`` / ``failed``）—— writer **不构造**
+       （避免无意义的 stub 副作用）。这条是 AC 里"构造语句只在该 KB 状态需要清除
+       时执行一次"那条的取证。
+    """
+    from unittest.mock import patch
+    from core.kb_index_status import KbIndexStatusWriter
+
+    import services.kb_service as kb_svc
+    import storage.kb_repo as kb_repo
+    from api.main import recover_stuck_indexes
+
+    # 卡住的 KB（应被 clear_building）
+    kb_stuck = kb_svc.create_kb(name="卡住的KB", category="national")
+    kb_stuck.index_status = "building"
+    kb_stuck.index_progress = 0.42
+    kb_stuck.index_current_doc = "foo.pdf"
+    kb_repo.update(kb_stuck)
+
+    # 不卡住的 KB（writer 不应被构造）
+    kb_already_none = kb_svc.create_kb(name="已 None", category="national")
+    # index_status 默认为 "none"，不动
+
+    kb_already_searchable = kb_svc.create_kb(name="已 searchable", category="national")
+    kb_already_searchable.index_status = "searchable"
+    kb_already_searchable.index_progress = 1.0
+    kb_repo.update(kb_already_searchable)
+
+    kb_already_failed = kb_svc.create_kb(name="已 failed", category="national")
+    kb_already_failed.index_status = "failed"
+    kb_already_failed.index_current_doc = "历史错误"
+    kb_repo.update(kb_already_failed)
+
+    # spy：记所有构造的 kb_id + clear_building 调用次数
+    constructed_ids: list[str] = []
+    clear_calls: list[str] = []
+
+    real_init = KbIndexStatusWriter.__init__
+    real_clear = KbIndexStatusWriter.clear_building
+
+    def spy_init(self, kb_id, total=1):
+        constructed_ids.append(kb_id)
+        real_init(self, kb_id, total=total)
+
+    def spy_clear(self):
+        clear_calls.append(self._kb_id)
+        real_clear(self)
+
+    with patch.object(KbIndexStatusWriter, "__init__", spy_init), \
+         patch.object(KbIndexStatusWriter, "clear_building", spy_clear):
+        recover_stuck_indexes()
+
+    # 1. 卡住的 KB → writer 构造一次 + clear_building 调一次
+    assert kb_stuck.id in constructed_ids, (
+        f"卡住的 KB 必须构造 KbIndexStatusWriter；实际构造列表 {constructed_ids}"
+    )
+    assert kb_stuck.id in clear_calls, (
+        f"卡住的 KB 必须调 clear_building；实际调用 {clear_calls}"
+    )
+    # 且该 KB 状态字段最终落到 none / None / ""
+    kb_after = kb_repo.get(kb_stuck.id)
+    assert kb_after.index_status == "none"
+    assert kb_after.index_progress is None
+    assert kb_after.index_current_doc == ""
+
+    # 2. 不卡住的 KB → writer **不构造**
+    for kb in (kb_already_none, kb_already_searchable, kb_already_failed):
+        assert kb.id not in constructed_ids, (
+            f"不卡住的 KB {kb.id} (status={kb.index_status}) 不应构造 writer；"
+            f"实际构造列表 {constructed_ids}"
+        )
+        assert kb.id not in clear_calls, (
+            f"不卡住的 KB {kb.id} 不应调 clear_building；实际调用 {clear_calls}"
+        )
+
+
 # ── V4 POST /reparse ──────────────────────────────────────────────────────────
 
 

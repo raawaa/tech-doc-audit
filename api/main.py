@@ -24,6 +24,7 @@ app = FastAPI(
 # 这里在启动时自动恢复 ― 将 stuck 状态的 KB/Doc 重置为 none/embedded。
 import storage.kb_repo as kb_repo
 import storage.doc_repo as doc_repo
+from core.kb_index_status import KbIndexStatusWriter
 
 
 def recover_stuck_indexes():
@@ -34,13 +35,15 @@ def recover_stuck_indexes():
     - Doc.embedding_status="pending_index" → "none"（尚未开始写向量就崩了）
     - Doc.embedding_status="indexing" → "pending_index"（写到一半崩了，重排队）
     - 已 "embedded" 的文档与 "searchable"/"failed" 的 KB 不动
+
+    KB 检索状态字段的写收集归 ``KbIndexStatusWriter.clear_building()``
+    （issue #147 / #153 —— writer 是该字段唯一写入者）；doc 级
+    ``embedding_status`` 仍由 ``doc_repo._save_doc_meta`` 写（不是 KB 状态
+    机的责任，单独立契约）。
     """
     stuck_kbs = [kb for kb in kb_repo.list_all() if kb.index_status == "building"]
     for kb in stuck_kbs:
-        kb.index_status = "none"
-        kb.index_progress = None
-        kb.index_current_doc = ""
-        kb_repo.update(kb)
+        KbIndexStatusWriter(kb.id).clear_building()
         print(f"[startup] 恢复卡住的 KB: {kb.name} ({kb.id}) → index_status=none")
 
     kbs_dir = kb_repo.get_kbs_dir()

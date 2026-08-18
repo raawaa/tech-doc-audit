@@ -119,38 +119,57 @@ class KbIndexStatusWriter:
             self.note_in_flight(f"reparse 错误: {err}")
 
     def clear_building(self) -> None:
-        """把 KB 状态拉回 ``none``（崩溃自愈 / 运维解卡）。"""
+        """把 KB 状态拉回 ``none``（崩溃自愈 / 运维解卡）。
+
+        三个字段一并清除 —— 包括 ``index_progress=None``（即使原值非零也得
+        清，否则下次重建时前端还会看到上次的 0.42）。``progress=None`` 走
+        ``_write`` 的"显式置 None"分支（vs. 哨兵 ``_UNSET`` 的"跳过"分支），
+        见 ``_write`` docstring。
+        """
         self._write(status="none", progress=None, current_doc="")
 
     # ── 内部 ────────────────────────────────────────────────────────
 
+    # 区分"未给出"与"明确置 None"：用哨兵对象，否则 ``clear_building`` 拿 ``_write(
+    # progress=None)`` 表达"清空进度"会被当作"跳过"，index_progress 残留上次的非零
+    # 值（#148 spec 7 / #153 把这个语义首次暴露给非默认值的 KB）。
+    _UNSET: object = object()
+
     def _write(
         self,
         *,
-        status: Optional[str] = None,
-        progress: Optional[float] = None,
-        current_doc: Optional[str] = None,
+        status: object = _UNSET,
+        progress: object = _UNSET,
+        current_doc: object = _UNSET,
     ) -> None:
         """读—改—写一次 KB 元数据；只覆盖显式给出的字段。
 
         锁住整个 read-modify-write：``kb_repo.update`` 落的是整个对象，
         没锁的话两个线程各自读到旧值再写回，后写的会把前一次的进度抹掉。
         KB 已删（``kb_repo.get`` 返 ``None``）→ 静默 ``return``。
+
+        字段参数语义：
+        - 哨兵 ``_UNSET``（默认）→ 该字段不动。
+        - ``None`` → 把该字段显式清空（如 ``clear_building`` 的 ``progress``）。
+        - 其它值 → 正常写入。
         """
         with self._lock:
-            if progress is not None:
+            if progress is not self._UNSET and progress is not None:
                 # 单调不减：并发下完成回调乱序也不许让进度倒退（#93）
                 progress = max(self._progress, progress)
                 self._progress = progress
             kb = kb_repo.get(self._kb_id)
             if kb is None:
                 return
-            if status is not None:
-                kb.index_status = status
-            if progress is not None:
-                kb.index_progress = progress
-            if current_doc is not None:
-                kb.index_current_doc = current_doc
+            # 三字段同形态（"如果不是 _UNSET 就赋值"），收归一次循环；
+            # 字段名是 KnowledgeBase 的 Literal 字段，setattr 走 type: ignore。
+            for field, value in (
+                ("index_status", status),
+                ("index_progress", progress),
+                ("index_current_doc", current_doc),
+            ):
+                if value is not self._UNSET:
+                    setattr(kb, field, value)  # type: ignore[arg-type]
             kb_repo.update(kb)
 
     # ── 字符串 helper（人在读的一行）─────────────────────────────────
