@@ -13,8 +13,9 @@
    决议），预检里作为警告呈现、实际 run 里进 ``skipped``。
 4. **受控并发编排** —— 线程池限流 + 单篇轮询超时，单篇失败不中断整批。
 5. **KB 级检索状态** —— 整批期间把 KB 按在 ``building``，终态末尾写一次
-   （issue #109，见 ``_KbIndexStatus``）。批量下单篇入口以
-   ``caller_manages_kb_status=True`` 调用，不再各写各的。
+   （issue #109 / #147，由 ``core.kb_index_status.KbIndexStatusWriter`` 独占）。
+   批量下单篇入口注入该 writer 取代旧的 ``caller_manages_kb_status=True`` 开关
+   （#150），不再各写各的。
 6. **实测 OCR 消耗计数与报告持久化**（issue #110）—— 跑前取缓存条目快照，
    跑完每篇按 ``paddleocr / cache_hit / 非 OCR 来源 / unknown`` 分桶，预检
    估算与实测值并列写进 ``data/kbs/{kb_id}/bulk_reparse_report.json``。
@@ -27,7 +28,6 @@ HTTP 端点（#111）不在这里，后续 ticket 在此基础上加。
 """
 from __future__ import annotations
 
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -37,6 +37,7 @@ from typing import Callable, Mapping, Optional, Sequence
 import storage.doc_repo as doc_repo
 import storage.kb_repo as kb_repo
 from core import bulk_reparse_report_store, paddleocr_cache, pages_store
+from core.kb_index_status import KbIndexStatusWriter
 from core.logger import get_logger
 from models.document import KBDocument
 from services.reparse_service import reparse_document
@@ -75,9 +76,6 @@ REASON_FORCED = "forced"
 
 # 跳过原因。
 SKIP_REASON_PAGE_LIMIT = "page_limit"
-
-# 失败摘要里最多点名几篇（``index_current_doc`` 是要给人看的一行字，不是日志）。
-_MAX_SUMMARY_ITEMS = 3
 
 # 实测 OCR 消耗的两个**非解析器**分桶名（其余分桶名直接就是缓存条目的 ``source``：
 # ``paddleocr`` / ``pymupdf`` / ``fallback_*``）。
@@ -333,7 +331,7 @@ def reparse_one(
     doc: KBDocument,
     *,
     timeout_s: float = PER_DOC_TIMEOUT_S,
-    caller_manages_kb_status: bool = False,
+    kb_writer: Optional[KbIndexStatusWriter] = None,
 ) -> tuple[str, str]:
     """对一篇文档触发重新解析并等待终态。返回 ``(doc_id, outcome)``。
 
@@ -343,11 +341,12 @@ def reparse_one(
     明细只剩光秃秃的 "failed" 串，根本看不出是 parse 挂了、layout 空了、还是
     索引写失败。同步 ``reparse_document()`` 抛异常仍走 ``"raised:<err>"`` 路径。
 
-    ``caller_manages_kb_status`` 原样透传给 ``reparse_document``：批量编排下必须为
-    ``True``，否则单篇一完成就把 KB 写回 ``searchable``（见 ``_KbIndexStatus``）。
+    ``kb_writer`` 直接透传给 ``reparse_document``：批量编排下注入它跨文档共享的
+    ``KbIndexStatusWriter``，让 KB 级状态字段由编排层独占管理（详见 ``KbIndexStatusWriter``
+    docstring + #147）；默认 ``None`` —— 单篇入口走函数自构造 ``total=1`` 的 writer。
     """
     try:
-        reparse_document(doc.id, caller_manages_kb_status=caller_manages_kb_status)
+        reparse_document(doc.id, kb_writer=kb_writer)
     except Exception as e:
         return (doc.id, f"raised:{type(e).__name__}:{e}")
 
@@ -380,103 +379,21 @@ def _wait_for_terminal(kb_id: str, doc_id: str, timeout_s: float) -> str:
 
 
 # ── 5) KB 级检索状态：批次期间的唯一写入者 ─────────────────────────────────────
-
-
-class _KbIndexStatus:
-    """一次批量运行期间 KB 级检索状态的**唯一写入者**（issue #109）。
-
-    契约三句话：
-
-    1. 批次开头写一次 ``building`` + ``index_progress=0``；
-    2. 期间只推进 ``index_progress``（``done/total``，单调不减）与
-       ``index_current_doc``（在飞文档名），``index_status`` 恒为 ``building``；
-    3. 批次末尾写一次终态 —— 全部完成 → ``searchable``；有任何一篇没完成 →
-       ``failed`` + 一行人能读懂的失败摘要。
-
-    为什么中途一次 ``searchable`` 都不许有：按 ``CONTEXT.md`` 的定义，
-    ``searchable`` 表示"该库**此刻**可被向量检索"，批量重解析进行到一半时
-    这句话不成立。而且前端 ``KnowledgeBaseDetail.tsx`` 以
-    ``index_status === "building"`` 为轮询续订的唯一条件，抖动会让它反复
-    停轮询又重启，进度条彻底不可信（#93 实测 154 篇抖动上百次）。
-
-    因此单篇入口在批量下必须以 ``caller_manages_kb_status=True`` 调用。
-    ``index_current_doc`` 在并发 > 1 时是"最近开跑的那一篇"（后写覆盖前写），
-    不试图表达"同时在飞的 N 篇"—— 这个字段只有一个槽位。
-    """
-
-    def __init__(self, kb_id: str, total: int) -> None:
-        self._kb_id = kb_id
-        self._total = total
-        self._lock = threading.Lock()
-        self._progress = 0.0
-
-    def begin(self) -> None:
-        self._write(status="building", progress=0.0, current_doc="")
-
-    def note_in_flight(self, doc: KBDocument) -> None:
-        self._write(current_doc=doc.original_name)
-
-    def advance(self, completed: int) -> None:
-        self._write(progress=completed / self._total if self._total else 1.0)
-
-    def finish(
-        self, failed: Sequence[tuple[str, str]], *, interrupted: Optional[str] = None
-    ) -> None:
-        """写终态，整批只调用一次。``failed`` 是 ``(文档名, outcome)`` 列表。
-
-        ``interrupted`` 是编排层自身出事时的错误串（线程池崩溃 / Ctrl-C）：
-        批次没跑完，但 KB 更不能永远卡在 ``building`` —— 前端会一直轮询一个
-        永不落地的批次。落 ``failed`` 并说明中断原因。
-        """
-        if interrupted is not None:
-            self._write(
-                status="failed", progress=1.0,
-                current_doc=f"批量重新解析中断: {interrupted}",
-            )
-        elif failed:
-            self._write(
-                status="failed", progress=1.0,
-                current_doc=_failure_summary(failed, self._total),
-            )
-        else:
-            self._write(status="searchable", progress=1.0, current_doc="")
-
-    def _write(
-        self,
-        *,
-        status: Optional[str] = None,
-        progress: Optional[float] = None,
-        current_doc: Optional[str] = None,
-    ) -> None:
-        """读—改—写一次 KB 元数据；只覆盖显式给出的字段。
-
-        锁住整个读—改—写：``kb_repo.update`` 落的是整个对象，没有锁的话
-        两个线程各自读到旧值再写回，后写的会把前一次的进度抹掉。
-        """
-        with self._lock:
-            if progress is not None:
-                # 单调不减：并发下完成回调乱序也不许让进度倒退
-                progress = max(self._progress, progress)
-                self._progress = progress
-            kb = kb_repo.get(self._kb_id)
-            if kb is None:
-                return
-            if status is not None:
-                kb.index_status = status
-            if progress is not None:
-                kb.index_progress = progress
-            if current_doc is not None:
-                kb.index_current_doc = current_doc
-            kb_repo.update(kb)
-
-
-def _failure_summary(failed: Sequence[tuple[str, str]], total: int) -> str:
-    """把失败清单压成一行给人看的摘要，写进 ``index_current_doc``。"""
-    shown = "；".join(
-        f"{name}: {outcome}" for name, outcome in failed[:_MAX_SUMMARY_ITEMS]
-    )
-    more = " 等" if len(failed) > _MAX_SUMMARY_ITEMS else ""
-    return f"批量重新解析失败 {len(failed)}/{total} 篇（{shown}{more}）"
+#
+# Issue #147 / #148：KB 级检索状态字段（``index_status`` / ``index_progress`` /
+# ``index_current_doc``）的唯一写入者是 ``core.kb_index_status.KbIndexStatusWriter``。
+# 本模块原本的 ``_KbIndexStatus`` 是它的二次克隆（issue #109 引入），#150 后
+# 直接用 ``KbIndexStatusWriter`` 即可：批次开头 ``begin()`` + 期间 ``advance()``
+# + 末尾 ``finish()`` 三句契约不变；单篇入口注入本 writer 取代旧的
+# ``caller_manages_kb_status=True`` 开关。
+#
+# 为什么中途一次 ``searchable`` 都不许有：按 ``CONTEXT.md`` 的定义，
+# ``searchable`` 表示"该库**此刻**可被向量检索"，批量重解析进行到一半时
+# 这句话不成立。而且前端 ``KnowledgeBaseDetail.tsx`` 以
+# ``index_status === "building"`` 为轮询续订的唯一条件，抖动会让它反复
+# 停轮询又重启，进度条彻底不可信（#93 实测 154 篇抖动上百次）。
+# ``index_current_doc`` 在并发 > 1 时是"最近开跑的那一篇"（后写覆盖前写），
+# 不试图表达"同时在飞的 N 篇"—— 这个字段只有一个槽位。
 
 
 def run_bulk_reparse(
@@ -517,13 +434,13 @@ def run_bulk_reparse(
     doc_usages: list[DocParseUsage] = []
 
     if total:
-        status = _KbIndexStatus(kb_id, total)
+        status = KbIndexStatusWriter(kb_id, total=total)
         status.begin()
 
         def _run_one(doc: KBDocument) -> tuple[str, str]:
-            status.note_in_flight(doc)
+            status.note_in_flight(doc.original_name)
             return reparse_one(
-                kb_id, doc, timeout_s=timeout_s, caller_manages_kb_status=True
+                kb_id, doc, timeout_s=timeout_s, kb_writer=status
             )
 
         with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:

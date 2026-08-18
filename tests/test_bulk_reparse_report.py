@@ -95,7 +95,7 @@ def _stub_reparse(monkeypatch, *, outcomes=None, on_parse=None):
     outcomes = outcomes or {}
     monkeypatch.setattr(svc, "_POLL_INTERVAL_S", 0.01)
 
-    def _fake(doc_id: str, *, caller_manages_kb_status: bool = False):
+    def _fake(doc_id: str, *, kb_writer=None):
         outcome = outcomes.get(doc_id, "embedded")
         if outcome == "raise":
             raise RuntimeError("simulated reparse outage")
@@ -524,7 +524,7 @@ def test_async_failure_message_from_kb_state_surfaces_in_report(kb, monkeypatch)
     monkeypatch.setattr(svc, "_POLL_INTERVAL_S", 0.01)
     bad = _add_doc(kb.id, "async_bad.pdf", page_count=2)
 
-    def _async_fail(doc_id: str, *, caller_manages_kb_status: bool = False):
+    def _async_fail(doc_id: str, *, kb_writer=None):
         # 模拟 reparse_service 异步分支的 _mark_failed 写错误消息
         k = kb_repo.get(bad.kb_id)
         k.index_current_doc = "reparse 错误: 解析 PaddleOCR API 504"

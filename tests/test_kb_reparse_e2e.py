@@ -351,8 +351,13 @@ def test_reparse_passes_by_layout_to_index_document(
         # 模拟 doc_repo.get_doc(kb_id, doc_id) → doc 实例
         mock_doc_repo.get_doc.return_value = doc
 
+        # #150：_reparse_async 现在显式接受 kb_writer；这里造一个 total=1 的实例，
+        # 让它走完整的 begin / note_in_flight / finish 生命周期。
+        from core.kb_index_status import KbIndexStatusWriter
+        kb_writer = KbIndexStatusWriter(kb.id, total=1)
+
         from services.reparse_service import _reparse_async
-        _reparse_async(kb.id, doc.id)
+        _reparse_async(kb.id, doc.id, kb_writer)
 
     mock_idx.assert_called_once()
     call = mock_idx.call_args

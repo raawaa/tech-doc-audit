@@ -423,8 +423,10 @@ def _stub_reparse_observing_kb(monkeypatch, kb_id, outcomes: dict[str, str] | No
     return svc, observed, calls
 
 
-def test_bulk_run_opts_into_caller_managed_kb_status(kb, monkeypatch):
-    """编排层必须对每一篇打开"调用方托管 KB 状态"开关，否则单篇仍会自己写 searchable。"""
+def test_bulk_run_passes_its_kb_writer_to_every_doc(kb, monkeypatch):
+    """编排层必须对每一篇注入它跨文档共享的 ``KbIndexStatusWriter``，
+    否则每篇仍会自己造 total=1 的 writer、单篇一完成就把 KB 写回 searchable
+    （#93 抖动症状的源头）。"""
     _add_doc(kb.id, "a.pdf", embedding_status="failed", page_count=3)
     _add_doc(kb.id, "b.pdf", embedding_status="failed", page_count=3)
     svc, _observed, calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
@@ -432,8 +434,15 @@ def test_bulk_run_opts_into_caller_managed_kb_status(kb, monkeypatch):
     svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
 
     assert len(calls) == 2
-    for _doc_id, kwargs in calls:
-        assert kwargs.get("caller_manages_kb_status") is True
+    writers = [kwargs.get("kb_writer") for _doc_id, kwargs in calls]
+    assert all(w is not None for w in writers), (
+        f"编排层必须对每篇传入 kb_writer，实际 {writers}"
+    )
+    # 跨文档共享：两次调用拿到的是同一个 writer 实例。
+    assert writers[0] is writers[1], (
+        "跨文档共享的应是同一个 KbIndexStatusWriter 实例"
+        f"（实际 {writers[0]!r} vs {writers[1]!r}）"
+    )
 
 
 def test_bulk_run_never_claims_searchable_mid_batch(kb, monkeypatch):

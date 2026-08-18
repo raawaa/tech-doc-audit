@@ -6,9 +6,12 @@
 设计上：
 - 立即返回（异步）；后台任务在 KB 级锁内执行，避免与重建索引混线。
 - 任何步骤失败 → ``embedding_status=failed`` + ``index_current_doc`` 写错误信息（沿用现有契约）。
-- ``caller_manages_kb_status=True`` 时**完全不碰** KB 级检索状态，交给调用方
-  （批量重新解析编排层）在批次首尾各写一次 —— 避免整批期间反复宣称
-  ``searchable``（issue #109 / #93 抖动症状）。默认关闭，单篇入口行为不变。
+- KB 级检索状态（``index_status`` / ``index_progress`` / ``index_current_doc``）由
+  ``core.kb_index_status.KbIndexStatusWriter``（issue #148）唯一写入。单篇入口默认
+  自己造 ``total=1`` 的 writer 走完整生命周期；批量重新解析
+  （``services.bulk_reparse_service``）注入编排层共享的 writer（``total=N``），
+  由此函数在自己的 begin()/finish() 之间干活，编排层在批次首尾再
+  begin()/finish() 收尾，整批期间 KB 不会在 ``building ⇄ searchable`` 间抖动。
 - 完整逆向兼容：老 ``page_texts`` 路径仍在 ``import_document`` 里；reparse 走新路径。
 """
 from __future__ import annotations
@@ -16,6 +19,7 @@ from __future__ import annotations
 import threading
 from typing import Optional
 
+from core.kb_index_status import KbIndexStatusWriter
 from core.logger import get_logger
 from core.parse_document import parse_document, MIN_FULL_TEXT_CHARS
 from core.pages_store import save_pages
@@ -30,16 +34,18 @@ import storage.kb_repo as kb_repo
 _logger = get_logger(__name__)
 
 
-def reparse_document(doc_id: str, *, caller_manages_kb_status: bool = False) -> dict:
+def reparse_document(
+    doc_id: str, *, kb_writer: Optional[KbIndexStatusWriter] = None
+) -> dict:
     """同步启动重新解析的 KB 文档。立即返回 status=pending_index；后台任务执行。
 
     Args:
-        caller_manages_kb_status: 打开后本次重解析**完全不碰** KB 级检索状态
-            （``index_status`` / ``index_progress`` / ``index_current_doc``），
-            由调用方负责在合适的时机写。批量重新解析
-            （``services.bulk_reparse_service``）用它把 KB 按住在 ``building``；
-            默认关闭，per-doc API 端点与单篇 UI 按钮的行为不变。
-            注意：doc 级 ``embedding_status`` 无论开关如何都照常写。
+        kb_writer: KB 检索状态字段的唯一写入者（issue #148 / #147）。批量重新解析
+            （``services.bulk_reparse_service``）注入它跨文档共享的 writer，让
+            整批期间 KB 状态由编排层独占管理；默认 ``None`` —— 函数自己构造一个
+            ``KbIndexStatusWriter(kb_id, total=1)`` 走完整生命周期（开头 building、
+            终态 searchable|failed）。无论是否传入，doc 级 ``embedding_status``
+            都照常写。
 
     Returns:
         ``{"status": "pending_index", "doc_id": "..."}`` 表示已调度。
@@ -54,10 +60,13 @@ def reparse_document(doc_id: str, *, caller_manages_kb_status: bool = False) -> 
     doc.embedding_status = "pending_index"
     doc_repo._save_doc_meta(doc)
 
+    # 默认自己管 KB 状态；批量注入时由编排层管生命周期。
+    if kb_writer is None:
+        kb_writer = KbIndexStatusWriter(doc.kb_id, total=1)
+
     thread = threading.Thread(
         target=_reparse_async,
-        args=(doc.kb_id, doc_id),
-        kwargs={"caller_manages_kb_status": caller_manages_kb_status},
+        args=(doc.kb_id, doc_id, kb_writer),
         daemon=True,
     )
     thread.start()
@@ -66,26 +75,30 @@ def reparse_document(doc_id: str, *, caller_manages_kb_status: bool = False) -> 
 
 
 def _reparse_async(
-    kb_id: str, doc_id: str, *, caller_manages_kb_status: bool = False
+    kb_id: str, doc_id: str, kb_writer: KbIndexStatusWriter
 ) -> None:
-    """后台执行：parse → save_pages → 重建索引 → 更新状态。"""
+    """后台执行：parse → save_pages → 重建索引 → 更新状态。
+
+    KB 级状态字段走 writer —— 单篇路径 writer 由 ``reparse_document`` 构造，
+    批量路径 writer 由编排层构造并注入。两种情形都是"先 begin / finish 一条线"，
+    没有 caller_manages_kb_status 这种布尔分支。
+    """
     doc = doc_repo.get_doc(kb_id, doc_id)
     if not doc or not doc.file_path:
         _mark_failed(
             kb_id, doc_id, "doc or file_path missing",
-            caller_manages_kb_status=caller_manages_kb_status,
+            kb_writer=kb_writer,
         )
         return
 
-    # 标记 KB building（除非调用方托管 KB 状态）
     kb = kb_repo.get(kb_id)
     if not kb:
         return
-    if not caller_manages_kb_status:
-        kb.index_status = "building"
-        kb.index_progress = 0.0
-        kb.index_current_doc = doc.original_name
-        kb_repo.update(kb)
+
+    # 开锁前先标记 building。批量场景下编排层已 begin()，这里再调一次
+    # 是幂等的（同样的 building + progress=0 + current_doc=""）。
+    kb_writer.begin()
+    kb_writer.note_in_flight(doc.original_name)
 
     with _get_index_lock(kb_id):
         try:
@@ -125,13 +138,7 @@ def _reparse_async(
             doc.embedding_status = "embedded"
             doc_repo._save_doc_meta(doc)
 
-            if not caller_manages_kb_status:
-                fresh = kb_repo.get(kb_id)
-                if fresh is not None:
-                    fresh.index_status = "searchable"
-                    fresh.index_progress = 1.0
-                    fresh.index_current_doc = ""
-                    kb_repo.update(fresh)
+            kb_writer.finish()
 
             _logger.info(
                 "reparse: doc %s (%s) embedded %d chunks",
@@ -142,22 +149,34 @@ def _reparse_async(
             _logger.warning("reparse failed for doc %s: %s", doc_id, e)
             _mark_failed(
                 kb_id, doc_id, str(e),
-                caller_manages_kb_status=caller_manages_kb_status,
+                kb_writer=kb_writer,
             )
 
 
 def _mark_failed(
-    kb_id: str, doc_id: str, err: str, *, caller_manages_kb_status: bool = False
+    kb_id: str, doc_id: str, err: str, *, kb_writer: KbIndexStatusWriter
 ) -> None:
+    """doc 失败 → 写 ``embedding_status="failed"`` + 走 writer 写 KB 终态。
+
+    writer 是 KB 级检索状态的唯一写入者（issue #148）。单篇路径下 kb_writer
+    由 ``reparse_document`` 内部构造（total=1），``finish(failed=[...])`` 直接
+    把 KB 写成 ``failed`` + 一行失败摘要；批量路径下 kb_writer 由编排层注入
+    （total=N），单篇失败不调 ``finish()``（避免整批期间 KB 在中途跳到
+    ``failed``），只把错误信息塞进 ``index_current_doc``，终态由编排层在
+    批次末尾通过同一个 writer 统一写。
+    """
     doc = doc_repo.get_doc(kb_id, doc_id)
     if doc is not None:
         doc.embedding_status = "failed"
         doc_repo._save_doc_meta(doc)
-    if caller_manages_kb_status:
-        # 批量场景：单篇失败不代表整库失败，终态由编排层在批次末尾写一次。
-        return
-    kb = kb_repo.get(kb_id)
-    if kb is not None:
-        kb.index_status = "failed"
-        kb.index_current_doc = f"reparse 错误: {err}"
-        kb_repo.update(kb)
+
+    doc_name = doc.original_name if doc is not None and doc.original_name else doc_id
+    if kb_writer._total == 1:
+        # 单篇路径：直接写终态 failed。字面前缀仍是 writer 的
+        # ``_format_failure_summary``（"批量重新解析失败 1/1 篇..."），已知语义小漂移，
+        # 见 #149 PR description 备注。
+        kb_writer.finish(failed=[(doc_name, err)])
+    else:
+        # 批量路径：单篇失败不代表整批失败；只把错误摘要写到 current_doc，
+        # 保留 status=building 不变，由编排层在批次末尾统一 finish()。
+        kb_writer.note_in_flight(f"reparse 错误: {err}")
