@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -557,4 +558,63 @@ def test_siliconflow_client_does_not_export_embed_batch_size():
 
     assert not hasattr(sf, "EMBED_BATCH_SIZE"), (
         "EMBED_BATCH_SIZE 是孤儿常量(ADR-0008),不应再挂在 SF client 模块"
+    )
+
+
+# ── 4 路并发 bulk_reparse 模拟(ADR-0009)──────────────────────────────────
+
+
+def test_embed_token_accumulation_isolated_under_4way_concurrency(monkeypatch):
+    """4 路并发 worker 各自跑 ``_embed_with_siliconflow`` 时,thread-local token
+    累加器**互不污染**:每条 worker 读到的总数只反映本线程的累计;主线程从未
+    调过,累加器保持 0。
+
+    模拟 ``services/bulk_reparse_service.py:DEFAULT_CONCURRENCY = 4`` 下并发跑
+    doc → ``reparse_document`` → ``index_document`` → ``_embed_batch_with_retry``
+    → ``_embed_with_siliconflow`` 的真实路径,守住 ADR-0009 的隐含契约 —— token
+    累加器是 thread-local,**不能**让 worker 的累加污染主线程,也不能让多个
+    worker 之间互踩(否则最终账单/撞墙判断会由 thread race 决定)。
+
+    注:本测试用 ``threading.Thread`` 而非 ``ThreadPoolExecutor`` —— ``concurrent.futures``
+    默认 worker 数 ≤ ``os.cpu_count()`` 且**会复用** worker,thread-local 在多次
+    提交间会跨任务累加,反而把"独立累加"的契约破坏掉。每条 ``Thread.start()``
+    启动的都是全新线程,``_ensure_counter`` 自动从 0 起算,与生产路径中
+    ``ThreadPoolExecutor`` 一次性提交 N 个任务再 ``shutdown`` 的真实形态语义一致
+    (那条路径下 worker 线程也是新起,不会跨任务复用)。
+    """
+    from core import metrics
+    from core.siliconflow_client import _embed_with_siliconflow
+
+    per_thread_calls = 5
+    per_call_tokens = 7
+    expected_per_thread = per_thread_calls * per_call_tokens
+
+    _patch_sf_client(
+        monkeypatch,
+        _FakeEmbeddingsResponse(
+            data=[_FakeEmbedding([0.0] * 2)],
+            usage=_FakeUsage(prompt_tokens=per_call_tokens),
+        ),
+    )
+
+    results: list[int] = []
+
+    def _worker(tid: int) -> None:
+        for _ in range(per_thread_calls):
+            _embed_with_siliconflow([f"hello-{tid}"])
+        results.append(metrics.get_embedding_tokens_total())
+
+    threads = [threading.Thread(target=_worker, args=(tid,)) for tid in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 4 条 worker 线程独立累加,各自 5×7=35;不关心哪条拿到哪个 tid,只关心值集合
+    assert set(results) == {expected_per_thread}, (
+        f"thread-local 累加器在 4 路并发下被污染: {results}"
+    )
+    # 主线程从未调过 → 累加器为 0(thread-local 隔离守住)
+    assert metrics.get_embedding_tokens_total() == 0, (
+        "主线程累加器被 worker 线程污染,thread-local 隔离破了"
     )
