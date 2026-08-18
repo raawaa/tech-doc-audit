@@ -10,6 +10,7 @@ from models.knowledge_base import KnowledgeBase
 import storage.doc_repo as doc_repo
 import storage.kb_repo as kb_repo
 from services.vector_search import index_document as _index_vec
+from core.kb_index_status import KbIndexStatusWriter
 from core.logger import get_logger
 
 _logger = get_logger(__name__)
@@ -137,24 +138,32 @@ def import_document(
 
 
 def _index_single_doc_async(kb_id: str, doc: KBDocument):
-    """后台索引单篇文档（由 import_document async_index=True 调用）。"""
-    import storage.kb_repo as kb_repo
+    """后台索引单篇文档（由 import_document async_index=True 调用）。
 
+    KB 检索状态字段（``index_status`` / ``index_progress`` / ``index_current_doc``）
+    交给 ``KbIndexStatusWriter``（issue #148 / #152）—— 这是该字段在
+    ``doc_service`` 内的**唯一**写入者，与 ``reparse_service`` / ``rebuild_kb_index``
+    等所有路径共享同一个 writer 接口，KB 级状态字段不再分散直写。
+    ``_get_lock(kb_id)`` 仍是**文档生命周期锁**（防 ``document_ids`` 与异步
+    索引交错，issue #136 残留）：与 writer 自带的 per-instance 锁保护**不同**
+    资源，两把锁并存、互不替代。
+    """
     # 标记为 indexing（崩溃后可识别）
     doc.embedding_status = "indexing"
     doc_repo._save_doc_meta(doc)
 
-    # 获取最新 kb 并标记 building（原子 get→modify→update）。
-    # 注：最终 searchable 由调用方（rebuild_kb_index）按内置契约写回；
-    # 此处只在单文档场景下做兜底——一个 KB 一篇文档且导入即完成时需把 KB→searchable。
+    # KB 检索状态字段交给 writer —— writer 自己起一把 per-instance 锁串行化
+    # read-modify-write。开锁前先 begin()，让 UI/其他线程看见 ``building``
+    # 中间态（``rebuild_kb_index`` 同款内置契约）。
+    # ``_get_lock(kb_id)`` 仍在**此处**持有（issue #152 AC3）：它防的是
+    # document_ids 与 KB 状态字段交错（issue #136 残留）—— 与 writer 的
+    # per-instance 锁不同资源；两把锁都保留、嵌套持有。
+    # 最终 ``searchable`` 由本函数在末尾 ``finish()``，作为"一个 KB 一篇文档且
+    # 导入即完成"的兜底（rebuild_kb_index 不在此路径上跑）。
     with _get_lock(kb_id):
-        kb = kb_repo.get(kb_id)
-        if not kb:
-            return
-        kb.index_status = "building"
-        kb.index_progress = 0.0
-        kb.index_current_doc = doc.original_name
-        kb_repo.update(kb)
+        kb_writer = KbIndexStatusWriter(kb_id, total=1)
+        kb_writer.begin()
+        kb_writer.note_in_flight(doc.original_name)
 
     try:
         _index_vec(kb_id, doc.id, doc.file_path)
@@ -166,12 +175,13 @@ def _index_single_doc_async(kb_id: str, doc: KBDocument):
     # 原子地更新文档和 KB 状态（同一锁内，防止前端看到 doc embedded 而 KB 还在 building）
     with _get_lock(kb_id):
         doc_repo._save_doc_meta(doc)
-        kb = kb_repo.get(kb_id)
-        if kb:
-            kb.index_status = "searchable"
-            kb.index_progress = 1.0
-            kb.index_current_doc = ""
-            kb_repo.update(kb)
+        # 终态走 writer：单文档场景下始终 ``finish()``（searchable），与旧契约
+        # 对齐 —— 旧路径无论 doc.embedding_status 是 embedded 还是 failed 都写
+        # searchable（KB 视角"已处理过这篇"，doc 视角失败仍记 ``failed``）。
+        # 失败摘要留给 batch 路径 + reparse 路径（writer.fail_doc / finish(failed)），
+        # 单文档异步入口不重复该摘要。KB 已删 → writer 的 ``_write`` 内部对
+        # ``kb_repo.get`` 返 ``None`` 静默 return。
+        kb_writer.finish()
 
 
 def batch_import_documents(
@@ -254,7 +264,23 @@ def batch_import_documents(
 
 
 def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
-    """后台批量索引文档（由 batch_import_documents 调用）。"""
+    """后台批量索引文档（由 batch_import_documents 调用）。
+
+    KB 检索状态字段（``index_status`` / ``index_progress`` / ``index_current_doc``）
+    交给 ``KbIndexStatusWriter``（issue #148 / #152）—— 这是该字段在
+    ``doc_service`` 内的**唯一**写入者。三处状态写入：
+
+    1. 开头 ``building`` 占位 → ``kb_writer.begin()`` + ``note_in_flight(first_doc)``；
+    2. ``_on_progress`` 回调里的进度推进 → ``kb_writer.advance(current)`` +
+       ``note_in_flight(doc_name)``；
+    3. 末尾 ``searchable`` / ``failed`` 终态 → ``kb_writer.finish()`` 或
+       ``kb_writer.finish(interrupted=str(e))``。
+
+    ``_get_lock(kb_id)`` 仍是**文档生命周期锁**（防 ``document_ids`` 与异步索引
+    交错，issue #136 残留）：与 writer 自带的 per-instance 锁保护**不同**资源，
+    两把锁并存、互不替代。doc 级 ``embedding_status`` 写入仍是 ``doc_service``
+    的事（不同 owner）。
+    """
     with _get_lock(kb_id):
         kb = kb_repo.get(kb_id)
         if not kb:
@@ -289,31 +315,32 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
                     doc_map[doc.id].embedding_status = "failed"
                     doc_repo._save_doc_meta(doc_map[doc.id])
 
+        # KB 检索状态字段交给 writer（issue #148 / #152）：
+        # total 在此处确定（解析完成的篇数）—— writer.advance() / finish() 需要它。
+        kb_writer = KbIndexStatusWriter(kb_id, total=max(len(texts), 1))
+
         if not texts:
-            kb.index_status = "searchable"
-            kb_repo.update(kb)
+            # 无文本要索引 → KB 兜底 ``searchable``（旧契约保留，issue #152 AC）。
+            # doc_repo 这边的 ``embedding_status`` 失败/跳过的状态已在上面写完。
+            kb_writer.finish()
             return
 
-        kb.index_status = "building"
-        kb.index_progress = 0.0
-        kb.index_current_doc = texts[0][2] if texts else "准备中…"
-        kb_repo.update(kb)
+        # 开头 ``building`` 占位：writer 自己起锁串行化 read-modify-write。
+        kb_writer.begin()
+        kb_writer.note_in_flight(texts[0][2])
     indexed_ids = set()
 
     def _on_progress(current: int, total: int, doc_name: str):
         # 锁内更新 KB 进度 + 文档状态，防止前端看到 doc embedded 而 KB 还在 building
         with _get_lock(kb_id):
-            inner_kb = kb_repo.get(kb_id)
-            if not inner_kb:
-                return
-            inner_kb.index_progress = current / total
-            inner_kb.index_current_doc = doc_name
-            kb_repo.update(inner_kb)
             doc_id = texts[current - 1][0]
             if doc_id in doc_map:
                 doc_map[doc_id].embedding_status = "embedded"
                 doc_repo._save_doc_meta(doc_map[doc_id])
                 indexed_ids.add(doc_id)
+            # KB 检索状态推进走 writer（issue #148 / #152）。
+            kb_writer.advance(current)
+            kb_writer.note_in_flight(doc_name)
 
     try:
         from core.index_manager import index_documents_batch
@@ -321,20 +348,14 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
         # 锁内 read-modify-write 原子更新完成状态；KB 已删则跳过（不写回陈旧对象）
         # 批量路径此处直接 searchable 而非依赖 rebuild_kb_index（因为我们没调用它）
         with _get_lock(kb_id):
-            kb = kb_repo.get(kb_id)
-            if kb is not None:
-                kb.index_status = "searchable"
-                kb.index_progress = 1.0
-                kb.index_current_doc = ""
-                kb_repo.update(kb)
+            kb_writer.finish()
     except Exception as e:
         _logger.error("batch indexing failed for kb %s: %s", kb_id, e)
         with _get_lock(kb_id):
-            kb = kb_repo.get(kb_id)
-            if kb is not None:
-                kb.index_status = "failed"
-                kb.index_current_doc = f"错误: {e}"
-                kb_repo.update(kb)
+            # 失败消息走 writer 的 ``_format_interruption``（issue #152 AC）：
+            # 统一前缀 ``批量重新解析中断: ``，与批量重新解析 / 单篇 reparse 失败
+            # 路径字面对齐（issue #147 §User Stories 第 14 条）。
+            kb_writer.finish(interrupted=str(e))
 
 
 def delete_document(kb_id: str, doc_id: str) -> bool:

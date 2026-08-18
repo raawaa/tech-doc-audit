@@ -401,3 +401,325 @@ def test_batch_import_documents_dedup():
     # KB 中总共 3 篇文档
     all_docs = doc_repo.list_docs(kb.id)
     assert len(all_docs) == 3
+
+
+# ── KbIndexStatusWriter 集成（issue #152）────────────────────────────────────────
+#
+# #152 把 `_index_single_doc_async` / `_batch_index_docs` 内三处 KB 状态字段的
+# 直接写收集归 `KbIndexStatusWriter`。验证手段：spy writer 的 callback 调用
+# 序列 —— 函数必须经过 writer 这一间接层（而不是直接 `kb.index_status = ...`）。
+# `_get_lock(kb_id)` 仍是文档生命周期锁，**不被 writer 替换**，验证锁外还能
+# 跑非 KB-状态的工作（``doc_repo._save_doc_meta`` 等）。
+
+
+def test_index_single_doc_async_uses_writer(monkeypatch, stub_pdf_parse):
+    """`_index_single_doc_async` 不再直接 ``kb.index_status = ...``，改走 writer。
+
+    同步 ``_index_vec`` 桩为成功 → 函数末尾 ``kb_writer.finish()`` 被调一次。
+    """
+    from unittest.mock import MagicMock, patch
+    from core.kb_index_status import KbIndexStatusWriter
+
+    # spy on KbIndexStatusWriter 的 callback 序列
+    callback_calls: list[tuple[str, tuple]] = []
+
+    real_begin = KbIndexStatusWriter.begin
+    real_finish = KbIndexStatusWriter.finish
+    real_note_in_flight = KbIndexStatusWriter.note_in_flight
+
+    def spy_begin(self):
+        callback_calls.append(("begin", ()))
+        real_begin(self)
+
+    def spy_finish(self, failed=None, *, interrupted=None):
+        callback_calls.append(("finish", (failed, interrupted)))
+        real_finish(self, failed, interrupted=interrupted)
+
+    def spy_note(self, doc_name):
+        callback_calls.append(("note_in_flight", (doc_name,)))
+        real_note_in_flight(self, doc_name)
+
+    # 桩掉 _index_vec 走成功路径
+    monkeypatch.setattr("services.vector_search.index_document", lambda *a, **k: None)
+
+    with patch.object(KbIndexStatusWriter, "begin", spy_begin), \
+         patch.object(KbIndexStatusWriter, "finish", spy_finish), \
+         patch.object(KbIndexStatusWriter, "note_in_flight", spy_note):
+        kb = kb_svc.create_kb(name="writer_async_single", category="national")
+        content = b"%PDF-1.4 fake pdf content"
+        doc = doc_svc.import_document(kb.id, "test.pdf", content, async_index=True)
+
+        _wait_docs_terminal(kb.id, [doc.id])
+        _wait_kb_searchable(kb.id)
+
+    methods_called = [name for name, _ in callback_calls]
+    assert "finish" in methods_called, (
+        f"_index_single_doc_async 必须调 writer.finish()；实际 callback 序列 {methods_called}"
+    )
+    # finish 必须以 failed=[]|None + interrupted=None 收尾（成功路径）
+    finish_call = next(args for name, args in callback_calls if name == "finish")
+    failed, interrupted = finish_call
+    assert failed in (None, []), (
+        f"成功路径 finish 必须 failed=[]|None；实际 {failed!r}"
+    )
+    assert interrupted is None, (
+        f"成功路径 finish 必须 interrupted=None；实际 {interrupted!r}"
+    )
+
+
+def test_index_single_doc_async_failure_keeps_searchable(monkeypatch, stub_pdf_parse):
+    """`_index_single_doc_async` 失败仍写 searchable（保留旧契约）。
+
+    issue #152 AC：单文档异步入口"末尾 `searchable` 写入"。doc.embedding_status
+    写 ``failed`` 是 doc 层面的事，KB 检索状态仍写 ``searchable``（KB 视角"已
+    处理过这篇"，失败摘要留给 doc 级 `embedding_status`，KB 字段不再分裂语义）。
+    """
+    from unittest.mock import patch
+    from core.kb_index_status import KbIndexStatusWriter
+
+    finish_calls: list[tuple] = []
+
+    real_finish = KbIndexStatusWriter.finish
+
+    def spy_finish(self, failed=None, *, interrupted=None):
+        finish_calls.append((failed, interrupted))
+        real_finish(self, failed, interrupted=interrupted)
+
+    def _explode(*a, **k):
+        raise RuntimeError("simulated index_vec outage")
+
+    monkeypatch.setattr("services.vector_search.index_document", _explode)
+
+    with patch.object(KbIndexStatusWriter, "finish", spy_finish):
+        kb = kb_svc.create_kb(name="writer_async_single_fail", category="national")
+        content = b"%PDF-1.4 fake pdf content"
+        doc = doc_svc.import_document(kb.id, "test.pdf", content, async_index=True)
+
+        _wait_docs_terminal(kb.id, [doc.id])
+
+    assert finish_calls, (
+        "_index_single_doc_async 失败仍必须调 writer.finish()（保留 searchable 契约）；实际 0 次"
+    )
+    failed, interrupted = finish_calls[0]
+    assert failed is None or failed == [], (
+        f"单文档异步入口 finish 不应传 failed；实际 {failed!r}"
+    )
+    assert interrupted is None, (
+        f"单文档异步入口 finish 不应传 interrupted；实际 {interrupted!r}"
+    )
+
+
+def test_batch_index_docs_uses_writer_for_three_spots(monkeypatch):
+    """`_batch_index_docs` 三处状态写入全部走 writer。
+
+    开头 building 占位 → ``begin()`` + ``note_in_flight(first_doc)``；
+    末尾 searchable 终态 → ``finish(failed=[])``；
+    失败路径走 ``finish(interrupted=...)`` 而不是直接 ``kb.index_current_doc = f"错误: ..."`。
+
+    同步路径（``async_index=False``）让函数在主线程跑完，无须轮询。
+    """
+    from unittest.mock import MagicMock, patch
+    from core.kb_index_status import KbIndexStatusWriter
+
+    callback_calls: list[tuple[str, tuple]] = []
+
+    real_begin = KbIndexStatusWriter.begin
+    real_finish = KbIndexStatusWriter.finish
+    real_note_in_flight = KbIndexStatusWriter.note_in_flight
+    real_advance = KbIndexStatusWriter.advance
+
+    def spy_begin(self):
+        callback_calls.append(("begin", ()))
+        real_begin(self)
+
+    def spy_finish(self, failed=None, *, interrupted=None):
+        callback_calls.append(("finish", (failed, interrupted)))
+        real_finish(self, failed, interrupted=interrupted)
+
+    def spy_note(self, doc_name):
+        callback_calls.append(("note_in_flight", (doc_name,)))
+        real_note_in_flight(self, doc_name)
+
+    def spy_advance(self, done):
+        callback_calls.append(("advance", (done,)))
+        real_advance(self, done)
+
+    with patch.object(KbIndexStatusWriter, "begin", spy_begin), \
+         patch.object(KbIndexStatusWriter, "finish", spy_finish), \
+         patch.object(KbIndexStatusWriter, "note_in_flight", spy_note), \
+         patch.object(KbIndexStatusWriter, "advance", spy_advance):
+        kb = kb_svc.create_kb(name="writer_batch_sync", category="national")
+        files = [
+            ("a.md", "# A\n\n内容一的内容一的内容一的内容一的内容一的内容一。".encode("utf-8")),
+            ("b.md", "# B\n\n内容二的内容二的内容二的内容二的内容二的内容二。".encode("utf-8")),
+        ]
+        doc_svc.batch_import_documents(kb.id, files, async_index=False)
+
+    methods_called = [name for name, _ in callback_calls]
+    # 开头 building 占位 → begin + note_in_flight(first doc)
+    assert "begin" in methods_called, (
+        f"_batch_index_docs 必须调 writer.begin()；实际 {methods_called}"
+    )
+    # 末尾 searchable 终态 → finish(failed=[])
+    assert "finish" in methods_called, (
+        f"_batch_index_docs 末尾必须调 writer.finish()；实际 {methods_called}"
+    )
+    finish_calls = [args for name, args in callback_calls if name == "finish"]
+    assert any(
+        (fc == ([], None) or fc == (None, None))
+        for fc in finish_calls
+    ), (
+        f"成功路径 finish 必须 failed=[]|None + interrupted=None；实际 finish calls={finish_calls}"
+    )
+    # 开头 note_in_flight 至少调一次（"a.md" 是 texts[0]）
+    note_calls = [args for name, args in callback_calls if name == "note_in_flight"]
+    assert any(nc == ("a.md",) for nc in note_calls), (
+        f"开头 note_in_flight 应传入第一篇 doc 名 'a.md'；实际 {note_calls}"
+    )
+
+
+def test_batch_index_docs_failure_path_uses_writer_format_helper(monkeypatch):
+    """`_batch_index_docs` 失败路径 → ``finish(interrupted=str(e))``。
+
+    验证 writer 的 ``_format_interruption`` 是失败消息唯一来源 —— ``index_current_doc``
+    必须以 ``"批量重新解析中断: "`` 前缀开头（而非旧的 ``"错误: "``）。
+    """
+    from core.kb_index_status import KbIndexStatusWriter
+
+    # 触发 index_documents_batch 抛错 → 走 except 分支 → finish(interrupted=str(e))
+    monkeypatch.setattr(
+        "core.index_manager.index_documents_batch",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("simulated batch outage")),
+    )
+
+    kb = kb_svc.create_kb(name="writer_batch_fail", category="national")
+    files = [
+        ("x.md", "# X\n\n内容 X 的内容 X 的内容 X 的内容 X 的内容 X 的内容 X。".encode("utf-8")),
+    ]
+    doc_svc.batch_import_documents(kb.id, files, async_index=False)
+
+    import storage.kb_repo as kb_repo
+    final_kb = kb_repo.get(kb.id)
+    assert final_kb is not None
+    assert final_kb.index_status == "failed", (
+        f"失败路径 KB 终态应为 failed；实际 {final_kb.index_status}"
+    )
+    # 失败消息走 writer 的 _format_interruption（统一前缀）
+    assert final_kb.index_current_doc.startswith("批量重新解析中断: "), (
+        f"失败消息必须以 '批量重新解析中断: ' 前缀开头（writer 统一格式）；"
+        f"实际 {final_kb.index_current_doc!r}"
+    )
+    assert "simulated batch outage" in final_kb.index_current_doc, (
+        f"失败消息应包含原始错误；实际 {final_kb.index_current_doc!r}"
+    )
+
+
+def test_doc_service_lock_still_held_around_doc_meta_writes(monkeypatch):
+    """`_get_lock(kb_id)` 仍是文档生命周期锁，与 writer 的 per-instance lock 并存。
+
+    验证：``_append_doc_ids_atomic`` 内的 ``_get_lock`` 调用顺序不变 —— 锁住
+    doc_repo 读—改—写。writer 自己另起一把锁串行化 KB 状态字段。两条资源互不
+    替代（issue #152 AC）。
+    """
+    from unittest.mock import MagicMock
+    import services.doc_service as doc_svc_mod
+    from core.kb_index_status import KbIndexStatusWriter
+
+    # spy 锁的获取：验证 _append_doc_ids_atomic 仍然 _get_lock 内做 read-modify-write
+    lock_acquired: list[str] = []
+
+    original_get_lock = doc_svc_mod._get_lock
+
+    def spy_get_lock(kb_id):
+        lock_acquired.append(kb_id)
+        return original_get_lock(kb_id)
+
+    monkeypatch.setattr(doc_svc_mod, "_get_lock", spy_get_lock)
+
+    # 同时 stub writer 让它真的不发 kb_repo.update（隔离 doc lifecycle 路径）
+    noop_writer = MagicMock(spec=KbIndexStatusWriter)
+    monkeypatch.setattr(
+        "core.kb_index_status.KbIndexStatusWriter",
+        noop_writer,
+    )
+
+    kb = kb_svc.create_kb(name="lock_test", category="national")
+    doc_svc_mod._append_doc_ids_atomic(kb.id, ["d1", "d2"])
+
+    assert lock_acquired, (
+        f"_append_doc_ids_atomic 必须调 _get_lock({kb.id})；实际 0 次"
+    )
+    assert lock_acquired[0] == kb.id, (
+        f"_get_lock 应传入 kb_id={kb.id}；实际 {lock_acquired}"
+    )
+
+
+def test_index_single_doc_async_begin_holds_get_lock(monkeypatch, stub_pdf_parse):
+    """`_index_single_doc_async` BEGIN ``kb_writer.begin()`` 仍在 ``_get_lock`` 内。
+
+    issue #152 AC3 守卫回归：把 ``kb_writer.begin()`` 从 ``_get_lock`` 内挪出去
+    会让 ``document_ids`` 与 KB 状态字段交错（issue #136 TOCTOU 残留）——
+    writer 的 per-instance 锁只保护自己的 read-modify-write，不替代文档
+    生命周期锁。验证 BEGIN 段 ``_get_lock`` 仍被持有。
+    """
+    import threading
+    import services.doc_service as doc_svc_mod
+    from core.kb_index_status import KbIndexStatusWriter
+
+    # 用追踪 depth 的锁替换 _get_lock 返回的 lock（threading.Lock 自身不可改写）
+    depth = 0
+    depth_lock = threading.Lock()
+
+    class _TrackedLock:
+        def __init__(self, inner: threading.Lock):
+            self._inner = inner
+
+        def __enter__(self):
+            nonlocal depth
+            with depth_lock:
+                depth += 1
+            return self._inner.__enter__()
+
+        def __exit__(self, exc_type, exc, tb):
+            result = self._inner.__exit__(exc_type, exc, tb)
+            nonlocal depth
+            with depth_lock:
+                depth -= 1
+            return result
+
+    real_get_lock = doc_svc_mod._get_lock
+
+    def spy_get_lock(kb_id):
+        return _TrackedLock(real_get_lock(kb_id))
+
+    # spy writer.begin()：记录调用时 _get_lock 是否已持有
+    lock_held_during_begin: list[bool] = []
+    lock_depth_at_begin: list[int] = []
+    real_begin = KbIndexStatusWriter.begin
+
+    def spy_begin(self):
+        with depth_lock:
+            lock_held_during_begin.append(depth > 0)
+            lock_depth_at_begin.append(depth)
+        return real_begin(self)
+
+    monkeypatch.setattr(doc_svc_mod, "_get_lock", spy_get_lock)
+    monkeypatch.setattr(KbIndexStatusWriter, "begin", spy_begin)
+
+    # stub _index_vec 走快速成功路径
+    monkeypatch.setattr("services.vector_search.index_document", lambda *a, **k: None)
+
+    kb = kb_svc.create_kb(name="lock_at_begin", category="national")
+    content = b"%PDF-1.4 fake pdf content"
+    doc = doc_svc.import_document(kb.id, "test.pdf", content, async_index=True)
+
+    _wait_docs_terminal(kb.id, [doc.id])
+    _wait_kb_searchable(kb.id)
+
+    assert lock_held_during_begin, (
+        "_index_single_doc_async 必须至少调一次 writer.begin()；实际 0 次"
+    )
+    assert all(lock_held_during_begin), (
+        f"writer.begin() 调用时 _get_lock 必须已持有；"
+        f"实际 lock_depth_at_begin = {lock_depth_at_begin}"
+    )
