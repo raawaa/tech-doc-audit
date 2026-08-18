@@ -107,6 +107,11 @@ class KbIndexStatusWriter:
         还是批量里的一篇"。把 ``_total`` 这种私有细节挪到 writer 自己后，
         调用方就只剩一行 ``kb_writer.fail_doc(name, err)`` —— issue #150 的
         "无脑调 writer API" 在这里真正落地。
+
+        #149 已知字面小漂移：``total == 1`` 路径仍复用 ``_format_failure_summary``，
+        因此单篇失败时 ``index_current_doc`` 会写成 ``"批量重新解析失败 1/1 篇
+        （name: err）"`` —— "批量"字面与单篇语境不符，#147 §User Stories 第14条
+        列入后续 ticket；下次若改 ``_format_failure_summary``，单篇路径会一起变。
         """
         if self._total == 1:
             self.finish(failed=[(name, err)])
