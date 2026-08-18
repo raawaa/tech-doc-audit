@@ -8,6 +8,7 @@ import services.kb_service as kb_svc
 import storage.doc_repo as doc_repo
 from api.deps import get_data_dir
 from core import bulk_reparse_report_store
+from core.kb_index_status import KbIndexStatusWriter
 from core.logger import get_logger
 from services.bulk_reparse_service import (
     DEFAULT_CONCURRENCY,
@@ -154,7 +155,15 @@ def delete_kb(kb_id: str):
 
 @router.post("/{kb_id}/reindex")
 def reindex_kb(kb_id: str):
-    """重建知识库索引（异步：立即返回，后台运行，进度通过 GET 查询）。"""
+    """重建知识库索引（异步：立即返回，后台运行，进度通过 GET 查询）。
+
+    KB 检索状态字段（``index_status`` / ``index_progress`` /
+    ``index_current_doc``）由 ``KbIndexStatusWriter`` 独占写入（issue #148 /
+    #147 / #151）：开头预写 ``building``，``_on_progress`` 回调走
+    ``note_in_flight`` + ``advance``；终态由 ``rebuild_kb_index`` 内置契约
+    （issue #149）经同一 writer 类的另一实例写 —— router 这层不二次收尾，
+    只剩 setup 阶段异常的兜底 ``failed``。
+    """
     kb = kb_svc.get_kb(kb_id)
     if not kb:
         raise HTTPException(status_code=404, detail="知识库不存在")
@@ -162,33 +171,35 @@ def reindex_kb(kb_id: str):
     if kb.index_status == "building":
         raise HTTPException(status_code=409, detail="索引正在重建中")
 
-    # 标记为 building，所有文档标记为 pending_index
-    kb.index_status = "building"
-    kb.index_progress = 0.0
-    kb.index_current_doc = ""
-    kb_svc.update_kb(kb)
-
-    # 将所有关联文档的状态重置为 pending_index，表示正在等待重建
+    # 标记所有文档为 pending_index，先于 begin() —— begin() 一调，外部 GET
+    # 立刻看到 building，reindex / bulk-reparse 互斥也立刻生效
     all_docs = doc_repo.list_docs(kb_id)
     for doc in all_docs:
         doc.embedding_status = "pending_index"
         doc_repo._save_doc_meta(doc)
 
+    kb_writer = KbIndexStatusWriter(kb_id, total=len(all_docs))
+    kb_writer.begin()
+
     def _on_progress(current: int, total: int, doc_name: str):
-        """每索引完一篇文档的回调，更新 KB 状态供前端轮询。"""
-        fresh = kb_svc.get_kb(kb_id)
-        if fresh is None:
-            return  # KB 已删，不写陈旧对象
-        fresh.index_progress = current / total if total else 0
-        fresh.index_current_doc = doc_name
-        kb_svc.update_kb(fresh)
+        """每索引完一篇文档的回调 —— 走 writer，不直写字段。
+
+        ``total`` 参数由 ``rebuild_kb_index`` 传过来（无向量缓存需重跑的那批
+        doc 的篇数），router 这层不依赖它：进度分母用 writer 构造时的
+        ``total=len(all_docs)``，整体保持在 [0, 1] 内即可。
+        """
+        kb_writer.note_in_flight(doc_name)
+        kb_writer.advance(current)
 
     def _run():
-        """后台执行重建。"""
+        """后台执行重建。成功 / 失败终态由 ``rebuild_kb_index`` 内部 writer
+        写（ADR-0002 / #149），router 这层不在 success 分支二次收尾；
+        但 setup / post-work（FAISS 核实、doc 元数据落盘）的异常仍走
+        writer 兜底 failed —— 保留旧版"任何步骤出错 KB 都进 failed"的契约
+        （issue #151 AC："保持外部行为不变"）。"""
         import services.vector_search as vs
         try:
             vs.rebuild_kb_index(kb_id, progress_callback=_on_progress)
-
             # 重建完成后，检查实际索引结果并更新各文档的向量化状态
             # （rebuild_kb_index 内部可能因节点不匹配等原因跳过某些文档，
             #   所以需要核实 FAISS 索引中实际包含哪些文档）
@@ -203,27 +214,18 @@ def reindex_kb(kb_id: str):
                         doc.id, doc.original_name,
                     )
                 doc_repo._save_doc_meta(doc)
-
-            # KB 检索状态由 rebuild_kb_index 在锁内按内置契约写回（ADR-0002）。
-            # 这里再次按 fetch-fresh 模式只更新进度字段，避免把 status 写回陈旧值
-            # （rebuild_kb_index 持锁内独立 fetch+update；handler 自己也是 fetch+update，
-            #  互不踩各自锁，无需担心 TOCTOU）。
-            fresh = kb_svc.get_kb(kb_id)
-            if fresh is not None:
-                fresh.index_progress = 1.0
-                fresh.index_current_doc = ""
-                kb_svc.update_kb(fresh)
         except Exception as e:
-            # 失败路径写 failed（rebuild_kb_index 也会自己写 failed；这里再保险一次）
-            fresh = kb_svc.get_kb(kb_id)
-            if fresh is not None:
-                fresh.index_status = "failed"
-                fresh.index_current_doc = f"错误: {e}"
-                kb_svc.update_kb(fresh)
+            # rebuild_kb_index 自己已写过 failed（issue #149）；这里对 setup
+            # / post-work 异常也兜底（最后一次写覆盖前一次，行为与旧版
+            # "任何步骤出错 KB 都进 failed" 一致）；错误信息格式收敛到
+            # writer 一处（#151），不再有 "错误: <msg>" 这种私有前缀。
+            kb_writer.finish(failed=[("reindex", str(e))])
             for doc in all_docs:
                 if doc.embedding_status == "pending_index":
                     doc.embedding_status = "failed"
                     doc_repo._save_doc_meta(doc)
+        # success 分支：KB 检索状态由 rebuild_kb_index 内部 writer 在锁内
+        # 按 ADR-0002 收尾，router 这层不再二次 fetch+update。
 
     import threading
     thread = threading.Thread(target=_run, daemon=True)
@@ -367,10 +369,11 @@ def bulk_reparse_trigger(
     互斥由 ``kb.index_status == "building"`` 统一守门（spec #102 story 17/18）：
     reindex 与 bulk 共享同一字段，in-flight 任一边都会挡住另一边，无需新 mutex。
 
-    KB 状态由 ``run_bulk_reparse`` 内部的 ``_KbIndexStatus`` 统一接管（issue #109）：
-    批次开头写一次 ``building``，期间只推 ``index_progress`` 与
-    ``index_current_doc``，末尾写一次终态。这里**预先**写一次 ``building`` 是
-    为了让紧跟的 GET 立刻看到 building，无需等线程调度 —— 与 reindex 端点同款。
+    KB 状态机由 ``KbIndexStatusWriter`` 独占（issue #148 / #147 / #151 /
+    #154）：本路由预写 ``building`` 让客户端 GET 立刻看到 + reindex 互斥立刻
+    生效，``run_bulk_reparse`` 用自己的 writer 实例完成批次期间的进度推进与
+    终态收尾 —— 两份 writer 各管各的写，不读 cross-instance 私有锁。两份
+    ``begin()`` 落到同一组（building / 0 / ""）的值，幂等。
 
     **空批次短路**：没有可跑的目标（全被页数上限拦下 / 全 healthy）= 没发生
     任何重解析，``run_bulk_reparse`` 的 ``if total:`` 分支根本不进，KB 状态
@@ -395,11 +398,12 @@ def bulk_reparse_trigger(
             kb_id=kb_id, target_count=0, index_status=kb.index_status,
         )
 
-    # 预写 building —— 让客户端 GET 立刻看到 building，reindex 互斥也立刻生效
-    kb.index_status = "building"
-    kb.index_progress = 0.0
-    kb.index_current_doc = ""
-    kb_svc.update_kb(kb)
+    # 预写 building —— 由 KbIndexStatusWriter 独占写入（issue #148 /
+    # #147 / #151）。``run_bulk_reparse`` 内部还会再用它自己的 writer 实例
+    # 写一次（同 idempotent 的 begin()），两份都落到同一组字段值
+    # （building / 0 / ""）。
+    kb_writer = KbIndexStatusWriter(kb_id, total=len(targets))
+    kb_writer.begin()
 
     def _run():
         try:
@@ -412,11 +416,10 @@ def bulk_reparse_trigger(
             # 编排层自身抛错：把 KB 落在 failed 而不是让它永远卡在 building。
             # （run_bulk_reparse 的 ``except BaseException`` 已经写过 failed；
             # 这里是双保险 —— 比如线程根本没启起来 / 列表生成出错。）
-            fresh = kb_svc.get_kb(kb_id)
-            if fresh is not None and fresh.index_status == "building":
-                fresh.index_status = "failed"
-                fresh.index_current_doc = f"批量重新解析启动失败: {type(e).__name__}: {e}"
-                kb_svc.update_kb(fresh)
+            # 走 writer，错误信息格式收敛到 writer 一处（issue #151）。
+            kb_writer.finish(
+                failed=[("bulk_reparse", f"{type(e).__name__}: {e}")],
+            )
 
     import threading
     thread = threading.Thread(target=_run, daemon=True)
