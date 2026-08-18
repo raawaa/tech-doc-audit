@@ -366,30 +366,77 @@ def test_reparse_one_times_out_without_terminal_status(kb, monkeypatch):
     assert (doc_id, outcome) == (doc.id, "timeout")
 
 
-# ── KB 级检索状态稳定性（issue #109）────────────────────────────────────────────
+# ── KB 级检索状态稳定性（issue #109 / #147 / #154）─────────────────────────────
 #
 # 批量跑到一半时 KB **不可能**"此刻可被向量检索"。#93 实测下每完成一篇就写回
 # searchable，154 篇 = 上百次 building ⇄ searchable 抖动，前端轮询以
 # ``index_status === 'building'`` 为唯一续订条件，于是反复停轮询又重启。
-# 编排层现在是 KB 级状态的**唯一写入者**：批次开头写一次 building，
-# 期间只推进 index_progress / index_current_doc，末尾写一次终态。
+# 编排层现在是 KB 级状态的**唯一写入者**（``KbIndexStatusWriter``，
+# issue #147 / #148）：批次开头写一次 building，期间只推进
+# ``index_progress / index_current_doc``，末尾写一次终态。
+#
+# 契约的取证层在 #154 从"``kb_repo.update`` 写入序列"上移到
+# "``KbIndexStatusWriter`` 接口调用序列"：前者既冗余（KB 状态本就是
+# writer 写的）又给旁路留缝（任何直接 ``kb_repo.update`` 的代码都能让
+# spy 看起来正常），后者把契约绑在概念层，旁路自然露馅。
 
 
-def _spy_kb_writes(monkeypatch):
-    """记录所有经 ``kb_repo.update`` 落盘的 KB 状态快照，按时间顺序。
+def _spy_kb_writer(monkeypatch):
+    """记录 ``KbIndexStatusWriter`` 的批量编排相关 callback 调用，按时间顺序。
 
-    "整批期间只在首尾各写一次终态"这条契约只有看写入序列才能证伪，
-    看最终快照是看不出中间抖动的。
+    本 spy 只裹 ``run_bulk_reparse`` 实际触发的 4 个 callback：
+
+    - ``begin()`` —— 批次头一次调用，落 ``building`` + ``progress=0``；
+    - ``note_in_flight(name)`` / ``advance(done)`` —— 期间唯一允许的推进；
+    - ``finish(failed=...)`` / ``finish(interrupted=...)`` —— 末尾各调一次，
+      终态只在它里面写。
+
+    不裹 ``fail_doc`` / ``clear_building``：前者只在 ``total == 1`` 的单篇
+    writer 路径上做事，与批量编排语义无关；后者是运维解卡按钮，不在批量
+    自动流程里。需要那两条路径的测试应放在 ``test_kb_index_status.py``
+    的 writer 单测里，不该混到本文件。
+
+    "整批期间只在首尾各写一次终态"契约改在 **writer 接口序列** 上锁
+    （issue #147 / #154）：KB 状态字段的唯一写入者是 ``KbIndexStatusWriter``，
+    旧 ``_spy_kb_writes`` 绑在 ``kb_repo.update`` 上既冗余又给旁路留缝。
+
+    调用通过 ``real(self, ...)`` 转发，KB 真实状态仍会更新；断言"最终 KB 长
+    什么样" 与"调用序列长什么样" 同源，不会因 spy 改写而走偏。
     """
-    writes: list[tuple[str, float | None, str]] = []
+    from core.kb_index_status import KbIndexStatusWriter
+
+    calls: list[tuple[str, tuple, dict]] = []
+
+    def _wrap(name: str):
+        real = getattr(KbIndexStatusWriter, name)
+
+        def _spy(self, *args, **kwargs):
+            calls.append((name, args, kwargs))
+            return real(self, *args, **kwargs)
+
+        return _spy
+
+    for name in ("begin", "note_in_flight", "advance", "finish"):
+        monkeypatch.setattr(KbIndexStatusWriter, name, _wrap(name))
+    return calls
+
+
+def _spy_kb_repo_updates(monkeypatch):
+    """记录所有经 ``kb_repo.update`` 落盘的 KB，按时间顺序。
+
+    与 ``_spy_kb_writer`` 配对使用：组合断言 "writer 调用次数 == update
+    调用次数" 即可锁死"任何 KB 状态写入都只能经 writer 触发"——旁路写路径
+    会让两边对不上，立刻可见。
+    """
+    updates: list = []
     real_update = kb_repo.update
 
     def _spy(kb):
-        writes.append((kb.index_status, kb.index_progress, kb.index_current_doc))
+        updates.append(kb)
         return real_update(kb)
 
     monkeypatch.setattr(kb_repo, "update", _spy)
-    return writes
+    return updates
 
 
 def _stub_reparse_observing_kb(monkeypatch, kb_id, outcomes: dict[str, str] | None = None):
@@ -451,75 +498,130 @@ def test_bulk_run_never_claims_searchable_mid_batch(kb, monkeypatch):
     _add_doc(kb.id, "b.pdf", embedding_status="failed", page_count=3)
     _add_doc(kb.id, "c.pdf", embedding_status="failed", page_count=3)
     svc, observed, _calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
-    writes = _spy_kb_writes(monkeypatch)
+    writer_calls = _spy_kb_writer(monkeypatch)
 
     svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
 
     # 每篇开跑的那一刻，KB 对外都还是 building
     assert [status for status, _p, _d in observed] == ["building"] * 3
 
-    statuses = [status for status, _p, _d in writes]
-    assert statuses[0] == "building", "批次开头必须先写一次 building"
-    assert statuses[-1] == "searchable", "批次末尾必须落终态"
-    assert all(s == "building" for s in statuses[:-1]), (
-        f"整批期间只许停在 building，实际写入序列 {statuses}"
+    methods = [name for name, _a, _kw in writer_calls]
+    assert methods[0] == "begin", f"批次开头必须先 begin()，实际序列 {methods}"
+    assert methods[-1] == "finish", f"批次末尾必须 finish()，实际序列 {methods}"
+    # 期间只许推进，不许触发 finish（finish 是终态唯一入口）
+    middle = methods[1:-1]
+    assert all(m in ("note_in_flight", "advance") for m in middle), (
+        f"整批期间只许 note_in_flight/advance，实际中间序列 {middle}"
     )
-    assert statuses.count("searchable") == 1, "终态只许写一次"
+    # finish 只能调一次 → 终态只写一次
+    assert methods.count("finish") == 1, (
+        f"finish 应只调一次（终态写一次），实际 {methods.count('finish')} 次，"
+        f"序列 {methods}"
+    )
 
 
 def test_bulk_run_starts_at_building_with_zero_progress(kb, monkeypatch):
-    """触发瞬间 KB 即 ``building`` + ``index_progress = 0``（前端轮询的起点）。"""
+    """触发瞬间 KB 即 ``building`` + ``index_progress = 0``（前端轮询的起点）。
+
+    writer 的 ``begin()`` 是契约的承载点：写一次 ``(status=building,
+    progress=0.0, current_doc="")``。该断言从原 KB 写入序列前移至
+    writer 首次 callback —— begin() 是空入参的状态机开端，progress=0
+    是 writer 内部写死的语义常量。
+    """
     _add_doc(kb.id, "a.pdf", embedding_status="failed", page_count=3)
     svc, _observed, _calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
-    writes = _spy_kb_writes(monkeypatch)
+    writer_calls = _spy_kb_writer(monkeypatch)
 
     svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
 
-    assert writes[0][:2] == ("building", 0.0)
+    # 头一次 callback 是 begin() 且不带任何入参（progress=0 是写死的语义）
+    assert writer_calls[0][0] == "begin"
+    assert writer_calls[0][1] == ()  # 位置参数为空
+    assert writer_calls[0][2] == {}  # 关键字参数也为空
 
 
 def test_bulk_run_advances_progress_monotonically_as_done_over_total(kb, monkeypatch):
-    """``index_progress`` 是 ``done / total`` 且单调不减；``index_current_doc`` 是在跑的那篇。"""
+    """``index_progress`` 是 ``done / total`` 且单调不减；``index_current_doc`` 是在跑的那篇。
+
+    改在 writer 接口层取证：``advance(done)`` 的入参单调不减 → 落盘的
+    ``index_progress`` 单调不减；``note_in_flight(name)`` 的入参就是"那一刻
+    在飞的那篇"。终态由 ``finish()`` 一锤定音，不再靠 ``current_doc == ""``
+    兜底（writer 自己清空）。
+    """
     a = _add_doc(kb.id, "a.pdf", embedding_status="failed", page_count=3)
     b = _add_doc(kb.id, "b.pdf", embedding_status="failed", page_count=3)
     c = _add_doc(kb.id, "c.pdf", embedding_status="failed", page_count=3)
     names = {a.original_name, b.original_name, c.original_name}
     svc, observed, _calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
-    writes = _spy_kb_writes(monkeypatch)
+    writer_calls = _spy_kb_writer(monkeypatch)
 
     svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
 
-    progresses = [p for _s, p, _d in writes]
-    assert progresses == sorted(progresses), f"进度必须单调不减，实际 {progresses}"
-    # 串行跑 3 篇：完成 1/3、2/3 两个中间刻度都应出现过（第 3 篇并入终态 1.0）
-    assert 1 / 3 in progresses and 2 / 3 in progresses
-    assert progresses[-1] == 1.0
+    # advance 入参（已完成计数）单调不减
+    advance_args = [
+        args[0] for name, args, _kw in writer_calls if name == "advance"
+    ]
+    assert advance_args == sorted(advance_args), (
+        f"advance 入参必须单调不减，实际 {advance_args}"
+    )
+    # 串行跑 3 篇：完成 1/3、2/3 两个中间刻度都应出现（writer 内部换算成
+    # progress=1/3、2/3 落盘；这里看入参序列等效）
+    assert advance_args == [1, 2, 3], f"应有三次 advance 入参为 1/2/3，实际 {advance_args}"
 
-    # 每篇开跑时 index_current_doc 指向在飞的那一篇
-    in_flight = [current for _s, _p, current in observed]
-    assert set(in_flight) == names
-    assert writes[-1][2] == "", "成功终态不留残余的在飞文档名"
+    # note_in_flight 入参 = "那一刻在飞的那篇"
+    in_flight = [
+        args[0] for name, args, _kw in writer_calls if name == "note_in_flight"
+    ]
+    assert set(in_flight) == names, (
+        f"在飞文档名集合应为 {names}，实际 {in_flight}"
+    )
+
+    # 终态由 finish() 一锤定音；不留残余的 current_doc
+    final = kb_repo.get(kb.id)
+    assert final.index_status == "searchable"
+    assert final.index_current_doc == "", "成功终态不留残余的在飞文档名"
 
 
 def test_bulk_run_failure_terminates_failed_with_error_summary(kb, monkeypatch):
-    """批次中途有失败 → 终态 ``failed``，``index_current_doc`` 带人能读懂的失败摘要。"""
+    """批次中途有失败 → 终态 ``failed``，``index_current_doc`` 带人能读懂的失败摘要。
+
+    #154 取证点迁到 ``finish(failed=...)`` 调用的入参：writer 自己把失败
+    列表收归成 ``"批量重新解析失败 N/M 篇（name: reason）"`` 一行 —— 测试
+    只断言"它被以正确入参调了一次"，不再断言"KB 写入序列以 failed 收尾"
+    （那是 ``finish`` 的实现细节）。
+    """
     ok = _add_doc(kb.id, "ok.pdf", embedding_status="failed", page_count=3)
     bad = _add_doc(kb.id, "bad.pdf", embedding_status="failed", page_count=3)
     svc, _observed, _calls = _stub_reparse_observing_kb(
         monkeypatch, kb.id, {bad.id: "failed"}
     )
-    writes = _spy_kb_writes(monkeypatch)
+    writer_calls = _spy_kb_writer(monkeypatch)
 
     result = svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
 
     assert result.done == [ok.id]
-    statuses = [status for status, _p, _d in writes]
-    assert all(s == "building" for s in statuses[:-1]), (
-        f"中途那篇失败不许提前把整库判死，实际 {statuses}"
+    methods = [name for name, _a, _kw in writer_calls]
+    # 中途的失败不许提前把整库判死（finish 应只在末尾）
+    assert "finish" not in methods[:-1], (
+        f"批次中间不许调 finish，实际中间序列 {methods[:-1]}"
     )
-    assert statuses[-1] == "failed"
-    assert statuses.count("failed") == 1
+    assert methods[-1] == "finish", (
+        f"批次末尾必须 finish()，实际序列 {methods}"
+    )
+    assert methods.count("finish") == 1
 
+    # finish 的入参应是失败列表（含 failed 终态串）
+    finish_call = writer_calls[-1]
+    assert finish_call[0] == "finish"
+    # 兼容位置参数与关键字参数两种调用风格
+    _args, _kwargs = finish_call[1], finish_call[2]
+    failed_list = _args[0] if _args else _kwargs.get("failed", [])
+    assert any(
+        name == bad.original_name and reason.startswith("failed")
+        for name, reason in failed_list
+    ), f"finish(failed=...) 应含 bad 文档，实际 {failed_list}"
+
+    # 终态由 writer 落地，KB 真实字段是摘要的最终消费者
     final = kb_repo.get(kb.id)
     assert final.index_status == "failed"
     assert bad.original_name in final.index_current_doc, "摘要要点名是哪篇没跑成"
@@ -527,20 +629,53 @@ def test_bulk_run_failure_terminates_failed_with_error_summary(kb, monkeypatch):
 
 
 def test_bulk_run_with_nothing_runnable_leaves_kb_status_untouched(kb, monkeypatch):
-    """没有可跑的目标（全被页数上限拦下）= 没发生任何重解析，不该改写 KB 状态。"""
+    """没有可跑的目标（全被页数上限拦下）= 没发生任何重解析，不该改写 KB 状态。
+
+    #154 改在 writer 层取证：空批次连 ``begin()`` 都不该调，更不该有
+    ``finish()`` —— 什么都跑过，没理由告诉前端"我们 building 了"。
+    """
     huge = _add_doc(kb.id, "huge.pdf", embedding_status="failed")
     svc, _observed, _calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
     huge.page_count = svc.PAGE_LIMIT + 1
     doc_repo._save_doc_meta(huge)
     before = kb_repo.get(kb.id).index_status
-    writes = _spy_kb_writes(monkeypatch)
+    writer_calls = _spy_kb_writer(monkeypatch)
 
     result = svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
 
     assert result.total == 0
     assert [s.doc.id for s in result.skipped] == [huge.id]
-    assert writes == [], "空批次不该产生任何 KB 状态写入"
+    assert writer_calls == [], (
+        f"空批次不该触发任何 writer callback，实际 {writer_calls}"
+    )
     assert kb_repo.get(kb.id).index_status == before
+
+
+def test_bulk_run_kb_writes_go_only_through_writer(kb, monkeypatch):
+    """整批期间 ``kb_repo.update`` 只经 ``KbIndexStatusWriter`` 触发。
+
+    issue #147 / #154 决策：KB 状态字段（``index_status`` / ``index_progress``
+    / ``index_current_doc``）的唯一写入者是 ``KbIndexStatusWriter``。任何绕开
+    writer 直接 ``kb_repo.update`` 的代码路径都属 #93 抖动症状复发。
+
+    本测试是这条契约的"可证伪"层：writer 的每次 callback 内部都恰好调一次
+    ``kb_repo.update``；一旦旁路写路径出现，两边计数立刻对不上。
+    """
+    _add_doc(kb.id, "a.pdf", embedding_status="failed", page_count=3)
+    _add_doc(kb.id, "b.pdf", embedding_status="failed", page_count=3)
+    svc, _observed, _calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
+    writer_calls = _spy_kb_writer(monkeypatch)
+    kb_updates = _spy_kb_repo_updates(monkeypatch)
+
+    svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
+
+    # load-bearing 断言：两边计数严格相等。差一个就意味着存在绕开 writer 的
+    # 写入路径 —— 这正是 #93 抖动症状复发的指纹。
+    assert len(kb_updates) == len(writer_calls), (
+        f"kb_repo.update 应只经 writer 触发；"
+        f"writer callback {len(writer_calls)} 次、kb_repo.update {len(kb_updates)} 次"
+        f"—— 差距意味存在绕开 writer 的写入路径"
+    )
 
 
 def test_bulk_run_interrupted_orchestration_still_lands_terminal_status(kb, monkeypatch):
@@ -567,9 +702,12 @@ def test_bulk_run_interrupted_orchestration_still_lands_terminal_status(kb, monk
 
 
 def test_bulk_run_tolerates_missing_kb_without_raising(kb, monkeypatch):
-    """``_KbIndexStatus._write`` 遇到 ``kb_repo.get`` 返回 ``None`` 时静默跳过。
+    """``KbIndexStatusWriter._write`` 遇到 ``kb_repo.get`` 返回 ``None`` 时静默跳过。
 
     真实场景：KB 元数据被运维误删 / 还没创建就被外部触发。编排层自身不应因此炸。
+
+    （原 docstring 引用的 ``_KbIndexStatus._write`` 已在 #154 收归 writer；
+    行为本身不变，仍是 ``kb_repo.get`` 返回 ``None`` 时静默 noop。）
     """
     from services import bulk_reparse_service as svc
 
