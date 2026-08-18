@@ -20,7 +20,11 @@ from typing import Callable
 
 from core.logger import get_logger
 from models.audit_task import AuditIssue, ExtractedStandard
-from services.vector_search import search_doc_by_text, vec_search
+from services.vector_search import (
+    _normalize_for_standard_match,
+    search_doc_by_text,
+    vec_search,
+)
 import storage.doc_repo as _doc_repo
 
 _logger = get_logger(__name__)
@@ -103,6 +107,13 @@ def extract_standards_deepseek(issues: list[AuditIssue]) -> dict[int, ExtractedS
 2. standard_names: 标准中文名称列表，不含书名号《》，如 "灯和灯系统的光生物安全性"。
 3. standard_name 字段如果已有值直接复用，无需重复提取。
 4. 如果问题没有涉及任何可识别的标准，返回空数组。
+5. **格式约束**（#27,保证后续精确文本搜索可命中 KB 正文）:
+   - 字母与数字之间**保留一个空格**（如 "IEC 61547", "GB 7000.202"）。
+   - 连字符统一为半角 "-"（如 "GB/T 20145-2006"）。
+   - 反例（不要这样输出）:
+     - "IEC61547" ❌（字母与数字粘连）
+     - "GB 7000-.202" ❌（孤立 "." 前多了 "-"）
+     - "GBT20145" ❌（斜线 / 空格都没保留）
 
 输入格式: {"issues": [{"id": 1, "standard_name": "...", "description": "...", "cited_excerpt": "...", "suggestion": "..."}]}
 
@@ -174,10 +185,12 @@ def _pick_text_hit(
     standard_names: list[str],
     doc_name_by_id: dict[str, str],
 ) -> dict | None:
-    """从 text_hits 中挑最可能是标准本身的文档（#23 反稀释）。
+    """从 text_hits 中挑最可能是标准本身的文档（#23 反稀释 + #27 容错）。
 
     优先级：
-    1. 文档名（KB 标题）含任一标准编号 → 标准文档本体
+    1. 文档名（KB 标题）含任一标准编号 → 标准文档本体（**#27 容错**：
+       双方先 ``_normalize_for_standard_match`` 再做 ``in`` 比较，避免
+       ``GB 7000-.202``（LLM）与 ``GB 7000.202``（文件名）失配）。
     2. 文档名含任一标准中文名 → 标准文档本体
     3. text_hits 第一个（保底）
 
@@ -187,12 +200,16 @@ def _pick_text_hit(
         return None
     try:
         names = {h["doc_id"]: (doc_name_by_id.get(h["doc_id"]) or "") for h in text_hits}
-        # 1) name 含标准编号
+        # #27: 文档名里的格式可能与 LLM 抽出的编号差一个 ``-`` / ``.`` / 空格,
+        # 双方归一化后再 ``in`` 比较。
+        norm_numbers = [_normalize_for_standard_match(sn) for sn in standard_numbers]
+        norm_names = {doc_id: _normalize_for_standard_match(name) for doc_id, name in names.items()}
+        # 1) name 含标准编号（归一化后）
         for h in text_hits:
-            doc_name = names.get(h["doc_id"], "")
-            if any(sn and sn in doc_name for sn in standard_numbers):
+            doc_name_norm = norm_names.get(h["doc_id"], "")
+            if any(sn and sn in doc_name_norm for sn in norm_numbers):
                 return h
-        # 2) name 含标准中文名
+        # 2) name 含标准中文名（中文名不易漂移,保持原 ``in`` 比较）
         for h in text_hits:
             doc_name = names.get(h["doc_id"], "")
             if any(nm and nm in doc_name for nm in standard_names):

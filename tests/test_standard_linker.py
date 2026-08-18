@@ -641,3 +641,26 @@ def test_link_standards_end_to_end_with_post_processing_combined(monkeypatch):
     # 后处理把 ``GB 7000-.202`` → ``GB 7000.202``,故最终 chunk_text 更接近正文
     assert sr.chunk_text == "GB 7000.202"
     assert sr.standard_name == "GB 7000.202"
+
+
+def test_pick_text_hit_tolerates_dash_in_extracted_number(monkeypatch):
+    """#27 acceptance #5: 文档名 ``GB 7000.202 建筑照明设计标准.pdf`` 与
+    LLM 抽出的 ``GB 7000-.202``（多横线）经 ``_pick_text_hit`` 应能匹配成功。
+    旧 ``in`` 比较因 ``-`` 差异会失配,本测试覆盖归一化后的匹配。
+    """
+    picked = standard_linker._pick_text_hit(
+        text_hits=[
+            {"doc_id": "std_doc", "page_number": 0, "content": "..."},
+            {"doc_id": "list_doc", "page_number": 0, "content": "..."},
+        ],
+        standard_numbers=["GB 7000-.202"],   # LLM 抽出的"多横线"形态
+        standard_names=[],
+        doc_name_by_id={
+            "std_doc": "GB 7000.202 建筑照明设计标准.pdf",   # 文档名是干净形态
+            "list_doc": "适用标准名录.pdf",
+        },
+    )
+    assert picked is not None
+    assert picked["doc_id"] == "std_doc", (
+        f"#27 _pick_text_hit 应通过归一化匹配,实际 {picked['doc_id']}"
+    )
