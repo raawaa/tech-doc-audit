@@ -410,7 +410,8 @@ def run_bulk_reparse(
     - 超 ``PAGE_LIMIT`` 的文档不触发，直接进 ``skipped``（带原因）。
     - 单篇失败 / 超时 / 抛异常都只记账，不中断整批。
     - 每篇跑完立刻回读它的解析来源，进 run log 也进实测分桶（#110）。
-    - 整批期间 KB 被按在 ``building``，终态在末尾写一次（见 ``_KbIndexStatus``）。
+    - 整批期间 KB 被按在 ``building``，终态在末尾写一次（由
+      ``KbIndexStatusWriter`` 独占，issue #147 / #148 / #154）。
       没有任何可跑的目标时一个字都不写 —— 什么都没发生，不该改写 KB 状态。
     - ``forced`` 只是报告里的一个字段（这批是不是 ``--force`` 跑的），不影响执行。
 
