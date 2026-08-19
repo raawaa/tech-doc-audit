@@ -81,7 +81,7 @@ def reparse_document(
 def _resolve_doc_and_kb(
     kb_id: str, doc_id: str,
 ) -> tuple[Optional[object], Optional[object]]:
-    """查 doc + kb；任一缺失返回 ``(None, None)``。"""
+    """查 doc + kb；任一缺失返回 ``(None, None)``（#156 保留 mark_failed/silent-return 不对称）。"""
     doc = doc_repo.get_doc(kb_id, doc_id)
     if not doc or not doc.file_path:
         return None, None
@@ -91,8 +91,8 @@ def _resolve_doc_and_kb(
     return doc, kb
 
 
-def _run_parse_and_index(doc_id: str, file_path: str) -> ParseResult:
-    """``parse_document`` + 三道守卫（issue #156）；失败 → ``RuntimeError``。"""
+def _parse_with_guards(doc_id: str, file_path: str) -> ParseResult:
+    """``parse_document`` + 三道守卫（#94 假成功指纹防御）。失败 → ``RuntimeError``。"""
     parse_result = parse_document(file_path)
     if not parse_result.full_text or len(parse_result.full_text) < MIN_FULL_TEXT_CHARS:
         raise RuntimeError("parse_document returned empty/sparse text")
@@ -103,9 +103,7 @@ def _run_parse_and_index(doc_id: str, file_path: str) -> ParseResult:
     return parse_result
 
 
-def _persist_index(
-    kb_id: str, doc_id: str, parse_result: ParseResult, doc,
-) -> None:
+def _persist_index(kb_id: str, doc_id: str, parse_result: ParseResult, doc) -> None:
     """save_pages → remove_document → index_document；不获取锁。"""
     save_pages(
         kb_id, doc_id, parse_result.to_dict(),
@@ -126,7 +124,11 @@ def _persist_index(
 def _reparse_async(
     kb_id: str, doc_id: str, kb_writer: KbIndexStatusWriter
 ) -> None:
-    """后台执行：parse → save_pages → 重建索引 → 更新状态。KB 状态字段全部走 writer。"""
+    """后台执行：parse → save_pages → 重建索引 → 更新状态。
+
+    KB 状态字段全部走 writer（#155：begin() 由 caller 承担，本函数只调
+    ``note_in_flight`` / ``finish`` / ``fail_doc``）。
+    """
     doc, kb = _resolve_doc_and_kb(kb_id, doc_id)
     if doc is None:
         _mark_failed(kb_id, doc_id, "doc or file_path missing", kb_writer=kb_writer)
@@ -138,7 +140,7 @@ def _reparse_async(
 
     with _get_index_lock(kb_id):
         try:
-            parse_result = _run_parse_and_index(doc_id, doc.file_path)
+            parse_result = _parse_with_guards(doc_id, doc.file_path)
             _persist_index(kb_id, doc_id, parse_result, doc)
             doc.embedding_status = "embedded"
             doc_repo._save_doc_meta(doc)
@@ -158,9 +160,7 @@ def _mark_failed(
 ) -> None:
     """doc 失败 → 写 ``embedding_status="failed"`` + 走 writer 收尾。
 
-    KB 级终态由 writer 自己决定（``fail_doc`` 公开方法，单篇 / 批量各走各的
-    路径 —— ``total=1`` 写终态 ``failed``，``total>1`` 只把错误摘要写到
-    ``index_current_doc``，保留 ``status=building`` 让编排层收尾）。
+    KB 终态由 writer 决定：``total=1`` 写 ``failed``，``total>1`` 只写错误摘要。
     """
     doc = doc_repo.get_doc(kb_id, doc_id)
     if doc is not None:
