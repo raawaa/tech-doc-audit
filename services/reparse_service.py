@@ -21,7 +21,7 @@ from typing import Optional
 
 from core.kb_index_status import KbIndexStatusWriter
 from core.logger import get_logger
-from core.parse_document import parse_document, MIN_FULL_TEXT_CHARS
+from core.parse_document import parse_document, MIN_FULL_TEXT_CHARS, ParseResult
 from core.pages_store import save_pages
 from core.index_manager import (
     _get_index_lock,
@@ -78,69 +78,71 @@ def reparse_document(
     return {"status": "pending_index", "doc_id": doc_id}
 
 
+def _resolve_doc_and_kb(
+    kb_id: str, doc_id: str,
+) -> tuple[Optional[object], Optional[object]]:
+    """查 doc + kb；任一缺失返回 ``(None, None)``。"""
+    doc = doc_repo.get_doc(kb_id, doc_id)
+    if not doc or not doc.file_path:
+        return None, None
+    kb = kb_repo.get(kb_id)
+    if not kb:
+        return None, None
+    return doc, kb
+
+
+def _run_parse_and_index(doc_id: str, file_path: str) -> ParseResult:
+    """``parse_document`` + 三道守卫（issue #156）；失败 → ``RuntimeError``。"""
+    parse_result = parse_document(file_path)
+    if not parse_result.full_text or len(parse_result.full_text) < MIN_FULL_TEXT_CHARS:
+        raise RuntimeError("parse_document returned empty/sparse text")
+    if not parse_result.layout:
+        raise RuntimeError(f"empty layout for {doc_id}")
+    if not parse_result.by_page:
+        raise RuntimeError(f"empty by_page for {doc_id}")
+    return parse_result
+
+
+def _persist_index(
+    kb_id: str, doc_id: str, parse_result: ParseResult, doc,
+) -> None:
+    """save_pages → remove_document → index_document；不获取锁。"""
+    save_pages(
+        kb_id, doc_id, parse_result.to_dict(),
+        file_hash=doc.content_hash,
+    )
+    try:
+        remove_document(kb_id, doc_id)
+    except Exception as e:
+        _logger.warning("reparse: failed to remove old nodes for %s: %s", doc_id, e)
+    index_document(
+        kb_id, doc_id, parse_result.full_text,
+        source_name=doc.original_name,
+        by_page=parse_result.by_page,
+        by_layout=parse_result.layout,
+    )
+
+
 def _reparse_async(
     kb_id: str, doc_id: str, kb_writer: KbIndexStatusWriter
 ) -> None:
-    """后台执行：parse → save_pages → 重建索引 → 更新状态。
-
-    KB 级状态字段全部走 writer：单篇路径 writer 由 ``reparse_document`` 构造
-    并 ``begin()``，批量路径 writer 由编排层注入、begin()/finish() 都归
-    编排层管 —— 本函数只调 ``note_in_flight`` / ``finish`` / ``fail_doc``。
-    """
-    doc = doc_repo.get_doc(kb_id, doc_id)
-    if not doc or not doc.file_path:
-        _mark_failed(
-            kb_id, doc_id, "doc or file_path missing",
-            kb_writer=kb_writer,
-        )
+    """后台执行：parse → save_pages → 重建索引 → 更新状态。KB 状态字段全部走 writer。"""
+    doc, kb = _resolve_doc_and_kb(kb_id, doc_id)
+    if doc is None:
+        _mark_failed(kb_id, doc_id, "doc or file_path missing", kb_writer=kb_writer)
         return
-
-    kb = kb_repo.get(kb_id)
-    if not kb:
+    if kb is None:
         return
 
     kb_writer.note_in_flight(doc.original_name)
 
     with _get_index_lock(kb_id):
         try:
-            # 1) 解析（带缓存；命中跳过 OCR 配额）
-            parse_result = parse_document(doc.file_path)
-            if not parse_result.full_text or len(parse_result.full_text) < MIN_FULL_TEXT_CHARS:
-                raise RuntimeError("parse_document returned empty/sparse text")
-            # 防御 #94 假成功指纹：full_text ≥ 20 chars 但 layout/by_page 为空
-            # 意味着无高亮坐标，chip 预览会显示"未解析"；显式抛错走 _mark_failed
-            # 而非继续走"embedded"路径。
-            if not parse_result.layout:
-                raise RuntimeError(f"empty layout for {doc_id}")
-            if not parse_result.by_page:
-                raise RuntimeError(f"empty by_page for {doc_id}")
-
-            # 2) 落 pages/{doc_id}.json
-            save_pages(
-                kb_id, doc_id, parse_result.to_dict(),
-                file_hash=doc.content_hash,
-            )
-
-            # 3) 先清理该 doc 的旧节点（避免重复写入）
-            try:
-                remove_document(kb_id, doc_id)
-            except Exception as e:
-                _logger.warning("reparse: failed to remove old nodes for %s: %s", doc_id, e)
-
-            # 4) 重建索引（整篇切 chunk + _inject_page_number 自动注入）
-            index_document(
-                kb_id, doc_id, parse_result.full_text,
-                source_name=doc.original_name,
-                by_page=parse_result.by_page,
-                by_layout=parse_result.layout,
-            )
-
-            # 5) 更新文档与 KB 状态
+            parse_result = _run_parse_and_index(doc_id, doc.file_path)
+            _persist_index(kb_id, doc_id, parse_result, doc)
             doc.embedding_status = "embedded"
             doc_repo._save_doc_meta(doc)
-
             kb_writer.finish()
-
             _logger.info(
                 "reparse: doc %s (%s) embedded %d chunks",
                 doc_id, doc.original_name,
@@ -148,10 +150,7 @@ def _reparse_async(
             )
         except Exception as e:
             _logger.warning("reparse failed for doc %s: %s", doc_id, e)
-            _mark_failed(
-                kb_id, doc_id, str(e),
-                kb_writer=kb_writer,
-            )
+            _mark_failed(kb_id, doc_id, str(e), kb_writer=kb_writer)
 
 
 def _mark_failed(
