@@ -81,13 +81,13 @@ def reparse_document(
 def _resolve_doc_and_kb(
     kb_id: str, doc_id: str,
 ) -> tuple[Optional[object], Optional[object]]:
-    """查 doc + kb；任一缺失返回 ``(None, None)``（#156 保留 mark_failed/silent-return 不对称）。"""
+    """查 doc + kb；缺失位置为 ``None``（#156 保留 mark_failed/silent-return 不对称语义）。"""
     doc = doc_repo.get_doc(kb_id, doc_id)
     if not doc or not doc.file_path:
         return None, None
     kb = kb_repo.get(kb_id)
     if not kb:
-        return None, None
+        return doc, None
     return doc, kb
 
 
