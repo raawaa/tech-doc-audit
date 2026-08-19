@@ -164,6 +164,44 @@ Sequence in `PdfViewer.tsx`, anchored to line numbers:
   not page 1. This is the explicit fix vs. the pre-#72 implementation
   (lines 250-255 commentary).
 
+### 4.1 Sample-after-viewport-settles guard
+
+When the URL specifies `?page=N` with `N >= 2`, the `effectiveDPR` sample
+must be deferred until the viewport has actually switched to page N.
+Reading `pageVisibilityMetrics[0]` synchronously inside `onLayoutReady`
+(before the browser scroll has settled) returns page 1's metric and
+produces a stale `cssScale` for PDFs with mixed page sizes, mis-scaling
+the annotation rect. This is the #76 fix (Candidate C from #75's
+diagnostic report; see `docs/specs/embedpdf-annotation-async-contract.md`).
+
+Sanctioned implementation:
+
+- Gate the import on `scroll.onScroll` and confirm
+  `pm.pageNumber === target` before sampling
+  (`frontend/src/pages/PdfViewer.tsx:469-512` for `tryImport`,
+  `frontend/src/pages/PdfViewer.tsx:528-533` for the `onScroll` arming).
+  `scroll.onPageChange` is **not** a valid gate — its `pageNumber`
+  reflects the intent emitted by `startPageChange`, but `pageVisibilityMetrics`
+  has not switched yet (see comment at
+  `frontend/src/pages/PdfViewer.tsx:514-519`). Only `onScroll` (driven
+  by `commitMetrics` after the browser scroll commits) gives metrics
+  settled on the target page.
+- When the viewport is already on the target page (no scroll event will
+  fire, e.g. `?page=1` or a reload that resumes on the target page),
+  a `queueMicrotask(() => tryImport(target))` inside `onLayoutReady`
+  (`frontend/src/pages/PdfViewer.tsx:558`) catches the case and pulls
+  `scroll.getMetrics()` directly.
+- Falling back to `window.devicePixelRatio` is forbidden (§4 last
+  bullet). The stale-sample race is fixed by waiting for viewport
+  settle, not by abandoning `getEffectiveDpr` itself.
+
+This guard is the §5.2 fallback path's invariant too — the fallback
+`useEffect` (`frontend/src/pages/PdfViewer.tsx:584-618`) only fires when
+`registryRef.current` is ready and `viewerStatus === 'ready'`, which by
+that point has already passed through the same `onScroll` /
+`queueMicrotask` arming; the synchronous `onLayoutReady` path inside it
+is not a sanctioned sample site.
+
 ## 5. Fallback path
 
 The two-step restore admits a race: `onLayoutReady` can fire before
