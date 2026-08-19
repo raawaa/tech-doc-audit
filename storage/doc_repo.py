@@ -6,7 +6,7 @@ from typing import Optional
 import shutil
 
 from models.document import KBDocument
-from storage import validate_id
+from storage import atomic_write_json, validate_id
 
 
 def get_data_dir() -> Path:
@@ -58,8 +58,8 @@ def save_doc(kb_id: str, original_name: str, content: bytes, file_type: str) -> 
     with open(doc.file_path, "wb") as f:
         f.write(content)
     _ensure_dir(_doc_meta_dir(kb_id))
-    with open(_doc_meta_file(kb_id, doc.id), "w", encoding="utf-8") as f:
-        json.dump(_doc_to_json(doc), f, ensure_ascii=False, indent=2)
+    # issue #157：原子写，与 _save_doc_meta 同源走 storage.atomic_write_json
+    atomic_write_json(_doc_meta_file(kb_id, doc.id), _doc_to_json(doc))
     return doc
 
 
@@ -91,8 +91,9 @@ def list_docs(kb_id: str) -> list[KBDocument]:
 def _save_doc_meta(doc: KBDocument) -> None:
     """保存文档元数据到 JSON 文件。"""
     _ensure_dir(_doc_meta_dir(doc.kb_id))
-    with open(_doc_meta_file(doc.kb_id, doc.id), "w", encoding="utf-8") as f:
-        json.dump(_doc_to_json(doc), f, ensure_ascii=False, indent=2)
+    # issue #157：原子写，避免 POST /kb-documents/{id}/reparse 期间 doc/kb 同时更新
+    # 撞半截 → JSONDecodeError（详见 storage.atomic_write_json 文档）
+    atomic_write_json(_doc_meta_file(doc.kb_id, doc.id), _doc_to_json(doc))
 
 
 def find_doc_by_id(doc_id: str) -> Optional[KBDocument]:

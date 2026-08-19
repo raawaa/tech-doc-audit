@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from models.audit_document import AuditDocument
-from storage import validate_id
+from storage import atomic_write_json, validate_id
 
 
 def get_data_dir() -> Path:
@@ -41,8 +41,8 @@ def _doc_to_json(doc: AuditDocument) -> dict:
 
 def save_doc(doc: AuditDocument) -> AuditDocument:
     """保存文档元数据。"""
-    with open(_meta_file(doc.id), "w", encoding="utf-8") as f:
-        json.dump(_doc_to_json(doc), f, ensure_ascii=False, indent=2)
+    # issue #157：原子写，避免 read 端在 truncate / write 之间撞半截 → JSONDecodeError
+    atomic_write_json(_meta_file(doc.id), _doc_to_json(doc))
     return doc
 
 

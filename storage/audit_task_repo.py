@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from models.audit_task import AuditTask
-from storage import validate_id
+from storage import atomic_write_json, validate_id
 
 
 def get_data_dir() -> Path:
@@ -43,9 +43,8 @@ def save_task(task: AuditTask) -> AuditTask:
     """保存审核任务。"""
     task.updated_at = datetime.utcnow()
     _ensure_dir(_task_dir(task.document_id))
-    data = task.to_dict()
-    with open(_task_file(task.document_id, task.id), "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # issue #157：原子写，避免 daemon 线程写期间 GET /audit-tasks/{id} 撞半截 → JSONDecodeError
+    atomic_write_json(_task_file(task.document_id, task.id), task.to_dict())
     return task
 
 
