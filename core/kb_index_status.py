@@ -44,18 +44,34 @@ class KbIndexStatusWriter:
         self._kb_id = kb_id
         self._total = total
         self._lock = threading.Lock()
-        self._progress = 0.0
+        # ``None`` = 未开始过；首次 ``begin()`` 把它设为 0.0，之后保持单调
+        # 不减。批间切换由 caller 构造新 writer 或显式 ``clear_building``
+        # 触发 —— 见 ``begin()`` docstring。
+        self._progress: Optional[float] = None
 
     # ── 公开 callback ──────────────────────────────────────────────
 
     def begin(self) -> None:
         """批次开头写一次 ``building`` + 进度归零。
 
+        仅在"未开始过（``_progress is None``）"或"KB 当前 ``status == 'none'``"
+        时把 ``_progress`` 重置为 0.0；其它情况（mid-batch 重复调用，已有中间值）
+        **不**重置，让 ``_write`` 的单调不减守卫自然兜住（issue #155 defense）。
+        批间切换走两种路径之一：caller 构造新 writer（本模块与上游服务的
+        现行约定）—— 让 ``_progress`` 回到 ``None``，下次 ``begin()`` 自然 reset；
+        或先 ``clear_building()`` 把 KB 拍回 ``none``，下次 ``begin()`` 也能 reset。
+
         提前显式重置 ``_progress``：批终态 ``finish`` 会把单调守卫推到
         1.0，不重置就把"下一批的 0"截成 1.0，违反"进度归零"的契约。
         """
         with self._lock:
-            self._progress = 0.0
+            kb = kb_repo.get(self._kb_id)
+            should_reset = (
+                self._progress is None
+                or (kb is not None and kb.index_status == "none")
+            )
+            if should_reset:
+                self._progress = 0.0
         self._write(status="building", progress=0.0, current_doc="")
 
     def note_in_flight(self, doc_name: str) -> None:
@@ -155,8 +171,11 @@ class KbIndexStatusWriter:
         """
         with self._lock:
             if progress is not self._UNSET and progress is not None:
-                # 单调不减：并发下完成回调乱序也不许让进度倒退（#93）
-                progress = max(self._progress, progress)
+                # 单调不减：并发下完成回调乱序也不许让进度倒退（#93）。
+                # ``_progress`` 初始为 ``None``（writer 刚构造、还没 ``begin()``），
+                # 此时直接收下入参，不与 ``None`` 比 max。
+                if self._progress is not None:
+                    progress = max(self._progress, progress)
                 self._progress = progress
             kb = kb_repo.get(self._kb_id)
             if kb is None:

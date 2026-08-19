@@ -678,6 +678,28 @@ def test_bulk_run_kb_writes_go_only_through_writer(kb, monkeypatch):
     )
 
 
+def test_bulk_run_begin_called_exactly_once_across_all_docs(kb, monkeypatch):
+    """issue #155 验收点：批量 N 篇 ⇒ ``begin()`` 恰好 1 次（不是 N+1 次）。
+
+    旧实现里编排层调一次 ``begin()``，每个 per-doc 线程进 ``_reparse_async``
+    又调一次 ``begin()`` —— N 篇 ⇒ N+1 次，每次把 ``_progress`` 清零、把
+    ``index_progress=0.0`` 写盘，前端轮询会在两帧之间看到 ``0/N`` 回退。
+    修法：``begin()`` 由 caller 独家承担，``_reparse_async`` 不再调。
+    """
+    for n in ("a.pdf", "b.pdf", "c.pdf"):
+        _add_doc(kb.id, n, embedding_status="failed", page_count=3)
+    svc, _observed, _calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
+    writer_calls = _spy_kb_writer(monkeypatch)
+
+    svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
+
+    begin_count = sum(1 for name, _a, _kw in writer_calls if name == "begin")
+    assert begin_count == 1, (
+        f"批量 N 篇 ⇒ begin() 应只调 1 次（编排层独家承担），"
+        f"实际 {begin_count} 次；序列 {[n for n, _, _ in writer_calls]}"
+    )
+
+
 def test_bulk_run_interrupted_orchestration_still_lands_terminal_status(kb, monkeypatch):
     """编排层自身抛错（这里用逐篇回调模拟）也不许把 KB 留在 ``building``。
 

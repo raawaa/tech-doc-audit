@@ -217,6 +217,9 @@ def test_parse_document_raises_still_reaches_mark_failed(reparse_guard_kb):
 # 构造 ``total=1`` 的 writer 上走完整生命周期。两种情形都通过同一个
 # ``_reparse_async`` 跑 —— 区别只在 writer 是谁造的、单篇 ``finish()`` 的
 # 字面格式是否被压制（``_total > 1`` 时单篇失败只写 current_doc、不写终态）。
+# #155 把单篇路径的 ``begin()`` 从 per-doc 线程上提到 ``reparse_document``
+# 构造 writer 之后，避免 N 篇批量 = N+1 次 begin 的 ``index_progress=0.0``
+# 写盘回退。注入路径要求 caller 已 ``begin()``；本函数**不再** begin。
 #
 # 4 个 caller_manages_kb_status plumbing 测试塌成 2 个：
 # ① 默认 = 自己造 total=1 writer；② 注入 = 用注入的 writer（不再断言 kwargs 透传）。
@@ -232,13 +235,16 @@ def _good_parse_result() -> ParseResult:
 
 
 def test_default_mode_writes_kb_status(reparse_guard_kb):
-    """默认（``kb_writer=None``）：函数自己造一个 ``KbIndexStatusWriter(total=1)``
-    并调它的 ``begin / note_in_flight / finish``，KB 终态由它写。
+    """默认（``kb_writer=None``）：函数自己造一个 ``KbIndexStatusWriter(total=1)``，
+    **构造后立刻** ``begin()`` —— 单篇路径的 begin() 由本函数独家承担，
+    保证批量场景下 ``begin()`` 只被调一次（issue #155）。
 
     这是 per-doc API 端点与单篇 UI 按钮走的那条路径 —— #150 后默认行为
-    不变，"自己管 KB 状态" 的语义从"分支判断"变成"无脑调 writer API"。
+    不变，"自己管 KB 状态" 的语义从"分支判断"变成"无脑调 writer API"；
+    #155 又把 begin() 从 per-doc 线程提前到构造时，杜绝 N+1 次调用的
+    ``index_progress=0.0`` 写盘回退。
     """
-    from unittest.mock import patch
+    from unittest.mock import MagicMock, patch
     from core.kb_index_status import KbIndexStatusWriter
 
     kb, doc = reparse_guard_kb
@@ -251,7 +257,11 @@ def test_default_mode_writes_kb_status(reparse_guard_kb):
         constructed.append((kb_id_arg, total))
         real_init(self, kb_id_arg, total=total)
 
+    # 隔离外部副作用：构造之后立刻 begin() 会触发 ``kb_repo.update``，
+    # 本测试只关心契约，不关心落盘内容。
+    begin_mock = MagicMock()
     with patch.object(KbIndexStatusWriter, "__init__", spy_init), \
+         patch.object(KbIndexStatusWriter, "begin", begin_mock), \
          patch("services.reparse_service.threading.Thread"):
         from services.reparse_service import reparse_document
         reparse_document(doc.id)
@@ -260,15 +270,18 @@ def test_default_mode_writes_kb_status(reparse_guard_kb):
         f"默认模式下函数必须自己构造 KbIndexStatusWriter(kb_id={kb.id}, total=1)；"
         f"实际构造记录: {constructed}"
     )
+    # #155：构造后立刻 begin()，把 KB 拍到 building+0
+    # —— 单篇路径的 begin() 由 ``reparse_document`` 独家承担，不让 per-doc
+    # 线程进 _reparse_async 后再 begin()，否则批量场景下 begin() 会变 N+1 次。
+    begin_mock.assert_called_once_with()
 
 
 def test_provided_writer_takes_over_kb_status(reparse_guard_kb):
     """``kb_writer`` 注入：函数用注入的实例，不再自己造新 writer，
-    stub 的 ``begin / note_in_flight / finish`` 被按预期调用。
+    stub 的 ``note_in_flight / finish`` 被按预期调用，``begin()`` **不**再被调。
 
     这是批量重新解析走的那条路径 —— 编排层持有跨文档共享的 writer，
-    单篇入口只往里写自己那一格。断言从"kwargs 透传"转向"writer 接口被调"，
-    是 #150 把 seam 从布尔收到 writer 的语义落点。
+    单篇入口只往里写自己那一格，begin()/finish() 都归编排层独家承担（#155）。
     """
     from unittest.mock import MagicMock, patch
     from core.kb_index_status import KbIndexStatusWriter
@@ -298,7 +311,7 @@ def test_provided_writer_takes_over_kb_status(reparse_guard_kb):
         from services.reparse_service import _reparse_async
         _reparse_async(kb.id, "doc_x", stub_writer)
 
-    # stub writer 应按生命周期被调用，参数按约定传
-    stub_writer.begin.assert_called_once_with()
+    # 注入路径：begin() 由编排层独家承担，本函数**不再**调（#155）。
+    stub_writer.begin.assert_not_called()
     stub_writer.note_in_flight.assert_called_once_with(doc.original_name)
     stub_writer.finish.assert_called_once_with()

@@ -8,9 +8,9 @@
 - 任何步骤失败 → ``embedding_status=failed`` + ``index_current_doc`` 写错误信息（沿用现有契约）。
 - KB 级检索状态（``index_status`` / ``index_progress`` / ``index_current_doc``）由
   ``core.kb_index_status.KbIndexStatusWriter``（issue #148）唯一写入。单篇入口默认
-  自己造 ``total=1`` 的 writer 走完整生命周期；批量重新解析
-  （``services.bulk_reparse_service``）注入编排层共享的 writer（``total=N``），
-  由此函数在自己的 begin()/finish() 之间干活，编排层在批次首尾再
+  自己造 ``total=1`` 的 writer，构造后**立即** ``begin()``，把 KB 拍到 building+0
+  再起后台线程；批量重新解析（``services.bulk_reparse_service``）注入编排层共享的
+  writer（``total=N``），由此函数在自己的 begin()/finish() 之间干活，编排层在批次首尾再
   begin()/finish() 收尾，整批期间 KB 不会在 ``building ⇄ searchable`` 间抖动。
 - 完整逆向兼容：老 ``page_texts`` 路径仍在 ``import_document`` 里；reparse 走新路径。
 """
@@ -42,10 +42,12 @@ def reparse_document(
     Args:
         kb_writer: KB 检索状态字段的唯一写入者（issue #148 / #147）。批量重新解析
             （``services.bulk_reparse_service``）注入它跨文档共享的 writer，让
-            整批期间 KB 状态由编排层独占管理；默认 ``None`` —— 函数自己构造一个
-            ``KbIndexStatusWriter(kb_id, total=1)`` 走完整生命周期（开头 building、
-            终态 searchable|failed）。无论是否传入，doc 级 ``embedding_status``
-            都照常写。
+            整批期间 KB 状态由编排层独占管理；调用方**必须**已经 ``begin()``
+            过（issue #155：避免批量场景下每篇 per-doc 线程再 begin()，变成
+            N+1 次把 ``_progress`` 清零 + 把 ``index_progress=0.0`` 写盘）。
+            默认 ``None`` —— 函数自己构造一个 ``KbIndexStatusWriter(kb_id, total=1)``
+            并立即 ``begin()``，走完整生命周期（开头 building、终态 searchable|failed）。
+            无论是否传入，doc 级 ``embedding_status`` 都照常写。
 
     Returns:
         ``{"status": "pending_index", "doc_id": "..."}`` 表示已调度。
@@ -60,9 +62,11 @@ def reparse_document(
     doc.embedding_status = "pending_index"
     doc_repo._save_doc_meta(doc)
 
-    # 默认自己管 KB 状态；批量注入时由编排层管生命周期。
+    # 默认自己管 KB 状态；批量注入时由编排层管生命周期 —— 注入路径必须已 begin()
+    # （详见 docstring 与 issue #155）。
     if kb_writer is None:
         kb_writer = KbIndexStatusWriter(doc.kb_id, total=1)
+        kb_writer.begin()
 
     thread = threading.Thread(
         target=_reparse_async,
@@ -95,9 +99,6 @@ def _reparse_async(
     if not kb:
         return
 
-    # 开锁前先标记 building。批量场景下编排层已 begin()，这里再调一次
-    # 是幂等的（同样的 building + progress=0 + current_doc=""）。
-    kb_writer.begin()
     kb_writer.note_in_flight(doc.original_name)
 
     with _get_index_lock(kb_id):

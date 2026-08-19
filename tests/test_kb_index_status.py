@@ -79,6 +79,34 @@ def test_begin_writes_building_with_zero_progress(stub_and_writer):
     assert kb.index_current_doc == ""
 
 
+def test_begin_is_idempotent_does_not_reset_mid_batch_progress(stub_and_writer):
+    """issue #155 defense：mid-batch 重复 ``begin()`` **不**清掉 ``_progress`` 中间值。
+
+    旧实现无条件 ``self._progress = 0.0`` —— 每篇 per-doc 线程进来都 reset，
+    单调守卫只保护内存不保护已落盘的 ``kb.index_progress``，前端轮询会看到
+    ``0/N`` 短暂回退。修法：``begin()`` 改成只在"未开始过
+    （``_progress is None``）"或"KB 当前 ``status == 'none'``"时 reset，
+    其它情况（mid-batch 重复调用）保留中间值。
+
+    旧实现下本测试会失败：第二次 ``begin()`` 把 ``_progress`` 推回 0.0，
+    第二次 ``_write(progress=0.0)`` 在单调守卫下写出 0.0；前端会看到回退。
+    """
+    stub, writer = stub_and_writer
+
+    writer.begin()           # 首次：reset 到 0.0
+    writer.advance(1)        # _progress → 1/3，落盘 index_progress=1/3
+    writer.begin()           # 重复：必须**不**reset
+
+    # 整批写入里 progress 必须单调不减，没有 0.0 回退
+    progresses = [u.index_progress for u in stub.updates]
+    assert progresses, "应至少写一次"
+    assert max(progresses) >= 1 / 3 - 1e-9
+    for prev, curr in zip(progresses, progresses[1:]):
+        assert curr >= prev - 1e-9, (
+            f"progress 倒退: {prev} -> {curr} —— #155 幂等性失效"
+        )
+
+
 # ── 不变式 2: note_in_flight(name) ─────────────────────────────────
 
 
