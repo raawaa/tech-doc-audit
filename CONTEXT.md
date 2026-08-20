@@ -38,6 +38,24 @@
   _Avoid_: "就绪""ready"——必须与文档向量化层的终态严格区分。
 - **两者关系** — 文档向量化是知识库检索索引的**构成材料**（前置条件），不是同一回事：全部文档已向量化 ≠ 该库可检索，仍需合并建索引。类比："砖都烧好了 ≠ 墙砌好了"。
 
+## KB 索引代码分层
+
+KB 文档向量化与 KB 检索索引的概念边界（见上文 §知识库检索）落到三个模块：
+
+- **`KBIndexWriter` (`core/kb_index_writer.py`)** — 写入 orchestrator。隐藏 chunking / metadata enrichment / page-number 注入 / block-range 注入 / embed 重试。公开 `index_documents(docs)`（单入口，批量形态）与 `rebuild_kb_index(kb_id, *, progress_callback=None)`（2-phase 编排：cached vectors fast-path → GPU re-embed fallback）。单篇 reparse 也走 `index_documents([doc])`，不再有单篇/批量两条路径。
+- **`KBIndexStore` (`core/kb_index_store.py`)** — 一个 KB 的 FAISS + sidecar meta + vector cache + per-KB 锁的全部承载者。`KBIndexStore.open(kb_id)` 显式单例化（跨调用方共享锁与 `VectorStoreIndex` 缓存）。外部不再 import 私有锁。
+- **`ChunkLayoutMapper` (`core/chunk_layout_mapper.py`)** — 单方法 `map_chunk_to_blocks(chunk_text, page_layout) -> tuple[int, int] | None`，封装 T1/P2 规则。`_inject_block_range`（"对所有 node 注入"循环）留在 `KBIndexWriter`。
+
+支撑模块：
+- `core/text_norm.py` — `norm()`、`lcs_len()`、`_block_matches_chunk` + 阈值常量 `_MIN_LCS_LEN=4` / `_LCS_RATIO_THRESHOLD=0.85`。T1/P2 规则的唯一算法来源；与前端 `frontend/src/lib/layoutMatch.ts` 共享同一 JSON fixtures。
+- `core/embed_retry.py::embed_batch_with_retry(client, batch)` — `tenacity 3×2s→30s`，仅重试 `APIConnectionError` / `APITimeoutError`。ADR-0007 瞬态失败语义的唯一 owner；`KBIndexWriter` 当前唯一调用方，但函数本身可被 `core/siliconflow_client` 复用。
+- `storage/doc_repo.py::mark_doc_embedding_failed(kb_id, doc_id, err=None)` — doc `embedding_status="failed"` 状态转移的唯一公开入口（取代历史上 `core.index_manager._mark_doc_embedding_failed`）。
+- `core/text_norm_fixtures.json` — T1/P2 + norm + lcs_len 的 Python/TS 共享测试用例；任一端实现漂移即测试红。
+
+`core/index_manager.py` 删除（项目沿用硬改名惯例，issue #156/155/157/158 均为单 PR 一次性 sed）。
+
+_Avoid_: 直接 `KBIndexStore(kb_id)`（绕开 `open()`）——单例化失效，锁不再跨调用方共享；继续 import `core.index_manager.index_document` / `index_documents_batch` ——Q1 决策后这两符号已不存在。
+
 ## 线上 Embedding/Rerank 降级语义（ADR-0007）
 
 - **降级语义 (Degradation Semantics)** — 线上 embedding/rerank 服务失败时的整体行为契约：embedding 失败即抛（**无自动兜底**），rerank 失败优雅降级回原始排序。运维级兜底 = 重启切换 `EMBED_PROVIDER`。
