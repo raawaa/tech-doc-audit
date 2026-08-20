@@ -1,0 +1,5 @@
+{
+  "//": "生产构建专用：排除测试文件。npm run build 在 frontend/ 这个 Docker 构建上下文里跑（docker-compose.yml `context: ./frontend`），而 src/lib/layoutMatch.test.ts 要 import 仓库根的 core/text_norm_fixtures.json（issue #167 前后端共享用例）——那个文件不在构建上下文里，让 tsc 编译测试文件会 TS2307 报错。测试的类型检查由 `npm run typecheck`（走 tsconfig.json，含测试）负责。",
+  "extends": "./tsconfig.json",
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "e2e"]
+}
