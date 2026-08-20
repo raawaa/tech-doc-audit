@@ -67,7 +67,7 @@ BGE_MODELS = (
 
 - `embed_model.get_text_embedding_batch(texts)` → `_get_text_embeddings(texts)` → `_embed(texts, prompt_name="text")`（`base.py:322-333`）→ sentence-transformers 内部 `encode(..., prompt_name="text")`。
 - "text" prompt 是空串 → encode 时**不**给 chunk 文本加任何前缀。
-- 项目内 `embed_model` 也从不通过 `_get_query_embedding` 走 query 分支（`core/index_manager.py:201` 只调 `_embed_batch_with_retry(embed_model, node_texts)` → `embed_model.get_text_embedding_batch(texts)`），所以 query 分支（"query" prompt）也不会被触发——对 doc 和 query 来说**都不加指令**。
+- 项目内 `embed_model` 也从不通过 `_get_query_embedding` 走 query 分支（`core/index_manager.py:201` 只调 `embed_batch_with_retry(embed_model, node_texts)` → `embed_model.get_text_embedding_batch(texts)`），所以 query 分支（"query" prompt）也不会被触发——对 doc 和 query 来说**都不加指令**。
 
 ### 官方说法
 
