@@ -48,7 +48,7 @@ KB 文档向量化与 KB 检索索引的概念边界（见上文 §知识库检�
 
 支撑模块：
 - `core/text_norm.py` — `norm()`、`lcs_len()`、`_block_matches_chunk` + 阈值常量 `_MIN_LCS_LEN=4` / `_LCS_RATIO_THRESHOLD=0.85`。T1/P2 规则的唯一算法来源；与前端 `frontend/src/lib/layoutMatch.ts` 共享同一 JSON fixtures。
-- `core/embed_retry.py::embed_batch_with_retry(client, batch)` — `tenacity 3×2s→30s`，仅重试 `APIConnectionError` / `APITimeoutError`。ADR-0007 瞬态失败语义的唯一 owner；`KBIndexWriter` 当前唯一调用方，但函数本身可被 `core/siliconflow_client` 复用。
+- `core/embed_retry.py::embed_batch_with_retry(embed_model, texts)` — `tenacity 3×2s→30s`，仅重试 `APIConnectionError` / `APITimeoutError`。ADR-0007 瞬态失败语义的唯一 owner；`KBIndexWriter` 当前唯一调用方，但函数本身可被 `core/siliconflow_client` 复用。参数按实际契约命名（任何提供 `get_text_embedding_batch(texts)` 的 embedder），#165 规格里写作 `(client, batch)`，两种叫法同指、调用点一律位置传参。
 - `storage/doc_repo.py::mark_doc_embedding_failed(kb_id, doc_id, err=None)` — doc `embedding_status="failed"` 状态转移的唯一公开入口（取代历史上 `core.index_manager._mark_doc_embedding_failed`）。
 - `core/text_norm_fixtures.json` — T1/P2 + norm + lcs_len 的 Python/TS 共享测试用例；任一端实现漂移即测试红。
 
