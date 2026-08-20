@@ -105,154 +105,6 @@ def test_index_empty_text(seed_searchable_kb):
     assert len(results) == 0
 
 
-# ── _embed_batch_with_retry 重试层契约(ADR-0007 §2)───────────────────────────
-
-
-class _FakeEmbedModel:
-    """测试 ``_embed_batch_with_retry`` 的可控 fake。
-
-    记录每次调用次数,按 ``errors`` 队列逐次抛错(队列耗尽 → 成功返回),
-    验证 tenacity 重试层只重试连接错误、对其他异常零重试。
-    """
-
-    def __init__(self, *, return_value=None, errors=None):
-        self._return_value = return_value if return_value is not None else [[0.0] * 4]
-        self._errors = list(errors or [])
-        self.call_count = 0
-
-    def get_text_embedding_batch(self, texts):
-        self.call_count += 1
-        if self._errors:
-            raise self._errors.pop(0)
-        return self._return_value
-
-
-def _compress_retry_wait(monkeypatch):
-    """把 ``_EMBED_BATCH_RETRY_MIN_S`` / ``_EMBED_BATCH_RETRY_MAX_S`` 压成 0。
-
-    默认生产值是 2s 起 → 30s 上限,跑 3 次连接错误的测试要等 2s+4s = 6s。
-    测试里压缩到 0,让重试层瞬间走完。
-    """
-    import core.index_manager as im
-    monkeypatch.setattr(im, "_EMBED_BATCH_RETRY_MIN_S", 0)
-    monkeypatch.setattr(im, "_EMBED_BATCH_RETRY_MAX_S", 0)
-
-
-def test_embed_batch_retry_returns_immediately_on_success(monkeypatch):
-    """成功调用 → 1 次,无重试。"""
-    import core.index_manager as im
-    _compress_retry_wait(monkeypatch)
-
-    fake = _FakeEmbedModel(return_value=[[0.1, 0.2, 0.3, 0.4]])
-    out = im._embed_batch_with_retry(fake, ["hello"])
-    assert out == [[0.1, 0.2, 0.3, 0.4]]
-    assert fake.call_count == 1
-
-
-def test_embed_batch_retry_retries_api_connection_error_3_times(monkeypatch):
-    """``APIConnectionError`` 重试 3 次后 reraise。
-
-    ADR-0007 §2:连接层错误由 tenacity 3 次 2s→30s 指数退避负责。
-    """
-    import httpx as _httpx
-    from openai import APIConnectionError
-    import core.index_manager as im
-    _compress_retry_wait(monkeypatch)
-
-    fake = _FakeEmbedModel(errors=[APIConnectionError(request=_httpx.Request("POST", "https://api.siliconflow.cn/v1/embeddings"))] * 5)
-    with pytest.raises(APIConnectionError):
-        im._embed_batch_with_retry(fake, ["hello"])
-    # 3 次:stop_after_attempt(3)
-    assert fake.call_count == 3
-
-
-def test_embed_batch_retry_retries_api_timeout_error(monkeypatch):
-    """``APITimeoutError``(``APIConnectionError`` 子类)同样进重试。"""
-    import httpx as _httpx
-    from openai import APITimeoutError
-    import core.index_manager as im
-    _compress_retry_wait(monkeypatch)
-
-    fake = _FakeEmbedModel(errors=[APITimeoutError(request=_httpx.Request("POST", "https://api.siliconflow.cn/v1/embeddings"))] * 5)
-    with pytest.raises(APITimeoutError):
-        im._embed_batch_with_retry(fake, ["hello"])
-    assert fake.call_count == 3
-
-
-def test_embed_batch_retry_does_not_retry_value_error(monkeypatch):
-    """``ValueError`` 不进重试白名单 → 立即抛(不可重试错误,ADR-0007 §2)。
-
-    关键防退化测试:防止未来重构把 ``retry_if_exception_type`` 改成 retry
-    all exceptions —— 那样会让 ValueError 等不可重试错误白白耗 3 次。
-    """
-    import core.index_manager as im
-    _compress_retry_wait(monkeypatch)
-
-    fake = _FakeEmbedModel(errors=[ValueError("不可重试的错误")])
-    with pytest.raises(ValueError, match="不可重试"):
-        im._embed_batch_with_retry(fake, ["hello"])
-    assert fake.call_count == 1
-
-
-def test_embed_batch_retry_does_not_retry_runtime_error(monkeypatch):
-    """``RuntimeError`` 同样不进重试(本地 bge-m3 路径 CUDA OOM 也按"失败即抛"走)。
-
-    ADR-0007 §1:无自动兜底;不可重试错误立即抛出。
-    """
-    import core.index_manager as im
-    _compress_retry_wait(monkeypatch)
-
-    fake = _FakeEmbedModel(errors=[RuntimeError("CUDA out of memory")])
-    with pytest.raises(RuntimeError, match="CUDA out of memory"):
-        im._embed_batch_with_retry(fake, ["hello"])
-    assert fake.call_count == 1
-
-
-def test_embed_batch_retry_recovers_after_transient_connection_error(monkeypatch):
-    """前 2 次 ``APIConnectionError``,第 3 次成功 → 返回结果(不抛)。"""
-    import httpx as _httpx
-    from openai import APIConnectionError
-    import core.index_manager as im
-    _compress_retry_wait(monkeypatch)
-
-    fake = _FakeEmbedModel(
-        errors=[APIConnectionError(request=_httpx.Request("POST", "https://api.siliconflow.cn/v1/embeddings"))] * 2,
-        return_value=[[0.1, 0.2, 0.3, 0.4]],
-    )
-    out = im._embed_batch_with_retry(fake, ["hello"])
-    assert out == [[0.1, 0.2, 0.3, 0.4]]
-    assert fake.call_count == 3
-
-
-def test_embed_batch_retry_does_not_retry_http_status_errors(monkeypatch):
-    """``APIStatusError``(429/5xx 等)不在本层白名单 → 不重试。
-
-    理由:HTTP 层错误由 OpenAI SDK 内置 ``max_retries=2`` 负责,本层不重复。
-    SDK 实在扛不住时上抛的 ``RateLimitError`` / ``InternalServerError`` 等
-    ``APIStatusError`` 子类**不**进本层重试 —— 避免双层重试(ADR-0007 §2)。
-    """
-    import httpx as _httpx
-    from openai import APIStatusError
-    import core.index_manager as im
-    _compress_retry_wait(monkeypatch)
-
-    fake = _FakeEmbedModel(
-        errors=[
-            APIStatusError(
-                "rate limit",
-                response=_httpx.Response(429, request=_httpx.Request("POST", "https://api.siliconflow.cn/v1/embeddings")),
-                body=None,
-            )
-        ]
-    )
-    with pytest.raises(APIStatusError):
-        im._embed_batch_with_retry(fake, ["hello"])
-    assert fake.call_count == 1, (
-        f"HTTP 错误不该被本层重试(SDK 自己 retry);"
-        f"实际 {fake.call_count} 次"
-    )
-
-
 # ── index_documents_batch 每稿隔离(ADR-0007 §3)───────────────────────────────
 
 
@@ -275,7 +127,6 @@ def test_index_documents_batch_isolates_per_doc_embedding_failure(
     import storage.kb_repo as kb_repo
     import storage.doc_repo as doc_repo
 
-    _compress_retry_wait(monkeypatch)
 
     kb_id = seed_searchable_kb("test_kb_per_doc_iso")
 
@@ -311,7 +162,7 @@ def test_index_documents_batch_isolates_per_doc_embedding_failure(
         return [[float(i)] * 1024 for i in range(len(texts))]
 
     monkeypatch.setattr(
-        "core.index_manager._embed_batch_with_retry", _patched_batch
+        "core.index_manager.embed_batch_with_retry", _patched_batch
     )
 
     def _on_progress(current, total, doc_name):
@@ -363,7 +214,6 @@ def test_index_documents_batch_failed_doc_has_no_vector_file(
     from core.index_manager import index_documents_batch, _vectors_dir
     import storage.doc_repo as doc_repo
 
-    _compress_retry_wait(monkeypatch)
 
     kb_id = seed_searchable_kb("test_kb_per_doc_iso_no_vec")
 
@@ -390,7 +240,7 @@ def test_index_documents_batch_failed_doc_has_no_vector_file(
         return [[float(i)] * 1024 for i in range(len(texts))]
 
     monkeypatch.setattr(
-        "core.index_manager._embed_batch_with_retry", _patched_batch
+        "core.index_manager.embed_batch_with_retry", _patched_batch
     )
 
     docs = [
@@ -446,7 +296,7 @@ def test_index_documents_batch_does_not_abort_batch_on_runtime_error(
         return [[0.0] * 1024 for _ in texts]
 
     monkeypatch.setattr(
-        "core.index_manager._embed_batch_with_retry", _patched_batch
+        "core.index_manager.embed_batch_with_retry", _patched_batch
     )
 
     docs = [
@@ -481,7 +331,7 @@ def test_index_documents_batch_skips_docs_not_in_doc_repo(
         return [[0.0] * 1024 for _ in texts]
 
     monkeypatch.setattr(
-        "core.index_manager._embed_batch_with_retry", _patched_batch
+        "core.index_manager.embed_batch_with_retry", _patched_batch
     )
 
     docs = [
