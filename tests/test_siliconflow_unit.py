@@ -493,7 +493,7 @@ def test_make_siliconflow_client_passes_max_retries_2(monkeypatch):
 
     OpenAI SDK 默认就是 2,但要显式传 —— 未来若 SDK 改默认值,这条契约守住
     我们的语义:HTTP 层重试次数 = 2(批量路径在 SDK 之上还有一层连接层 tenacity,
-    见 ``_embed_batch_with_retry``)。
+    见 ``core.embed_retry.embed_batch_with_retry``)。
     """
     import httpx as _httpx
 
@@ -570,7 +570,7 @@ def test_embed_token_accumulation_isolated_under_4way_concurrency(monkeypatch):
     调过,累加器保持 0。
 
     模拟 ``services/bulk_reparse_service.py:DEFAULT_CONCURRENCY = 4`` 下并发跑
-    doc → ``reparse_document`` → ``index_document`` → ``_embed_batch_with_retry``
+    doc → ``reparse_document`` → ``index_document`` → ``embed_batch_with_retry``
     → ``_embed_with_siliconflow`` 的真实路径,守住 ADR-0009 的隐含契约 —— token
     累加器是 thread-local,**不能**让 worker 的累加污染主线程,也不能让多个
     worker 之间互踩(否则最终账单/撞墙判断会由 thread race 决定)。

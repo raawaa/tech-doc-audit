@@ -1,0 +1,198 @@
+{
+  "$schema_note": "chunk→layout 匹配规则的唯一测试用例来源，Python 与 TypeScript 双端加载（issue #167）。Python: tests/test_text_norm.py；TypeScript: frontend/src/lib/layoutMatch.test.ts。任一端实现漂移 → 两端同时红。每个 case 形状统一为 {chunk, block, expected, note}（norm 段不用 block，lcs_len 段的 expected 是数字）。",
+  "norm": [
+    {
+      "chunk": "８00兆对讲机",
+      "block": null,
+      "expected": "800兆对讲机",
+      "note": "NFKC 全角数字归一为半角"
+    },
+    {
+      "chunk": "ABC Def",
+      "block": null,
+      "expected": "abcdef",
+      "note": "lowercase + 去空白"
+    },
+    {
+      "chunk": "公 司 各 应 急",
+      "block": null,
+      "expected": "公司各应急",
+      "note": "去空白"
+    },
+    {
+      "chunk": "公司、各应急单位应当配置。",
+      "block": null,
+      "expected": "公司各应急单位应当配置",
+      "note": "去常见中文标点（、。）"
+    },
+    {
+      "chunk": "(800) MHz radio, OK!",
+      "block": null,
+      "expected": "800mhzradiook",
+      "note": "去常见英文标点"
+    },
+    {
+      "chunk": "（ＡＢＣ）",
+      "block": null,
+      "expected": "abc",
+      "note": "全角字母 + 全角括号 NFKC 后归一为半角再剥"
+    },
+    {
+      "chunk": "机场应急救援，指挥中心；报告。",
+      "block": null,
+      "expected": "机场应急救援指挥中心报告",
+      "note": "全角逗号 NFKC 后成半角 comma，落进 ASCII 标点集——两端 PUNCT 列表虽不同字面，归一后等价"
+    },
+    {
+      "chunk": "",
+      "block": null,
+      "expected": "",
+      "note": "空串归一化结果为空串"
+    },
+    {
+      "chunk": "   ",
+      "block": null,
+      "expected": "",
+      "note": "纯空白归一化后为空串（下游据此短路，不进匹配）"
+    }
+  ],
+  "lcs_len": [
+    {
+      "chunk": "hello",
+      "block": "hello",
+      "expected": 5,
+      "note": "完全相同"
+    },
+    {
+      "chunk": "abcd",
+      "block": "abce",
+      "expected": 3,
+      "note": "末字符不同 → abc"
+    },
+    {
+      "chunk": "",
+      "block": "abc",
+      "expected": 0,
+      "note": "空串左"
+    },
+    {
+      "chunk": "abc",
+      "block": "",
+      "expected": 0,
+      "note": "空串右"
+    },
+    {
+      "chunk": "abc",
+      "block": "xyz",
+      "expected": 0,
+      "note": "完全无交集"
+    },
+    {
+      "chunk": "800兆对讲机",
+      "block": "800兆对话机",
+      "expected": 6,
+      "note": "OCR 单字错（讲→话），7 字符错 1 → LCS 6"
+    },
+    {
+      "chunk": "应急救援指挥中心",
+      "block": "应急救援保障指挥中心",
+      "expected": 8,
+      "note": "block 多插两字，chunk 全部按序命中 → LCS = len(chunk)。这正是 P2 分母取 min 会误判 1.0 的形状"
+    }
+  ],
+  "block_match": [
+    {
+      "chunk": "公司各应急保障",
+      "block": "公司各应急保障单位应当配置",
+      "expected": true,
+      "note": "T1：chunk 是 block 子串"
+    },
+    {
+      "chunk": "公司各应急保障单位应当配置无线对讲设备至少两套",
+      "block": "公司各应急保障单位应当配置",
+      "expected": true,
+      "note": "T1 反向：block 是 chunk 子串（OCR 把一段拆成多个 block）"
+    },
+    {
+      "chunk": "公司 各应急 保障单位",
+      "block": "公司各应急保障单位",
+      "expected": true,
+      "note": "T1：去空白后完全相等"
+    },
+    {
+      "chunk": "公司、各应急单位应当配置。",
+      "block": "公司各应急单位应当配置",
+      "expected": true,
+      "note": "T1：去中文标点后完全相等"
+    },
+    {
+      "chunk": "８00兆对讲机",
+      "block": "800兆对讲机",
+      "expected": true,
+      "note": "T1：NFKC 归一后完全相等"
+    },
+    {
+      "chunk": "800兆对讲机",
+      "block": "与本标准无关的其他规范",
+      "expected": false,
+      "note": "完全无关：T1 miss，P2 ratio 远低于阈值"
+    },
+    {
+      "chunk": "",
+      "block": "公司各应急保障",
+      "expected": false,
+      "note": "空 chunk 不命中"
+    },
+    {
+      "chunk": "   ",
+      "block": "公司各应急保障",
+      "expected": false,
+      "note": "纯空白 chunk 归一化后为空 → 不命中"
+    },
+    {
+      "chunk": "800兆对讲机",
+      "block": "",
+      "expected": false,
+      "note": "空 block 不命中"
+    },
+    {
+      "chunk": "公司各应急保障单位应当配置无线对话设备至少两套",
+      "block": "公司各应急保障单位应当配置无线对讲设备至少两套",
+      "expected": true,
+      "note": "P2：等长 22 字错 1 → ratio 21/22 ≈ 0.955 ≥ 0.85。等长故 min 分母 == max 分母，两端无歧义"
+    },
+    {
+      "chunk": "800兆对讲机",
+      "block": "800兆对话机",
+      "expected": true,
+      "note": "P2：等长 7 字错 1 → ratio 6/7 ≈ 0.857，刚好过 0.85 阈值（阈值改动即红）"
+    },
+    {
+      "chunk": "abcd",
+      "block": "abce",
+      "expected": false,
+      "note": "P2：等长 4 字错 1 → ratio 3/4 = 0.75 < 0.85"
+    },
+    {
+      "chunk": "对讲机",
+      "block": "对话机",
+      "expected": false,
+      "note": "P2 短路：min 长度 3 < MIN_LCS_LEN(4) → 不跑 LCS，直接 false"
+    },
+    {
+      "chunk": "第八条 应急救援指挥中心",
+      "block": "应急救援指挥中心",
+      "expected": true,
+      "note": "T1 反向：真短语整段落在 block 里（散落误命中 case 的对照组）"
+    }
+  ],
+  "known_divergences": [
+    {
+      "chunk": "应急救援指挥中心",
+      "block": "公司消防、医疗救护相关设备物资发生报废、故障、检修等情况，造成机场应急救援保障能力降低的，消防急救保障部应及时向公司运行指挥中心报告。",
+      "python": true,
+      "typescript": false,
+      "note": "P2 分母不一致：Python core.text_norm._block_matches_chunk 用 lcs/min（chunk 8 字全部按序散落在长 block 里 → 1.0 → 命中），TypeScript layoutMatch 已在 'Bug B' 修成 lcs/max（8/65 ≈ 0.12 → 不命中）。本条是把这个既存漂移钉住的回归锚：任一端改动让两侧一致时，两端断言同时红 —— 届时删掉本条、把它提升进 block_match。issue #167 只做搬家不改行为，故此处记录而非修复。"
+    }
+  ]
+}

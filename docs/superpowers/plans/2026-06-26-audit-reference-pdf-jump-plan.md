@@ -341,7 +341,7 @@ def index_document(kb_id: str, doc_id: str, text: str, source_name: str = "",
         # 批量 embedding
         node_texts = [node.text or "" for node in all_nodes]
         with get_gpu_inference_lock():
-            embeddings = _embed_batch_with_retry(embed_model, node_texts)
+            embeddings = embed_batch_with_retry(embed_model, node_texts)
         for node, emb in zip(all_nodes, embeddings):
             node.embedding = emb
 

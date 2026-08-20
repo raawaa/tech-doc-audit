@@ -5,8 +5,11 @@ from pathlib import Path
 from typing import Optional
 import shutil
 
+from core.logger import get_logger
 from models.document import KBDocument
 from storage import atomic_write_json, validate_id
+
+_logger = get_logger(__name__)
 
 
 def get_data_dir() -> Path:
@@ -110,6 +113,55 @@ def find_doc_by_id(doc_id: str) -> Optional[KBDocument]:
         if doc:
             return doc
     return None
+
+
+def mark_doc_embedding_failed(
+    kb_id: str, doc_id: str, err: Optional[BaseException] = None,
+) -> None:
+    """把单篇 doc 的 ``embedding_status`` 标 ``failed``(ADR-0007 §3)。
+
+    这是该状态转移的**唯一公开入口**(issue #167)——历史上它藏在
+    ``core.index_manager._mark_doc_embedding_failed`` 里,放到 repo 层后
+    "谁在写 failed" 一次 grep 即可穷举。
+
+    失败原因写进 ``doc.metadata["embedding_error"]``,形如 ``TypeName: message``。
+    ``err=None`` 表示"标失败但没有具体异常"——此时**清掉**该键而不是留着上一次
+    的原因:``embedding_error`` 描述的是本次失败,留旧值会把运维引向错误的方向。
+
+    全程 best-effort:doc 不在 repo(脚本直调 ``index_documents_batch`` 等
+    场景)、读盘/写盘失败,一律 log warning 后返回,**不**抛——避免让批量流程
+    挂在 doc 元数据写不上。调用方 ``index_documents_batch`` 拿到 embedding
+    失败后用本函数记账,然后 ``continue`` 跳过这一稿、其余稿按正常流程跑。
+    """
+    try:
+        doc = get_doc(kb_id, doc_id)
+    except Exception as e:
+        _logger.warning(
+            "mark_doc_embedding_failed: failed to load doc %s for failure mark: %s",
+            doc_id, e,
+        )
+        return
+    if doc is None:
+        _logger.warning(
+            "mark_doc_embedding_failed: doc %s not in doc_repo; "
+            "cannot persist embedding_status=failed (caller may be a script)",
+            doc_id,
+        )
+        return
+    doc.embedding_status = "failed"
+    if not isinstance(doc.metadata, dict):
+        doc.metadata = {}
+    if err is None:
+        doc.metadata.pop("embedding_error", None)
+    else:
+        doc.metadata["embedding_error"] = f"{type(err).__name__}: {err}"
+    try:
+        _save_doc_meta(doc)
+    except Exception as e:
+        _logger.warning(
+            "mark_doc_embedding_failed: failed to persist failure mark for %s: %s",
+            doc_id, e,
+        )
 
 
 def delete_doc(kb_id: str, doc_id: str) -> bool:

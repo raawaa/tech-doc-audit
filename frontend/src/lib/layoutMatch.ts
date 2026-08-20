@@ -69,8 +69,12 @@ export function norm(s: string): string {
 /**
  * 字符级 LCS 长度（DP, Uint16Array），返回 ``lcs(a, b)`` 的字符数。
  * 时间 / 空间 O(n*m)。调用方负责 m/n 都别太大（典型 highlight 是几十字符）。
+ *
+ * 不做归一化 —— 与后端 ``core.text_norm.lcs_len`` 同契约（归一化由调用方
+ * 先跑）。导出是为了让 ``core/text_norm_fixtures.json`` 的 lcs_len 用例
+ * 两端共跑（issue #167）。
  */
-function lcsLen(a: string, b: string): number {
+export function lcsLen(a: string, b: string): number {
   const n = a.length
   const m = b.length
   if (!n || !m) return 0

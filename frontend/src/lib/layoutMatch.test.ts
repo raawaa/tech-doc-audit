@@ -1,11 +1,15 @@
 import { describe, it, expect } from 'vitest'
 import {
   norm,
+  lcsLen,
   lcsRatio,
   matchHighlightToBlocks,
   blockMatchesHighlight,
   type Block,
 } from './layoutMatch'
+// 与后端共享的唯一用例来源（issue #167）。后端由 tests/test_text_norm.py 加载
+// 同一份文件——任一端实现漂移，两端同时红。新增用例只加进 JSON。
+import fixtures from '../../../core/text_norm_fixtures.json'
 
 
 describe('norm', () => {
@@ -293,4 +297,57 @@ describe('blockMatchesHighlight', () => {
     expect(blockMatchesHighlight(makeBlock(scattered), '应急救援指挥中心')).toBe(false)
     expect(blockMatchesHighlight(makeBlock('第八条 应急救援指挥中心'), '应急救援指挥中心')).toBe(true)
   })
+})
+
+
+// ── 与后端共享的 JSON fixtures（issue #167）─────────────────────────────────
+//
+// 上面的 describe 块覆盖前端独有的关注点（bbox → 画布像素、多命中入 hits）。
+// 下面这一组只跑"算法本身"，用例与后端 tests/test_text_norm.py 逐条同源：
+// core/text_norm_fixtures.json 是唯一来源，改哪一端的实现都会让两端一起红。
+
+const fixtureBlock = (block_content: string): Block => ({
+  block_label: 'text',
+  block_content,
+  bbox_norm: [0.1, 0.1, 0.9, 0.2],  // 对 predicate 而言 bbox 无关
+  block_order: 0,
+})
+
+describe('shared fixtures: norm', () => {
+  for (const c of fixtures.norm) {
+    it(c.note, () => {
+      expect(norm(c.chunk)).toBe(c.expected)
+    })
+  }
+})
+
+describe('shared fixtures: lcsLen', () => {
+  for (const c of fixtures.lcs_len) {
+    it(c.note, () => {
+      expect(lcsLen(c.chunk, c.block)).toBe(c.expected)
+    })
+  }
+})
+
+describe('shared fixtures: T1/P2 block 判定', () => {
+  for (const c of fixtures.block_match) {
+    it(c.note, () => {
+      expect(blockMatchesHighlight(fixtureBlock(c.block), c.chunk)).toBe(
+        c.expected,
+      )
+    })
+  }
+})
+
+// 已知与后端不一致的判定：这里断言的是**当前行为**，不是期望行为。
+// 两端对齐的那天，本断言与 tests/test_text_norm.py 的对应断言会同时红——
+// 那时删掉 fixtures 里的这一条、把它提升进 block_match。
+describe('shared fixtures: 与后端的已知漂移', () => {
+  for (const c of fixtures.known_divergences) {
+    it(c.note, () => {
+      expect(blockMatchesHighlight(fixtureBlock(c.block), c.chunk)).toBe(
+        c.typescript,
+      )
+    })
+  }
 })
