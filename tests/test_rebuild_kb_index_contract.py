@@ -83,7 +83,13 @@ def test_rebuild_failure_writes_failed_with_error():
         "# 重建失败测试\n\n## 一章\n\n用于触发 KB rebuild 的失败路径。".encode(),
     )
 
-    with mock.patch("core.index_manager._persist", side_effect=IOError("disk gone")):
+    # Issue #168:per-KB 锁 + persist 已迁到 ``KBIndexStore``,所以 IO 异常
+    # 现在从 ``KBIndexStore._persist`` 抛出,而不是 ``core.index_manager._persist``
+    # (后者只是 backward-compat shim,真实落盘走 store)。
+    with mock.patch(
+        "core.kb_index_store.KBIndexStore._persist",
+        side_effect=IOError("disk gone"),
+    ):
         try:
             rebuild_kb_index(kb.id)
         except IOError:

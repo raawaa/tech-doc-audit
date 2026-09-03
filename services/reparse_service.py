@@ -20,11 +20,11 @@ import threading
 from typing import Optional
 
 from core.kb_index_status import KbIndexStatusWriter
+from core.kb_index_store import KBIndexStore
 from core.logger import get_logger
 from core.parse_document import parse_document, MIN_FULL_TEXT_CHARS, ParseResult
 from core.pages_store import save_pages
 from core.index_manager import (
-    _get_index_lock,
     index_document,
     remove_document,
 )
@@ -138,7 +138,9 @@ def _reparse_async(
 
     kb_writer.note_in_flight(doc.original_name)
 
-    with _get_index_lock(kb_id):
+    # Issue #168: per-KB 锁由 ``KBIndexStore`` 封装,外部通过
+    # ``acquire_write_lock()`` 拿 contextmanager(而非 RLock 对象)。
+    with KBIndexStore.open(kb_id).acquire_write_lock():
         try:
             parse_result = _parse_with_guards(doc_id, doc.file_path)
             _persist_index(kb_id, doc_id, parse_result, doc)

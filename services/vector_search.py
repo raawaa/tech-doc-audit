@@ -21,8 +21,8 @@ from core.index_manager import (
     remove_document as _remove_from_store,
     rebuild_kb_index as _rebuild_store,
     get_kb_index_built,
-    _get_index_lock,
 )
+from core.kb_index_store import KBIndexStore
 from core.logger import get_logger
 from core.pages_store import load_pages
 
@@ -210,7 +210,11 @@ def _ensure_kb_index(kb_id: str, sync_rebuild_for_audit: bool = False) -> bool:
         return True
 
     # 在 per-KB 锁内二次检查 + 触发重建
-    with _get_index_lock(kb_id):
+    # Issue #168: per-KB 锁已被 ``KBIndexStore`` 内部封装;外部不能直接拿到
+    # RLock 对象,只能通过 ``KBIndexStore.acquire_write_lock()`` 拿一个
+    # contextmanager —— 这是 issue #168 AC #3 "no external symbol exposes
+    # the lock" 的兑现。
+    with KBIndexStore.open(kb_id).acquire_write_lock():
         if get_kb_index_built(kb_id):
             return True  # 双检：另一线程可能刚完成
 
