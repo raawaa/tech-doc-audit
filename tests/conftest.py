@@ -139,8 +139,16 @@ def fake_models(monkeypatch):
     embed = _FakeEmbedder(dim=1024, model_name="fake-deterministic")
     llm = MagicMock(name="fake_llm")
 
-    # patch 所有顶层 import 了 getter 的模块 + 源模块
-    for mod_name in ("core.settings", "core.index_manager", "services.qa_service"):
+    # patch 所有顶层 import 了 getter 的模块 + 源模块。
+    # issue #169/PR-3:KBIndexWriter 是新的写入编排入口,需要单独 patch
+    # —— ``fake_models`` 的契约是"opt-in 的测试零模型加载",漏一处就
+    # 回到 SiliconFlow 真路径。后续若再拆出新模块也走这张表。
+    for mod_name in (
+        "core.settings",
+        "core.index_manager",
+        "core.kb_index_writer",
+        "services.qa_service",
+    ):
         try:
             mod = importlib.import_module(mod_name)
         except Exception:
