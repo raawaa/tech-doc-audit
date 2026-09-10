@@ -62,21 +62,9 @@ from core.settings import PADDLEOCR_PAGE_LIMIT, PDF_SPLIT_CHUNK_PAGES  # noqa: E
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
-def _make_blank_pdf(path: Path, page_count: int) -> Path:
-    """生成 ``page_count`` 页空白 PDF（不插文字 → 文字层空 → 走 PaddleOCR 路径）。
-
-    与 ``test_pymupdf_parse._make_text_only`` 的差别:这里不要 insert_text,
-    让 ``_is_text_layer_pdf`` 返回 False,以触发扫描件 → PaddleOCR 路径。
-    该 helper 同时承担"扫描件 PDF"的语义 —— 类名 ``TestSplitPages`` /
-    ``TestScratchCleanup`` 的命名已足够传达意图,不需要单独的
-    ``_make_scanned_split_pdf`` rename-only alias。
-    """
-    doc = pymupdf.open()
-    for _ in range(page_count):
-        doc.new_page(width=595, height=842)
-    doc.save(str(path))
-    doc.close()
-    return path
+# 共享 ``make_blank_pdf`` —— 抽到 ``tests/_pdf_helpers``(issue #177 收尾,
+# 避免 test_pdf_splitter 与 test_parse_document 各写一份)。
+from tests._pdf_helpers import make_blank_pdf as _make_blank_pdf  # noqa: E402
 
 
 def _chunk_offset_from_path(file_path: str) -> int:

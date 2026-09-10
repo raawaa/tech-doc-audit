@@ -17,14 +17,11 @@ from core.parse_document import (
     parse_document, _paddleocr_call, _is_text_layer_pdf,
 )
 
-# pymupdf 是页数对账测试（issue #177）造多页 PDF 与读取页数的唯一依赖；
-# 无 wheel 整文件 skip(与 test_pdf_splitter.py 同款契约)。
-try:
-    import pymupdf  # type: ignore[import-not-found]
-    _HAVE_PYMUPDF = True
-except Exception:
-    pymupdf = None  # type: ignore[assignment]
-    _HAVE_PYMUPDF = False
+# pymupdf 与 ``make_blank_pdf`` helper 从 ``tests/_pdf_helpers`` 拿(issue #177)。
+# 无 wheel 整文件 skip 由各测试 ``@pytest.mark.requires_pymupdf`` + ``pytest.skip``
+# 显式表达,与本文件既有 ``test_is_text_layer_pdf_*`` 测试同款契约。
+import pymupdf  # noqa: E402  -- fake OCR + 文字层 PDF 都要直接用
+from tests._pdf_helpers import make_blank_pdf as _make_blank_pdf  # noqa: E402
 
 
 # ── marker 声明（与 test_reparse_service.py / test_kb_reparse_e2e.py 对齐）────────
@@ -273,22 +270,7 @@ def test_pdf_use_cache_false_skips_cache_lookup(tmp_path, monkeypatch):
 #   AC4 — pdf_page_count 仅在缓存命中路径上调用一次;新解析路径不重复调
 
 
-def _make_blank_pdf(path: Path, page_count: int) -> Path:
-    """生成 ``page_count`` 页空白 PDF（不插文字 → 文字层空 → 扫描件 → 走 PaddleOCR）。
-    本地 helper;与 ``test_pdf_splitter._make_blank_pdf`` 同语义,不复用避免跨文件
-    拉取私有 fixture。
-    """
-    if not _HAVE_PYMUPDF:
-        pytest.skip("pymupdf wheel not installed")
-    doc = pymupdf.open()
-    for _ in range(page_count):
-        doc.new_page(width=595, height=842)
-    doc.save(str(path))
-    doc.close()
-    return path
-
-
-@pytest.mark.skipif(not _HAVE_PYMUPDF, reason="pymupdf wheel not installed")
+@pytest.mark.requires_pymupdf
 def test_reconciliation_truncated_cache_reparses(tmp_path, monkeypatch):
     """AC1 — 预置 100 页缓存 + 真 247 页 PDF → 二次 parse_document 不命中缓存,
     落解析 + 写一条 len(by_page) == 247 的新条目（覆盖旧条目）。
@@ -342,7 +324,7 @@ def test_reconciliation_truncated_cache_reparses(tmp_path, monkeypatch):
     )
 
 
-@pytest.mark.skipif(not _HAVE_PYMUPDF, reason="pymupdf wheel not installed")
+@pytest.mark.requires_pymupdf
 def test_reconciliation_matching_cache_hits(tmp_path, monkeypatch):
     """AC2 — by_page 与源 PDF 页数相等的缓存 + 同源 PDF → 二次 parse_document
     命中缓存,零 PaddleOCR 调用（_explode 不触发）。
@@ -381,45 +363,12 @@ def test_reconciliation_matching_cache_hits(tmp_path, monkeypatch):
     assert pr.full_text == "full match"
 
 
-@pytest.mark.skipif(not _HAVE_PYMUPDF, reason="pymupdf wheel not installed")
-def test_reconciliation_skipped_when_page_count_unreadable(tmp_path, monkeypatch):
-    """AC3 强化 — 损坏 / 加密 / 非 PDF 缓存条目仍然命中（pdf_page_count 返回 None
-    → 跳过对账）。既有 ``test_pdf_cache_hit_skips_paddleocr`` 已用 ``%PDF-1.4 dummy``
-    触发;本测试再加一条"条目 by_page 与 mtime 故意不一致"的极端边界,
-    确认对账只在 pdf_page_count 返回 int 时才生效,None 即跳过。
-    """
-    from core import paddleocr_cache as cache_module
-
-    cache_dir = tmp_path / "cache"
-    cache_dir.mkdir()
-    monkeypatch.setattr(cache_module, "get_cache_dir", lambda: cache_dir)
-
-    # 写入一个损坏 PDF —— pymupdf 打不开 → pdf_page_count 返回 None
-    corrupt = tmp_path / "corrupt.pdf"
-    corrupt.write_bytes(b"%PDF-1.4 dummy not a real pdf")
-
-    cached_payload = {
-        "by_page": [PageText(page=0, text="cached text").__dict__],
-        "full_text": "cached text",
-        "layout": [],
-    }
-    cache_module.save_cached(str(corrupt), cached_payload, source="paddleocr")
-
-    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: True)
-
-    def _explode(*a, **k):
-        raise AssertionError("corrupt PDF cache must hit without OCR call")
-
-    monkeypatch.setattr(pd_module, "_paddleocr_call", _explode)
-    monkeypatch.setattr(pd_module, "_paddleocr_parse", _explode)
-
-    # pdf_page_count 返回 None → 跳过对账 → 命中缓存
-    pr = parse_document(str(corrupt))
-    assert pr.full_text == "cached text"
-    assert pr.by_page[0].text == "cached text"
+# AC3（损坏 PDF 缓存仍命中）由既有 ``test_pdf_cache_hit_skips_paddleocr``
+# 用 ``b"%PDF-1.4 dummy"`` 覆盖 —— spec 明确要求该测试**无需改动**通过,
+# 不在本提交里再加一份。
 
 
-@pytest.mark.skipif(not _HAVE_PYMUPDF, reason="pymupdf wheel not installed")
+@pytest.mark.requires_pymupdf
 def test_reconciliation_calls_pdf_page_count_once_on_cache_hit(tmp_path, monkeypatch):
     """AC4 — 缓存命中路径上 ``pdf_page_count`` 调一次。
 
@@ -465,7 +414,7 @@ def test_reconciliation_calls_pdf_page_count_once_on_cache_hit(tmp_path, monkeyp
     )
 
 
-@pytest.mark.skipif(not _HAVE_PYMUPDF, reason="pymupdf wheel not installed")
+@pytest.mark.requires_pymupdf
 def test_reconciliation_does_not_call_pdf_page_count_from_parse_pdf_on_cache_miss(
     tmp_path, monkeypatch,
 ):

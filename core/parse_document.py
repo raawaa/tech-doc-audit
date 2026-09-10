@@ -206,14 +206,9 @@ def _parse_pdf(file_path: str, *, use_cache: bool) -> ParseResult:
         cached = get_cached(file_path)
 
     if cached is not None:
-        # 页数对账（issue #177）："#87 之前的假成功"截断缓存（仅前 100 页）
-        # 在 ``#173`` 的拆分裂缝之前是合法的命中态；现在若能读出源 PDF 物理
-        # 页数 ``n``,比对 ``len(cached["by_page"])``——少于 ``n`` 即视为截断,
-        # 降级为未命中,落到下面的解析路径（超限则走 T03 splitter）。
-        # ``pdf_page_count`` 读不出（损坏 / 加密 / 非 PDF / pymupdf 不可用）→
-        # 返回 ``None``,跳过对账,信任缓存 —— 与既有 happy path 行为兼容。
+        # 契约 #7 页数对账（issue #177）：截断缓存判废 + 落解析 + 写覆盖。
         n = pdf_page_count(file_path)
-        if n is not None and len(cached.get("by_page", [])) < n:
+        if n is not None and len(cached["by_page"]) < n:
             cached = None
 
     if cached is not None:
