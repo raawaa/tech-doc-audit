@@ -18,7 +18,7 @@ class KBDocument(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     embedding_status: Literal[
-        "none", "pending_index", "indexing", "embedded", "failed"
+        "none", "pending_index", "indexing", "embedded", "failed", "truncated"
     ] = "none"
     content_hash: Optional[str] = None  # SHA-256 of raw file bytes, for dedup
     metadata: dict = Field(default_factory=dict)

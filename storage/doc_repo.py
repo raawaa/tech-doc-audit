@@ -160,6 +160,49 @@ def mark_doc_embedding_failed(
         )
 
 
+def mark_doc_embedding_truncated(kb_id: str, doc_id: str) -> None:
+    """把单篇 doc 的 ``embedding_status`` 标 ``truncated``（spec #173 / issue #175）。
+
+    与 ``mark_doc_embedding_failed`` 并列，是该状态转移的**唯一公开入口**——
+    历史上 ``fake_success`` 是判断而非状态，服务端静默截断过 N 页的 doc 现在
+    用这个值表达"存着的结果被悄悄截短了"。两条入口各司其职，**不**给
+    ``mark_doc_embedding_failed`` 加 ``status=`` 字符串 kwarg（每个入口单一职责）。
+
+    故意不写失败原因：truncated 不是"这次解析炸了"，而是"历史缓存 / 历史
+    解析结果与源 PDF 页数对不上"。留个猜不出来的 ``embedding_error`` 串
+    反而把运维引向错误的方向。后续 ``repair_truncated.py`` 命中后会把状态
+    自然推到 ``embedded``（重解析走 ``reparse_one`` 全流程），无需在
+    truncated 状态上记额外原因。
+
+    全程 best-effort：doc 不在 repo（脚本直调 ``index_documents_batch``
+    等场景）、读盘 / 写盘失败，一律 log warning 后返回，**不**抛 —— 与
+    ``mark_doc_embedding_failed`` 同口径：失败态写不上不该反过来打断整批。
+    """
+    try:
+        doc = get_doc(kb_id, doc_id)
+    except Exception as e:
+        _logger.warning(
+            "mark_doc_embedding_truncated: failed to load doc %s for truncated mark: %s",
+            doc_id, e,
+        )
+        return
+    if doc is None:
+        _logger.warning(
+            "mark_doc_embedding_truncated: doc %s not in doc_repo; "
+            "cannot persist embedding_status=truncated (caller may be a script)",
+            doc_id,
+        )
+        return
+    doc.embedding_status = "truncated"
+    try:
+        _save_doc_meta(doc)
+    except Exception as e:
+        _logger.warning(
+            "mark_doc_embedding_truncated: failed to persist truncated mark for %s: %s",
+            doc_id, e,
+        )
+
+
 def delete_doc(kb_id: str, doc_id: str) -> bool:
     meta_path = _doc_meta_file(kb_id, doc_id)
     if meta_path.exists():

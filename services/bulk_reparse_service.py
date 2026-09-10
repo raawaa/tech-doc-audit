@@ -63,8 +63,12 @@ PER_DOC_TIMEOUT_S = 1800
 # 默认并发（issue #87 决议 γ）。
 DEFAULT_CONCURRENCY = 4
 
-# embedding 终态：成功 / 失败，轮询结束条件。
-_TERMINAL_STATUSES = {"embedded", "failed", "none"}
+# embedding 终态：成功 / 失败 / 不可考 / 被截断，轮询结束条件。
+# ``truncated``（spec #173 / issue #175）—— 历史上 PaddleOCR SaaS 对 >100 页 PDF
+# 静默截断留下的"假成功"状态，``repair_truncated.py`` 把它标出来、等下一次
+# 批量重解析自然接手。被纳入终态而不是触发继续轮询，避免单篇等满 30 分钟
+# 超时仍报 "timeout"。
+_TERMINAL_STATUSES = {"embedded", "failed", "none", "truncated"}
 
 # 轮询间隔（秒）。模块级常量便于测试压缩等待。
 _POLL_INTERVAL_S = 2.0

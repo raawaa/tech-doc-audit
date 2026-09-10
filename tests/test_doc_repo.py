@@ -1,14 +1,21 @@
-"""``storage.doc_repo`` 的失败态转移测试(issue #167)。
+"""``storage.doc_repo`` 的失败态 / 截断态转移测试(issue #167 / #175)。
 
 ``mark_doc_embedding_failed`` 是 doc ``embedding_status="failed"`` 的**唯一
 公开入口**(ADR-0007 §3 每稿隔离)。取代历史上藏在
 ``core.index_manager._mark_doc_embedding_failed`` 的私有实现——放在 repo 层
 后,"谁在写 failed"用一次 grep 就能穷举。
 
+``mark_doc_embedding_truncated``（spec #173 / issue #175）—— 与
+``mark_doc_embedding_failed`` 并列,是 ``embedding_status="truncated"`` 的
+唯一公开入口。两条入口各司其职,**不**给 ``mark_doc_embedding_failed`` 加
+``status=`` 字符串 kwarg。
+
 契约要点:best-effort。doc 不在 repo(脚本直调 ``index_documents_batch``)、
 读盘/写盘出错,一律 log warning 后返回,**不抛** —— 让批量流程挂在"元数据
 写不上"是本末倒置。
 """
+import json
+
 import pytest
 
 import storage.doc_repo as doc_repo
@@ -138,3 +145,90 @@ def test_repairs_non_dict_metadata(monkeypatch):
 
     assert captured["doc"].metadata == {"embedding_error": "ValueError: boom"}
     assert captured["doc"].embedding_status == "failed"
+
+
+# ── ``embedding_status="truncated"`` 状态转移（spec #173 / issue #175）───────────
+
+
+def test_kb_document_truncated_round_trips_through_disk():
+    """``embedding_status="truncated"`` 能构造 + 落盘 + 读回不变（验收 #1）。"""
+    doc = _seed_doc(embedding_status="truncated")
+
+    on_disk = json.loads(doc_repo._doc_meta_file(_KB_ID, doc.id).read_text(encoding="utf-8"))
+    assert on_disk["embedding_status"] == "truncated"
+
+    reloaded = doc_repo.get_doc(_KB_ID, doc.id)
+    assert reloaded is not None
+    assert reloaded.embedding_status == "truncated"
+
+
+def test_marks_status_truncated():
+    """正路：落盘的 doc 状态转 truncated，与 ``mark_doc_embedding_failed`` 并列。"""
+    _seed_doc(embedding_status="embedded")
+
+    doc_repo.mark_doc_embedding_truncated(_KB_ID, "doc_1")
+
+    saved = doc_repo.get_doc(_KB_ID, "doc_1")
+    assert saved.embedding_status == "truncated"
+
+
+def test_truncated_does_not_clobber_existing_metadata():
+    """truncated 入口不读 ``embedding_error``，不动 doc 上其它 metadata。"""
+    _seed_doc(metadata={"page_count_source": "paddleocr"})
+
+    doc_repo.mark_doc_embedding_truncated(_KB_ID, "doc_1")
+
+    saved = doc_repo.get_doc(_KB_ID, "doc_1")
+    assert saved.embedding_status == "truncated"
+    assert saved.metadata == {"page_count_source": "paddleocr"}
+    assert "embedding_error" not in saved.metadata
+
+
+def test_missing_doc_is_a_noop_for_truncated_marker():
+    """doc 不在 repo（脚本直调批量索引）→ warning 后跳过，不抛、不建文件。"""
+    doc_repo.mark_doc_embedding_truncated(_KB_ID, "doc_absent")
+
+    assert doc_repo.get_doc(_KB_ID, "doc_absent") is None
+
+
+def test_load_failure_does_not_raise_for_truncated_marker(monkeypatch):
+    """读 doc 出错 → 吞掉，批量流程继续。"""
+    _seed_doc()
+
+    def _boom(kb_id, doc_id):
+        raise OSError("meta 读到一半")
+
+    monkeypatch.setattr(doc_repo, "get_doc", _boom)
+    doc_repo.mark_doc_embedding_truncated(_KB_ID, "doc_1")
+
+
+def test_persist_failure_does_not_raise_for_truncated_marker(monkeypatch):
+    """写 doc meta 出错 → 吞掉。截断态写不上不该反过来打断整批。"""
+    _seed_doc()
+
+    def _boom(doc):
+        raise OSError("磁盘满")
+
+    monkeypatch.setattr(doc_repo, "_save_doc_meta", _boom)
+    doc_repo.mark_doc_embedding_truncated(_KB_ID, "doc_1")
+
+
+def test_truncated_marker_does_not_touch_failed_marker_path():
+    """``mark_doc_embedding_failed`` / ``mark_doc_embedding_truncated`` 互不污染：
+    ``failed`` 入口依旧写 ``embedding_error``，``truncated`` 入口不写。
+
+    这两条入口按"一个状态、一个函数"原则维持对称，不给 ``failed`` 加
+    ``status=`` kwarg（spec #175 显式拒绝）。
+    """
+    _seed_doc(embedding_status="indexing")
+
+    doc_repo.mark_doc_embedding_failed(_KB_ID, "doc_1", ValueError("boom"))
+    saved_failed = doc_repo.get_doc(_KB_ID, "doc_1")
+    assert saved_failed.embedding_status == "failed"
+    assert saved_failed.metadata.get("embedding_error") == "ValueError: boom"
+
+    doc_repo.mark_doc_embedding_truncated(_KB_ID, "doc_1")
+    saved_truncated = doc_repo.get_doc(_KB_ID, "doc_1")
+    assert saved_truncated.embedding_status == "truncated"
+    # truncated 不读 embedding_error，但显式失败原因应保留作历史审计线索
+    assert saved_truncated.metadata.get("embedding_error") == "ValueError: boom"

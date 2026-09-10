@@ -367,6 +367,78 @@ def test_reparse_one_times_out_without_terminal_status(kb, monkeypatch):
     assert (doc_id, outcome) == (doc.id, "timeout")
 
 
+# ── ``embedding_status="truncated"`` 进入终态机（spec #173 / issue #175）─────────
+
+
+def test_terminal_statuses_includes_truncated():
+    """``_TERMINAL_STATUSES`` 含 ``truncated``（验收 #3）—— 否则 ``_wait_for_terminal``
+    会把它当作"非终态"继续轮询,白白等满 30 分钟超时。
+    """
+    from services import bulk_reparse_service as svc
+
+    assert "truncated" in svc._TERMINAL_STATUSES
+    # 老成员一个都不丢
+    assert {"embedded", "failed", "none"} <= svc._TERMINAL_STATUSES
+
+
+def test_reparse_one_returns_truncated_when_doc_marked_truncated(kb, monkeypatch):
+    """验收 #4：把一篇 doc 标 ``truncated`` 然后调 ``reparse_one``，``_wait_for_terminal``
+    返回 ``"truncated"`` 而非 ``"timeout"``。
+    """
+    from services import bulk_reparse_service as svc
+
+    doc = _add_doc(kb.id, "truncated.pdf", embedding_status="failed", page_count=3)
+    monkeypatch.setattr(svc, "_POLL_INTERVAL_S", 0.01)
+
+    def _fake(doc_id: str, **_kwargs):
+        # 模拟 ``repair_truncated.py`` 的副作用:把 doc 标 truncated。
+        # 走 ``mark_doc_embedding_truncated`` 公开入口 —— 与 T07 脚本同款姿势，
+        # 让"谁在写 truncated"在测试里也走唯一公开入口，不留私货。
+        d = doc_repo.find_doc_by_id(doc_id)
+        doc_repo.mark_doc_embedding_truncated(d.kb_id, doc_id)
+        return {"status": "pending_index", "doc_id": doc_id}
+
+    monkeypatch.setattr(svc, "reparse_document", _fake)
+
+    doc_id, outcome = svc.reparse_one(kb.id, doc, timeout_s=5.0)
+
+    assert (doc_id, outcome) == (doc.id, "truncated")
+
+
+def test_list_target_docs_picks_up_truncated_docs(kb):
+    """验收 #5：``list_target_docs`` 把 ``truncated`` doc 收进 target 集 —— 走规则 1
+    （``embedding_status != "embedded"``），三条选取规则本身不需显式扩充。
+
+    这正是 spec #175 把 truncated 与 failed / pending_index 同列为"待修"的
+    用意：规则 1 已经把它们一网打尽。
+    """
+    from services import bulk_reparse_service as svc
+
+    truncated = _add_doc(kb.id, "truncated.pdf", embedding_status="truncated", pages=_good_pages())
+    _add_doc(kb.id, "healthy.pdf", embedding_status="embedded", pages=_good_pages())
+
+    targets = svc.list_target_docs(kb.id)
+
+    assert [t.doc.id for t in targets] == [truncated.id]
+    assert targets[0].reason == svc.REASON_NOT_EMBEDDED
+
+
+def test_list_target_docs_mixes_truncated_with_other_unembedded(kb):
+    """truncated 与 failed / pending_index 共存 → 全部按规则 1 入选,
+    按文档遍历顺序保留。"""
+    from services import bulk_reparse_service as svc
+
+    failed = _add_doc(kb.id, "failed.pdf", embedding_status="failed", pages=_good_pages())
+    truncated = _add_doc(kb.id, "truncated.pdf", embedding_status="truncated", pages=_good_pages())
+    pending = _add_doc(kb.id, "pending.pdf", embedding_status="pending_index", pages=_good_pages())
+    _add_doc(kb.id, "healthy.pdf", embedding_status="embedded", pages=_good_pages())
+
+    targets = svc.list_target_docs(kb.id)
+
+    assert {t.doc.id for t in targets} == {failed.id, truncated.id, pending.id}
+    assert {t.reason for t in targets} == {svc.REASON_NOT_EMBEDDED}
+
+
 # ── KB 级检索状态稳定性（issue #109 / #147 / #154）─────────────────────────────
 #
 # 批量跑到一半时 KB **不可能**"此刻可被向量检索"。#93 实测下每完成一篇就写回
