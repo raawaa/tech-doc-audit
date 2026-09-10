@@ -29,6 +29,27 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 # 默认 100MB，通过 MAX_UPLOAD_SIZE_MB 环境变量可调整
 MAX_UPLOAD_SIZE = int(os.environ.get("MAX_UPLOAD_SIZE_MB", "100")) * 1024 * 1024
 
+# ── PaddleOCR / PDF 拆分（issue #174 / spec §B §C）──────────────────────────────
+# 把 spec §B 与 §C 用到的所有配置与常量收在同一个 import 点；
+# 后续拆分 / 检测 / bulk 集成层唯一依赖的"符号源"。
+# PaddleOCR SaaS 上限：源 PDF 物理页数 > 此值即触发分块解析路径（#173 splitter 把 PDF
+# 切成 ≤ `PDF_SPLIT_CHUNK_PAGES` 的子块逐个喂 OCR，再按源物理页号缝合）。
+# 注意：旧的 issue #87 把这条用作"超限即 skipped"拦截线 —— #173 把语义翻转为
+# "超限即分块"，但消费侧（bulk_reparse_service 当前的 skipped 路径）会在后续
+# ticket 里跟着迁移；这里写的是**最终语义**，与 consumer 是否已迁移无关。
+PADDLEOCR_PAGE_LIMIT = int(os.environ.get("PADDLEOCR_PAGE_LIMIT", "100"))
+# 单块页数上限：splitter 把超限 PDF 拆成的每个子块不超过该页数（默认 99，留 1 页
+# 安全余量低于 `PADDLEOCR_PAGE_LIMIT`，确保子块不被 SaaS 二次截断）。
+PDF_SPLIT_CHUNK_PAGES = int(os.environ.get("PDF_SPLIT_CHUNK_PAGES", "99"))
+# 临时目录回收年龄（小时）：拆分产物暂存超过该时长即视为过期、清理。
+PDF_SPLIT_SCRATCH_TTL_HOURS = int(os.environ.get("PDF_SPLIT_SCRATCH_TTL_HOURS", "24"))
+# 拆分成本阈值（页）：单篇预估 OCR 页数 > 此值的 doc 在 bulk reparse 里进 skipped
+# （reason ``split_cost_exceeded``），避免一篇异常大的 PDF 静默吃掉一天配额
+# （#173 story 28）。``--force`` 不能绕过；显式 ``--ignore-cost-limit`` 才可。
+BULK_REPARSE_SPLIT_COST_LIMIT_PAGES = int(
+    os.environ.get("BULK_REPARSE_SPLIT_COST_LIMIT_PAGES", "20000")
+)
+
 from llama_index.core import Settings
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.callbacks import CallbackManager, LlamaDebugHandler

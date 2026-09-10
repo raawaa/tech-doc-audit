@@ -24,6 +24,7 @@ import pytest
 import storage.doc_repo as doc_repo
 import storage.kb_repo as kb_repo
 from core import paddleocr_cache, pages_store
+from core.settings import PADDLEOCR_PAGE_LIMIT
 from models.knowledge_base import KnowledgeBase
 
 
@@ -229,17 +230,17 @@ def test_estimate_counts_corrupt_cache_entry_as_uncached(kb):
 
 
 def test_over_page_limit_doc_lands_in_warnings_and_is_billed_at_page_limit(kb):
-    """超 ``PAGE_LIMIT`` → 进 ``over_page_limit`` 清单；成本按 PAGE_LIMIT 封顶（服务端会截断）。"""
+    """超 ``PADDLEOCR_PAGE_LIMIT`` → 进 ``over_page_limit`` 清单；成本按 ``PADDLEOCR_PAGE_LIMIT`` 封顶（服务端会截断）。"""
     from services import bulk_reparse_service as svc
 
-    doc = _add_doc(kb.id, "huge.pdf", embedding_status="failed", page_count=svc.PAGE_LIMIT + 50)
+    doc = _add_doc(kb.id, "huge.pdf", embedding_status="failed", page_count=PADDLEOCR_PAGE_LIMIT + 50)
 
     cost = svc.estimate_ocr_cost(svc.list_target_docs(kb.id))
 
     assert [over.doc.id for over in cost.over_page_limit] == [doc.id]
-    assert cost.over_page_limit[0].page_count == svc.PAGE_LIMIT + 50
+    assert cost.over_page_limit[0].page_count == PADDLEOCR_PAGE_LIMIT + 50
     assert cost.over_page_limit[0].reason == svc.SKIP_REASON_PAGE_LIMIT
-    assert cost.pages_uncached == svc.PAGE_LIMIT
+    assert cost.pages_uncached == PADDLEOCR_PAGE_LIMIT
 
 
 def test_split_by_page_limit_separates_runnable_from_skipped(kb):
@@ -247,14 +248,14 @@ def test_split_by_page_limit_separates_runnable_from_skipped(kb):
     from services import bulk_reparse_service as svc
 
     small = _add_doc(kb.id, "small.pdf", embedding_status="failed", page_count=10)
-    huge = _add_doc(kb.id, "huge.pdf", embedding_status="failed", page_count=svc.PAGE_LIMIT + 1)
+    huge = _add_doc(kb.id, "huge.pdf", embedding_status="failed", page_count=PADDLEOCR_PAGE_LIMIT + 1)
 
     runnable, skipped = svc.split_by_page_limit(svc.list_target_docs(kb.id))
 
     assert [t.doc.id for t in runnable] == [small.id]
     assert [s.doc.id for s in skipped] == [huge.id]
     assert skipped[0].reason == svc.SKIP_REASON_PAGE_LIMIT
-    assert skipped[0].page_count == svc.PAGE_LIMIT + 1
+    assert skipped[0].page_count == PADDLEOCR_PAGE_LIMIT + 1
 
 
 # ── 批量编排 ───────────────────────────────────────────────────────────────────
@@ -314,7 +315,7 @@ def test_run_bulk_reparse_skips_over_page_limit_without_raising(kb, monkeypatch)
     huge = _add_doc(kb.id, "huge.pdf", embedding_status="failed")
     small = _add_doc(kb.id, "small.pdf", embedding_status="failed", page_count=3)
     svc = _stub_reparse(monkeypatch, {})
-    huge.page_count = svc.PAGE_LIMIT + 1
+    huge.page_count = PADDLEOCR_PAGE_LIMIT + 1
     doc_repo._save_doc_meta(huge)
 
     result = svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
@@ -636,7 +637,7 @@ def test_bulk_run_with_nothing_runnable_leaves_kb_status_untouched(kb, monkeypat
     """
     huge = _add_doc(kb.id, "huge.pdf", embedding_status="failed")
     svc, _observed, _calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
-    huge.page_count = svc.PAGE_LIMIT + 1
+    huge.page_count = PADDLEOCR_PAGE_LIMIT + 1
     doc_repo._save_doc_meta(huge)
     before = kb_repo.get(kb.id).index_status
     writer_calls = _spy_kb_writer(monkeypatch)

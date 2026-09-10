@@ -29,6 +29,7 @@ import storage.kb_repo as kb_repo
 from core import bulk_reparse_report_store, paddleocr_cache, pages_store
 from core.kb_index_store import KBIndexStore
 from core.kb_index_writer import KBIndexWriter
+from core.settings import PADDLEOCR_PAGE_LIMIT
 from models.knowledge_base import KnowledgeBase
 
 
@@ -308,7 +309,7 @@ def test_report_lists_skipped_docs_instead_of_dropping_them(kb, monkeypatch):
     """超页数上限的 doc 出现在报告里，带原因与页数 —— 跳过不许静默（AC 5）。"""
     from services import bulk_reparse_service as _svc
 
-    huge = _add_doc(kb.id, "huge.pdf", page_count=_svc.PAGE_LIMIT + 20)
+    huge = _add_doc(kb.id, "huge.pdf", page_count=PADDLEOCR_PAGE_LIMIT + 20)
     small = _add_doc(kb.id, "small.pdf", page_count=2)
     svc = _stub_reparse(monkeypatch, on_parse=lambda d: pages_store.save_pages(kb.id, d.id, _pages(2)))
 
@@ -319,7 +320,7 @@ def test_report_lists_skipped_docs_instead_of_dropping_them(kb, monkeypatch):
             "doc_id": huge.id,
             "original_name": "huge.pdf",
             "reason": svc.SKIP_REASON_PAGE_LIMIT,
-            "page_count": svc.PAGE_LIMIT + 20,
+            "page_count": PADDLEOCR_PAGE_LIMIT + 20,
         }
     ]
     assert report["counts"] == {"done": 1, "failed": 0, "skipped": 1}

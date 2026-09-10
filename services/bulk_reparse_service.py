@@ -9,7 +9,7 @@
 2. **OCR 成本预检** —— 按 ``(content_hash, model_version)`` 探测缓存条目，
    区分命中 / 未命中。**无副作用**。历史 ``source=fallback_pdfplumber`` 条目
    （#99/05 之前残留）现在算命中：``get_cached`` 已不再判废，清理是单独工单。
-3. **页数上限分类** —— 超 ``PAGE_LIMIT`` 的文档会被解析器服务端截断（issue #87
+3. **页数上限分类** —— 超 ``PADDLEOCR_PAGE_LIMIT`` 的文档会被解析器服务端截断（issue #87
    决议），预检里作为警告呈现、实际 run 里进 ``skipped``。
 4. **受控并发编排** —— 线程池限流 + 单篇轮询超时，单篇失败不中断整批。
 5. **KB 级检索状态** —— 整批期间把 KB 按在 ``building``，终态末尾写一次
@@ -39,6 +39,7 @@ import storage.kb_repo as kb_repo
 from core import bulk_reparse_report_store, paddleocr_cache, pages_store
 from core.kb_index_status import KbIndexStatusWriter
 from core.logger import get_logger
+from core.settings import PADDLEOCR_PAGE_LIMIT
 from models.document import KBDocument
 from services.reparse_service import reparse_document
 
@@ -47,9 +48,9 @@ _logger = get_logger(__name__)
 
 # ── 常量 ───────────────────────────────────────────────────────────────────────
 
-# 单文件页数上限：超过此值按 PaddleOCR 服务端约定会被截断（issue #87 决议）。
-# 预检中仅警告；实际 run 中跳过（不静默丢内容）。
-PAGE_LIMIT = 100
+# ``PADDLEOCR_PAGE_LIMIT`` 由 ``core.settings`` 集中管理（issue #174 / spec §B）。
+# 本模块当前消费侧仍是 issue #87 的"超限即 skipped"路径；#173 把这条线的最终语义
+# 翻转为"超限即触发分块解析"，消费侧的迁移在后续 ticket 里完成。
 
 # 默认估算：未带 page_count 元数据的 doc，按此页数估算 OCR 成本。
 # 虹桥公司制度 KB 实测均值 10.93 / 中位 9（research/ocr-cache-hit-estimate.md）。
@@ -74,7 +75,10 @@ REASON_MISSING_PAGES = "missing_pages"
 REASON_EMPTY_LAYOUT = "empty_layout"
 REASON_FORCED = "forced"
 
-# 跳过原因。
+# 跳过原因（字符串值 ``"page_limit"`` 是写入报告 / API JSON 的 wire 格式，**不改**）。
+# 注：#173 计划把这条重命名为 ``SKIP_REASON_SPLIT_COST_EXCEEDED = "split_cost_exceeded"``
+# （语义从"超 PADDLEOCR_PAGE_LIMIT"翻转到"超拆分成本阈值"），不在本 ticket（T01
+# 术语底座）范围；这里保留旧名以免消费侧做两次 rename。
 SKIP_REASON_PAGE_LIMIT = "page_limit"
 
 # 实测 OCR 消耗的两个**非解析器**分桶名（其余分桶名直接就是缓存条目的 ``source``：
@@ -111,7 +115,7 @@ class ReparseTarget:
 
     @property
     def over_page_limit(self) -> bool:
-        return self.estimated_page_count > PAGE_LIMIT
+        return self.estimated_page_count > PADDLEOCR_PAGE_LIMIT
 
 
 @dataclass(frozen=True)
@@ -260,8 +264,8 @@ def estimate_ocr_cost(targets: Sequence[ReparseTarget]) -> OcrCostEstimate:
     for target in targets:
         if target.over_page_limit:
             over_page_limit.append(_as_skipped(target))
-            # 超限 doc：服务端会截断，按 PAGE_LIMIT 计费更保守。
-            billed_pages = PAGE_LIMIT
+            # 超限 doc：服务端会截断，按 PADDLEOCR_PAGE_LIMIT 计费更保守。
+            billed_pages = PADDLEOCR_PAGE_LIMIT
         else:
             billed_pages = target.estimated_page_count
 
@@ -300,7 +304,7 @@ def is_cache_hit(doc: KBDocument) -> bool:
 def split_by_page_limit(
     targets: Sequence[ReparseTarget],
 ) -> tuple[list[ReparseTarget], list[SkippedDoc]]:
-    """把目标清单切成"会跑"与"会跳过（超 ``PAGE_LIMIT``）"两半。
+    """把目标清单切成"会跑"与"会跳过（超 ``PADDLEOCR_PAGE_LIMIT``）"两半。
 
     dry-run 用它渲染"会被跳过"的警告；实际 run 用它决定谁进线程池。同一份规则。
     """
@@ -407,7 +411,7 @@ def run_bulk_reparse(
 ) -> BulkReparseResult:
     """受控并发跑完一批待重解析文档，返回终态统计并落盘一份**批量重新解析报告**。
 
-    - 超 ``PAGE_LIMIT`` 的文档不触发，直接进 ``skipped``（带原因）。
+    - 超 ``PADDLEOCR_PAGE_LIMIT`` 的文档不触发，直接进 ``skipped``（带原因）。
     - 单篇失败 / 超时 / 抛异常都只记账，不中断整批。
     - 每篇跑完立刻回读它的解析来源，进 run log 也进实测分桶（#110）。
     - 整批期间 KB 被按在 ``building``，终态在末尾写一次（由

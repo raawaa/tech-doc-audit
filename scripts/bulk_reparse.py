@@ -50,6 +50,7 @@ if _env_path.exists():
 os.environ.setdefault("AUDIT_DATA_DIR", "data")
 
 import storage.kb_repo as kb_repo
+from core.settings import PADDLEOCR_PAGE_LIMIT
 from services import bulk_reparse_service as bulk_svc
 
 
@@ -64,7 +65,7 @@ def _print_header(kb, kb_id: str, targets, cost, concurrency: int) -> None:
     print(f"预估 OCR 页数: {cost.pages_uncached} 页（缓存命中页 {cost.pages_cached} 不消耗）")
     print(f"并发: {concurrency}")
     if cost.over_page_limit:
-        print(f"⚠️  超 PAGE_LIMIT={bulk_svc.PAGE_LIMIT} 的 doc ({len(cost.over_page_limit)} 篇)：")
+        print(f"⚠️  超 PADDLEOCR_PAGE_LIMIT={PADDLEOCR_PAGE_LIMIT} 的 doc ({len(cost.over_page_limit)} 篇)：")
         for over in cost.over_page_limit:
             print(f"   - {over.doc.id} ({over.doc.original_name}) 约 {over.page_count} 页")
     print("=" * 70)
@@ -86,7 +87,7 @@ def _print_summary(result) -> None:
     print(f"完成统计：")
     print(f"  done:    {len(result.done)}")
     print(f"  failed:  {len(result.failed)}")
-    print(f"  skipped: {len(result.skipped)} （超 PAGE_LIMIT={bulk_svc.PAGE_LIMIT}）")
+    print(f"  skipped: {len(result.skipped)} （超 PADDLEOCR_PAGE_LIMIT={PADDLEOCR_PAGE_LIMIT}）")
 
     # 预估 vs 实测并排 —— #91 那次"报 1694 页、实际 0 页"的指纹就在这两行的差值里。
     # 差异不拦截，只呈现（spec #102 story 26）。
@@ -102,7 +103,7 @@ def _print_summary(result) -> None:
         for doc_id, reason in result.failed:
             print(f"  {doc_id}  ←  {reason}")
     if result.skipped:
-        print("\n跳过列表（超 PAGE_LIMIT）：")
+        print("\n跳过列表（超 PADDLEOCR_PAGE_LIMIT）：")
         for skipped in result.skipped:
             print(f"  {skipped.doc.id}  （约 {skipped.page_count} 页）")
     if result.report_path:
@@ -144,12 +145,12 @@ def bulk_reparse(
     runnable, over_limit = bulk_svc.split_by_page_limit(targets)
     if over_limit and not skip_confirm:
         print(
-            f"\n⚠️  检测到 {len(over_limit)} 篇 doc 超过 {bulk_svc.PAGE_LIMIT} 页上限，"
+            f"\n⚠️  检测到 {len(over_limit)} 篇 doc 超过 {PADDLEOCR_PAGE_LIMIT} 页上限，"
             f"run 将自动跳过这些 doc。"
         )
         print("   （服务端会截断，避免静默丢内容；issue #87 决议）")
     elif over_limit:
-        print(f"\n⚠️  跳过 {len(over_limit)} 篇超过 {bulk_svc.PAGE_LIMIT} 页的 doc（详见 dry-run 输出）。")
+        print(f"\n⚠️  跳过 {len(over_limit)} 篇超过 {PADDLEOCR_PAGE_LIMIT} 页的 doc（详见 dry-run 输出）。")
 
     if not skip_confirm:
         prompt = (

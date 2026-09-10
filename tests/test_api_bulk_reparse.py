@@ -165,7 +165,7 @@ def test_preflight_returns_target_count_and_estimate():
 
 
 def test_preflight_marks_over_page_limit_in_warning():
-    """超 PAGE_LIMIT 的 doc 进 ``over_page_limit`` 清单（AC 5）。"""
+    """超 ``PADDLEOCR_PAGE_LIMIT`` 的 doc 进 ``over_page_limit`` 清单（AC 5）。"""
     kb_id = _create_kb("preflight-over")
     huge = _add_doc(kb_id, "huge.pdf", embedding_status="failed", page_count=150)
 

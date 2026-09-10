@@ -96,6 +96,11 @@ CACHE_STATE_MISS = "uncached"
 # 真正消耗 OCR 配额的那个 source 值。批量重新解析的**实测**计数（#110）按它分桶：
 # 只有 source=paddleocr 的条目才代表配额支出，其余（pymupdf / fallback_*）都不烧。
 SOURCE_PADDLEOCR = "paddleocr"
+# 拆分后子块 PaddleOCR 解析的 source 值（issue #174 / spec §B）：
+# splitter 把超 PADDLEOCR_PAGE_LIMIT 的 PDF 拆成若干子块逐个喂 PaddleOCR，
+# 写缓存时打这个 source 标识"该条目来自拆分路径下的子块解析"，便于
+# bulk 报告分桶（区分"整篇一次性 OCR"与"拆分子块后 OCR"）。
+SOURCE_PADDLEOCR_SPLIT = "paddleocr_split"
 
 
 def _entry_by_hash(content_hash: str, version: str) -> Optional[dict]:
