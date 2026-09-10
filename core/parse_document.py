@@ -239,13 +239,57 @@ def _parse_pdf(file_path: str, *, use_cache: bool) -> ParseResult:
     return result
 
 
+def pdf_page_count(file_path: str) -> Optional[int]:
+    """源 PDF 物理页数（issue #176）。
+
+    与 :func:`_is_text_layer_pdf` 同款容错：损坏 / 加密 / 非 PDF → 返回
+    ``None`` + debug log,不抛。供 :func:`_paddleocr_parse` 在调 PaddleOCR
+    之前预先判断是否要走拆分路径（spec #173 AC#42：页数读不出时**不**
+    发明一个坏结论)。
+    """
+    if not file_path or Path(file_path).suffix.lower() != ".pdf":
+        return None
+    try:
+        import pymupdf
+
+        with pymupdf.open(file_path) as document:
+            return int(document.page_count)
+    except Exception as e:
+        _logger.debug("pdf_page_count failed for %s: %s", file_path, e)
+        return None
+
+
 def _paddleocr_parse(file_path: str) -> tuple[ParseResult, str]:
     """调用 PaddleOCR API 并返回 ParseResult；不可用或失败时抛出异常。
 
     返回 ``(result, source)``: source 是 cache 元数据，标识结果来自哪个解析器。
+
+    超限拆分（issue #173 / #176）:源 PDF 物理页数 >
+    ``PADDLEOCR_PAGE_LIMIT`` 时,在调 :func:`_paddleocr_call` 之前**先**
+    委托给 :func:`core.pdf_splitter.parse_split`,把 ``source`` 标为
+    :data:`core.paddleocr_cache.SOURCE_PADDLEOCR_SPLIT` 上抛给
+    :func:`_parse_pdf` 的 ``save_cached`` 行 —— 缓存键仍按源 PDF sha256
+    计算(``save_cached`` 内部对源路径算),落地即正确槽位。
+
+    页数读不出（损坏 / 加密 / 拼写异常）→ 委派走老的"直接调 PaddleOCR"
+    路径:让 SaaS 自身的错误响应走 ``_paddleocr_call`` 抛,而不是在
+    splitter 分发层发明坏结论(spec AC#42)。
     """
     if not _paddleocr_available():
         raise RuntimeError("PaddleOCR API not configured")
+
+    # 超限 → 分块路径。延迟 import 避免循环(parse_document 模块顶层 import 时
+    # pdf_splitter 还没初始化完)。
+    from core.settings import PADDLEOCR_PAGE_LIMIT
+
+    page_count = pdf_page_count(file_path)
+    if page_count is not None and page_count > PADDLEOCR_PAGE_LIMIT:
+        from core.pdf_splitter import parse_split
+
+        result = parse_split(file_path)
+        from core.paddleocr_cache import SOURCE_PADDLEOCR_SPLIT
+
+        return result, SOURCE_PADDLEOCR_SPLIT
 
     try:
         result = _paddleocr_call(file_path)
