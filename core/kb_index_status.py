@@ -7,6 +7,11 @@ ADR-0002（"KB 检索状态字段 = 唯一真相"）形同虚设。本模块把�
 
 被 ``core/``、``services/``、``api/`` 三层共用；只依赖 ``storage.kb_repo``，
 不引入循环。
+
+``get_kb_index_built``(issue #171 / PR-4): ``kb.index_status`` 的薄读函数,
+历史在 ``core.index_manager``,为删 ``index_manager.py`` 迁入本模块。
+issue #165 out-of-scope 列入的"``is_kb_searchable`` 改名 + 微整理"是
+单独的 follow-up ticket;本 PR 只迁函数,不更名。
 """
 from __future__ import annotations
 
@@ -212,3 +217,26 @@ class KbIndexStatusWriter:
     def _format_interruption(reason: str) -> str:
         """把中断原因写成一行人读摘要。"""
         return f"批量重新解析中断: {reason}"
+
+
+# ── KB 状态薄读(issue #171 / PR-4)────────────────────────────────────────
+# 历史上 ``get_kb_index_built`` 住在 ``core.index_manager``,与 ``search``
+# / ``get_kb_index`` 一起挂着"读路径"。``core.index_manager`` 删除后,
+# 把它迁到这里 —— 它读的就是 ``kb.index_status`` 字段,与
+# :class:`KbIndexStatusWriter` 写的字段同源,放一起也方便 review。
+#
+# 改名 ``is_kb_searchable`` 是 issue #165 out-of-scope 列表里挂的单独
+# follow-up,本 PR 不动函数名。
+
+def get_kb_index_built(kb_id: str) -> bool:
+    """检查 KB 是否可被向量检索。
+
+    ADR-0002 单真相:本函数只读 KB 元数据中的 ``kb.index_status`` 字段。
+    取值映射:
+    - ``searchable`` → True(可向量检索)
+    - ``building`` / ``none`` / ``failed`` → False(自愈路径触发条件)
+
+    KB 不存在同样返回 ``False``(与字段缺失同义),调用方不需要 None 分支。
+    """
+    kb = kb_repo.get(kb_id)
+    return kb is not None and kb.index_status == "searchable"

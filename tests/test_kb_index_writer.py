@@ -7,8 +7,8 @@
 4. **per-doc 失败隔离**(ADR-0007 §3)—— 任一 doc 抛错,该 doc 记
    ``embedding_status=failed``,**其余 doc 继续走通**。
 5. **embed 重试派发** —— ``embed_batch_with_retry`` 是 ADR-0007 重试
-   owner;writer 通过 lazy-resolve 走 ``core.index_manager.embed_batch_with_retry``,
-   ``monkeypatch.setattr("core.index_manager.embed_batch_with_retry", ...)``
+   owner;writer 通过 lazy-resolve 走 ``core.embed_retry.embed_batch_with_retry``,
+   ``monkeypatch.setattr("core.embed_retry.embed_batch_with_retry", ...)``
    仍能拦截写入路径(向后兼容)。
 
 公开 API 形状:
@@ -285,7 +285,7 @@ def test_index_documents_isolates_per_doc_embedding_failure(monkeypatch):
         return [[float(i)] * 1024 for i in range(len(texts))]
 
     monkeypatch.setattr(
-        "core.index_manager.embed_batch_with_retry", _patched_batch,
+        "core.embed_retry.embed_batch_with_retry", _patched_batch,
     )
 
     docs = [
@@ -325,7 +325,7 @@ def test_index_documents_failed_doc_has_no_vector_file(monkeypatch):
         return [[0.0] * 1024 for _ in texts]
 
     monkeypatch.setattr(
-        "core.index_manager.embed_batch_with_retry", _patched_batch,
+        "core.embed_retry.embed_batch_with_retry", _patched_batch,
     )
 
     docs = [
@@ -355,7 +355,7 @@ def test_index_documents_does_not_abort_batch_on_runtime_error(monkeypatch):
         return [[0.0] * 1024 for _ in texts]
 
     monkeypatch.setattr(
-        "core.index_manager.embed_batch_with_retry", _patched_batch,
+        "core.embed_retry.embed_batch_with_retry", _patched_batch,
     )
 
     docs = [
@@ -378,7 +378,7 @@ def test_index_documents_skips_docs_not_in_doc_repo(monkeypatch):
         return [[0.0] * 1024 for _ in texts]
 
     monkeypatch.setattr(
-        "core.index_manager.embed_batch_with_retry", _patched_batch,
+        "core.embed_retry.embed_batch_with_retry", _patched_batch,
     )
 
     docs = [
@@ -397,7 +397,7 @@ def test_index_documents_dispatches_via_embed_batch_with_retry(monkeypatch):
     """``index_documents`` 通过 ``embed_batch_with_retry`` 调用 embedder。
 
     重试 owner 是 ``core.embed_retry.embed_batch_with_retry``,writer
-    不另起一层重试。验证:monkeypatch ``core.index_manager.embed_batch_with_retry``
+    不另起一层重试。验证:monkeypatch ``core.embed_retry.embed_batch_with_retry``
     后,writer 仍走它(通过 lazy-resolve)。
     """
     _seed_kb_meta("test_writer_retry_dispatch")
@@ -409,7 +409,7 @@ def test_index_documents_dispatches_via_embed_batch_with_retry(monkeypatch):
         return [[float(i)] * 1024 for i in range(len(texts))]
 
     monkeypatch.setattr(
-        "core.index_manager.embed_batch_with_retry", _patched_batch,
+        "core.embed_retry.embed_batch_with_retry", _patched_batch,
     )
 
     docs = [Doc(
@@ -466,7 +466,7 @@ def test_index_documents_single_doc_with_kb_status_writer_writes_failed_state(mo
         raise boom
 
     monkeypatch.setattr(
-        "core.index_manager.embed_batch_with_retry", _patched_batch,
+        "core.embed_retry.embed_batch_with_retry", _patched_batch,
     )
 
     status_writer = KbIndexStatusWriter("test_writer_single_failed", total=1)
@@ -510,7 +510,7 @@ def test_rebuild_kb_index_with_cached_vectors_uses_fast_path(monkeypatch):
         return [[0.0] * 1024 for _ in texts]
 
     monkeypatch.setattr(
-        "core.index_manager.embed_batch_with_retry", _patched_batch,
+        "core.embed_retry.embed_batch_with_retry", _patched_batch,
     )
 
     KBIndexWriter("test_rebuild_fast").rebuild_kb_index()

@@ -14,15 +14,13 @@ import threading
 import unicodedata
 from pathlib import Path
 
+from llama_index.core import Settings
+from llama_index.core.schema import NodeWithScore
+
 import storage.kb_repo as kb_repo
-from core.index_manager import (
-    search as _vec_search,
-    index_document as _index_to_store,
-    remove_document as _remove_from_store,
-    rebuild_kb_index as _rebuild_store,
-    get_kb_index_built,
-)
+from core.kb_index_status import KbIndexStatusWriter, get_kb_index_built
 from core.kb_index_store import KBIndexStore
+from core.kb_index_writer import Doc, KBIndexWriter
 from core.logger import get_logger
 from core.pages_store import load_pages
 
@@ -180,13 +178,10 @@ def _text_search_fallback(kb_ids: list[str], keywords: list[str]) -> str:
 
 def _all_docs_have_vectors(kb_id: str) -> bool:
     """检查该 KB 关联的所有文档是否都有 .npy 向量缓存（fast path 判定）。"""
-    import storage.kb_repo as _kb_repo
-    from core.index_manager import _vectors_dir as _kb_vectors_dir
-
-    kb = _kb_repo.get(kb_id)
+    kb = kb_repo.get(kb_id)
     if kb is None or not kb.document_ids:
         return False
-    vectors_dir = _kb_vectors_dir(kb_id)
+    vectors_dir = KBIndexStore.open(kb_id)._vectors_dir()
     return all((vectors_dir / f"{did}.npy").exists() for did in kb.document_ids)
 
 
@@ -203,8 +198,8 @@ def _ensure_kb_index(kb_id: str, sync_rebuild_for_audit: bool = False) -> bool:
         True if ``kb.index_status`` 可被当前调用视作 'searchable'；
         False 表示仍在 'building' 或重建失败，调用方应降级或等待。
 
-    重建写回字段由 ``rebuild_kb_index``（被 _rebuild_store 指向）
-    按内置契约完成（ADR-0002 §决策 2），本函数不重复写。
+    重建写回字段由 ``KBIndexWriter.rebuild_kb_index`` 按内置契约完成
+    （ADR-0002 §决策 2），本函数不重复写。
     """
     if get_kb_index_built(kb_id):
         return True
@@ -218,26 +213,107 @@ def _ensure_kb_index(kb_id: str, sync_rebuild_for_audit: bool = False) -> bool:
         if get_kb_index_built(kb_id):
             return True  # 双检：另一线程可能刚完成
 
-        from core.index_manager import rebuild_kb_index as _rebuild
-
+        writer = KBIndexWriter(kb_id)
         if _all_docs_have_vectors(kb_id):
             # 快路：秒级同步重建
-            _rebuild(kb_id)
+            kb_writer = KbIndexStatusWriter(kb_id)
+            kb_writer.begin()
+            writer.rebuild_kb_index()
             return get_kb_index_built(kb_id)
 
         # 慢路：缺向量。按调用方意图决定同步 / 异步
         if sync_rebuild_for_audit:
-            _rebuild(kb_id)  # 同步：宁可请求挂几分钟也不让审核缺向量
+            kb_writer = KbIndexStatusWriter(kb_id)
+            kb_writer.begin()
+            writer.rebuild_kb_index()  # 同步：宁可请求挂几分钟也不让审核缺向量
             return get_kb_index_built(kb_id)
 
         # 异步：QA 默认。当前请求立即返回 False，让 QA 走文本降级
-        thread = threading.Thread(
-            target=_rebuild,
-            args=(kb_id,),
-            daemon=True,
-        )
+        def _async_rebuild():
+            kb_writer = KbIndexStatusWriter(kb_id)
+            kb_writer.begin()
+            writer.rebuild_kb_index()
+
+        thread = threading.Thread(target=_async_rebuild, daemon=True)
         thread.start()
         return False
+
+
+def _cross_kb_search(
+    kb_ids: list[str], query: str, top_k: int = 5, use_reranker: bool = True,
+) -> list[dict]:
+    """跨 KB 向量搜索(issue #171 / PR-4:从 ``core.index_manager.search`` 迁入)。
+
+    返回格式与旧版 ``vec_search()`` 兼容:
+    ``[{source, kb_id, doc_id, content, doc_source, relevance, page_number, block_range}, ...]``
+
+    当 reranker 可用时,用 cross-encoder 对候选结果重排序提升精度。
+
+    拆分理由(issue #165):原函数与 ``KBIndexStore.search``(单 KB)、``search``
+    在同一文件、且把"读也持锁 + 跨 KB 聚合 + reranker + 格式化为 hit dict"四
+    件不同理由变化的事揉在一起。读路径是 service 责任(决策要不要重排 / 决定
+    返回形状),放进 ``services.vector_search`` 让 caller 拿到的就是"已
+    reranker、已格式化"的最终结果。
+    """
+    if not query or not kb_ids:
+        return []
+
+    from core.settings import get_embed_model, get_gpu_inference_lock, run_reranker
+    get_embed_model()
+
+    # 一次 query embedding(原代码在每个 KB retriever.retrieve 内各做一次,
+    # 现在提到 search 入口做一次——同一 embedder、同一 query、同一结果,
+    # 跨 KB 复用)。Query embedding 不走 ``embed_batch_with_retry``——
+    # ADR-0007 §2:查询路径零附加重试。
+    query_embedding = Settings.embed_model.get_query_embedding(query)
+
+    gpu_lock = get_gpu_inference_lock()
+
+    with gpu_lock:
+        all_nodes: list[NodeWithScore] = []
+        for kb_id in kb_ids:
+            if not get_kb_index_built(kb_id):
+                continue
+            try:
+                nodes = KBIndexStore.open(kb_id).search(query_embedding, top_k)
+                for node in nodes:
+                    node.node.metadata["kb_id"] = kb_id
+                    all_nodes.append(node)
+            except Exception as e:
+                _logger.warning("vector search failed for kb %s: %s", kb_id, e)
+                continue
+
+        if not all_nodes:
+            return []
+
+        all_nodes.sort(key=lambda n: n.score or 0, reverse=True)
+        all_nodes = all_nodes[: top_k * 2]
+
+        if use_reranker:
+            try:
+                reranked = run_reranker(all_nodes, query)
+                if reranked:
+                    all_nodes = reranked
+            except Exception as e:
+                _logger.warning("reranker failed in search, using raw ranking: %s", e)
+
+    hits = []
+    for node in all_nodes[:top_k]:
+        meta = node.metadata or {}
+        hits.append({
+            "source": "vec_search",
+            "kb_id": meta.get("kb_id", ""),
+            "doc_id": meta.get("doc_id", ""),
+            "content": node.text,
+            "doc_source": meta.get("source", ""),
+            "section_path": meta.get("section_path", ""),
+            "clause_number": meta.get("clause_number", ""),
+            "page_number": meta.get("page_number"),
+            "block_range": meta.get("block_range"),
+            "relevance": round(node.get_score() or 0, 4),
+        })
+
+    return hits
 
 
 def vec_search(
@@ -260,7 +336,7 @@ def vec_search(
     for kb_id in kb_ids:
         if rebuild_if_missing:
             _ensure_kb_index(kb_id, sync_rebuild_for_audit=sync_rebuild_for_audit)
-    return _vec_search(kb_ids, query, top_k)
+    return _cross_kb_search(kb_ids, query, top_k)
 
 
 # ── 文档索引管理（公开 API）───────────────────────────────────────────────
@@ -274,7 +350,7 @@ def index_document(kb_id: str, doc_id: str, file_path: str, source_name: str = "
     by_page: ``ParseResult.by_page`` 同构（list[PageText]）。若 None，则
         ``parse_document`` 内部解析以获得 by_page（pages 文件入口路径）。
 
-    V8-S2 增 by_layout 透传：parse_result.layout 传给底层 ``_index_to_store``，
+    V8-S2 增 by_layout 透传：parse_result.layout 传给底层 ``KBIndexWriter``,
     让 ``_inject_block_range`` 能为每个 chunk 写入 block_range。非 PDF KB
     (layout=[]) → block_range 全 None,走 fallback 高亮。
     """
@@ -287,29 +363,42 @@ def index_document(kb_id: str, doc_id: str, file_path: str, source_name: str = "
     src = source_name or Path(file_path).stem
     # V6: by_page 来自 parse_result（pages 文件已落地，kb_files / reparse 共用一份）
     # V8-S2: by_layout 同样透传,让 chunk → block 区间自动落到 metadata
-    _index_to_store(
-        kb_id, doc_id, text, src,
+    KBIndexWriter(kb_id).index_documents([Doc(
+        doc_id=doc_id,
+        text=text,
+        source_name=src,
         by_page=by_page if by_page is not None else parse_result.by_page,
         by_layout=parse_result.layout,
-    )
+    )])
 
 
 def remove_document_index(kb_id: str, doc_id: str):
     """删除 KB 文档的向量索引。"""
-    _remove_from_store(kb_id, doc_id)
+    KBIndexStore.open(kb_id).remove_doc(doc_id)
 
 
 def rebuild_kb_index(kb_id: str, progress_callback=None):
-    """遍历 KB 全部文档重建向量索引。"""
-    _rebuild_store(kb_id, progress_callback)
+    """遍历 KB 全部文档重建向量索引。
+
+    走 ``KBIndexWriter.rebuild_kb_index``:调用方已 begin() 过(issue #155),
+    本函数内不 begin()。
+    """
+    writer = KBIndexWriter(kb_id)
+    kb_writer = KbIndexStatusWriter(kb_id)
+    kb_writer.begin()
+    writer.rebuild_kb_index(progress_callback=progress_callback)
 
 
 # ── 搜索接口 ─────────────────────────────────────────────────────────────
 
 
-def search(kb_ids: list[str], query: str, max_results: int = 5, rebuild_if_missing: bool = True) -> list[dict]:
-    """向量搜索（与旧版兼容）。"""
-    return vec_search(kb_ids, query, max_results, rebuild_if_missing=rebuild_if_missing)
+def search(kb_ids: list[str], query: str, top_k: int = 5, rebuild_if_missing: bool = True) -> list[dict]:
+    """向量搜索(issue #171 / PR-4:取代 ``core.index_manager.search`` 的位置)。
+
+    与旧版兼容,返回 hit dict 列表。``top_k`` 取代 ``max_results`` 以对齐
+    ``vec_search`` 形参(也便于 tests 直接传 ``top_k=N``,无需翻译)。
+    """
+    return vec_search(kb_ids, query, top_k, rebuild_if_missing=rebuild_if_missing)
 
 
 def _format_kb_results(results: list[dict], prefix: str = "知识库参考依据（向量检索）") -> str:

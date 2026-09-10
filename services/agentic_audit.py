@@ -495,10 +495,12 @@ def _lookup_chunk_block_range(
     chunk_norm = norm(standard_chunk_text or "")
 
     try:
-        from core.index_manager import get_kb_index
+        from core.kb_index_store import KBIndexStore
         for kb_id in kb_ids:
             try:
-                idx = get_kb_index(kb_id)
+                # 持锁读索引(issue #168 锁封装在 store 内,旧 ``get_kb_index`` 同样锁住)。
+                with KBIndexStore.open(kb_id).acquire_write_lock():
+                    idx = KBIndexStore.open(kb_id)._get_index()
             except Exception as e:
                 _logger.debug("_lookup_chunk_block_range: get_kb_index(%s) failed: %s", kb_id, e)
                 continue

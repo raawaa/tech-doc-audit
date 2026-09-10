@@ -9,7 +9,7 @@ from llama_index.core import QueryBundle
 from llama_index.core.schema import NodeWithScore
 from llama_index.core.retrievers import BaseRetriever
 
-from core.index_manager import get_kb_index
+from core.kb_index_store import KBIndexStore
 from core.logger import get_logger
 
 _logger = get_logger(__name__)
@@ -45,7 +45,9 @@ class CrossKBRetriever(BaseRetriever):
         all_nodes: dict[str, NodeWithScore] = {}
         for kb_id in self.kb_ids:
             try:
-                index = get_kb_index(kb_id)
+                # 通过 KBIndexStore 持锁读取索引（issue #168 锁封装在 store 内）。
+                with KBIndexStore.open(kb_id).acquire_write_lock():
+                    index = KBIndexStore.open(kb_id)._get_index()
                 retriever = index.as_retriever(similarity_top_k=self.top_k)
                 nodes = retriever.retrieve(query)
                 for node in nodes:

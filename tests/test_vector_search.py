@@ -92,7 +92,7 @@ def test_search_wrapper_delegates_to_vec_search(tmp_path, seed_searchable_kb):
 
     index_document(kb_id, "d1", str(f), source_name="d.md")
 
-    results = search([kb_id], "安全", max_results=5)
+    results = search([kb_id], "安全", top_k=5)
     assert len(results) >= 1
 
 

@@ -6,8 +6,13 @@
 ``embedded``（chip 预览 "未解析" 的根因类 bug）。
 
 不依赖 PaddleOCR / PyMuPDF 真实 API；用 ``unittest.mock.patch`` 桩出
-``parse_document`` / ``save_pages`` / ``remove_document`` / ``index_document``
-+ ``kb_repo`` / ``doc_repo``，对 ``_reparse_async`` 做同步调用验证。
+``parse_document`` / ``save_pages`` / ``KBIndexStore.remove_doc`` /
+``KBIndexWriter.index_documents`` + ``kb_repo`` / ``doc_repo``，对
+``_reparse_async`` 做同步调用验证。
+
+PR-4 (issue #171):``services.reparse_service`` 不再 import 旧
+``index_document`` / ``remove_document`` 符号—— 它们现在落到
+``KBIndexWriter.index_documents`` / ``KBIndexStore.remove_doc`` 上。
 
 跑法：``pytest -m "not requires_paddleocr and not requires_pymupdf"``
 """
@@ -17,6 +22,8 @@ import os
 
 import pytest
 
+from core.kb_index_store import KBIndexStore
+from core.kb_index_writer import KBIndexWriter
 from core.parse_document import Block, PageLayout, PageText, ParseResult
 
 
@@ -94,8 +101,8 @@ def _run_reparse_async_with_writer(kb_id, *, parse, kb_writer):
     # 同时影响两边。
     with patch_parse, \
          patch("services.reparse_service.save_pages"), \
-         patch("services.reparse_service.remove_document"), \
-         patch("services.reparse_service.index_document"), \
+         patch.object(KBIndexStore, "remove_doc"), \
+         patch.object(KBIndexWriter, "index_documents"), \
          patch.object(storage.kb_repo, "get") as mock_get, \
          patch.object(storage.kb_repo, "update") as mock_update, \
          patch("services.reparse_service.doc_repo") as mock_doc_repo:
@@ -303,8 +310,8 @@ def test_provided_writer_takes_over_kb_status(reparse_guard_kb):
     with patch.object(KbIndexStatusWriter, "__init__", fail_on_new_writer), \
          patch("services.reparse_service.parse_document", return_value=_good_parse_result()), \
          patch("services.reparse_service.save_pages"), \
-         patch("services.reparse_service.remove_document"), \
-         patch("services.reparse_service.index_document"), \
+         patch.object(KBIndexStore, "remove_doc"), \
+         patch.object(KBIndexWriter, "index_documents"), \
          patch("services.reparse_service.doc_repo") as mock_doc_repo:
         mock_doc_repo.get_doc.return_value = fake_doc
 

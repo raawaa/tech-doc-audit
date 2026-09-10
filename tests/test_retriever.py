@@ -8,7 +8,7 @@ fake_models neutralize 成 identity（返回原序），故可稳定测合并/�
 """
 import pytest
 
-from core.index_manager import index_document
+from core.kb_index_writer import Doc, KBIndexWriter
 from core.retriever import CrossKBRetriever
 
 
@@ -26,19 +26,26 @@ def _auto_seed_meta():
     取测试调用的 ``kb_id`` set 需要函数体运行后才能收集到,所以这里只给每条
     KB 创建一份(用 ``_index`` 同步带 meta 写入)。
     """
-    from core.index_manager import _write_index_meta
     yield  # meta 由 _index() 内部的 wrapper 直接写
 
 
 def _index(kb_id: str, docs: list[tuple[str, str]]):
     """建索引：docs = [(doc_id, text), ...]（text 需 >=20 字符）。
 
-    issues/144 AC#3 先写 meta 再 index_document。
+    issues/144 AC#3 先写 meta 再 index_documents。
+    PR-4:旧 ``core.index_manager.index_document`` 是 text-based,新 ``KBIndexWriter``
+    是单入口批量索引 —— 走 ``index_documents([Doc(...)])``。
     """
-    from core.index_manager import _write_index_meta
-    _write_index_meta(kb_id, model_id="BAAI/bge-m3", dim=1024, force=True)
+    from core.kb_index_store import KBIndexStore
+    store = KBIndexStore.open(kb_id)
+    store._write_index_meta(
+        model_id="BAAI/bge-m3", dim=1024, force=True,
+    )
+    writer = KBIndexWriter(kb_id)
     for doc_id, text in docs:
-        index_document(kb_id, doc_id, text, source_name=f"{doc_id}.txt")
+        writer.index_documents([Doc(
+            doc_id=doc_id, text=text, source_name=f"{doc_id}.txt",
+        )])
 
 
 # ── 基本检索 ──────────────────────────────────────────────────────────────────

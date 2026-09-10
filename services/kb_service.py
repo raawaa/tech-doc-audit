@@ -1,6 +1,7 @@
 import shutil
 from typing import Optional, Literal
 
+from core.kb_index_store import KBIndexStore
 from models.knowledge_base import KnowledgeBase
 import storage.kb_repo as kb_repo
 
@@ -16,9 +17,8 @@ def create_kb(name: str, description: str = "", category: Literal["national", "i
     """
     kb = KnowledgeBase(name=name, description=description, category=category)
     kb = kb_repo.create(kb)
-    from core.index_manager import _write_index_meta
-    _write_index_meta(
-        kb.id, model_id="BAAI/bge-m3", dim=1024, force=True,
+    KBIndexStore.open(kb.id)._write_index_meta(
+        model_id="BAAI/bge-m3", dim=1024, force=True,
     )
     return kb
 

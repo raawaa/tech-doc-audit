@@ -330,7 +330,7 @@ def test_concurrent_batch_imports_no_orphans(monkeypatch):
     import threading
     import storage.kb_repo as kb_repo
 
-    monkeypatch.setattr("core.index_manager.index_documents_batch", lambda *a, **k: None)
+    monkeypatch.setattr("core.kb_index_writer.KBIndexWriter.index_documents", lambda *a, **k: None)
 
     kb = kb_svc.create_kb(name="并发批量", category="national")
 
@@ -588,7 +588,7 @@ def test_batch_index_docs_failure_path_uses_writer_format_helper(monkeypatch):
 
     # 触发 index_documents_batch 抛错 → 走 except 分支 → finish(interrupted=str(e))
     monkeypatch.setattr(
-        "core.index_manager.index_documents_batch",
+        "core.kb_index_writer.KBIndexWriter.index_documents",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("simulated batch outage")),
     )
 

@@ -233,7 +233,7 @@ def seed_searchable_kb():
     不需要再为每个 KB 显式 seed meta。生产索引由 ``scripts/backfill_kb_meta.py``
     一次性回填。
     """
-    from core.index_manager import _write_index_meta
+    from core.kb_index_store import KBIndexStore
 
     seeded: list[str] = []
 
@@ -247,8 +247,8 @@ def seed_searchable_kb():
         seeded.append(kb_id)
         # issues/144 写入前的硬关（issues/144 AC#3）—— 测试 fixture 同步
         # 提供生产体系元数据（生产路径由 doc_svc 落，或由 backfill 回填）。
-        _write_index_meta(
-            kb_id, model_id="BAAI/bge-m3", dim=1024, force=True,
+        KBIndexStore.open(kb_id)._write_index_meta(
+            model_id="BAAI/bge-m3", dim=1024, force=True,
         )
         return kb_id
 

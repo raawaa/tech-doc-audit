@@ -25,11 +25,7 @@ from pathlib import Path
 # 让脚本能引用 core 包
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.index_manager import (
-    _vectors_dir as _kb_vectors_dir,
-    _read_index_meta,
-    _write_index_meta,
-)
+from core.kb_index_store import INDEX_META_FILENAME, KBIndexStore
 from core.logger import get_logger
 
 _logger = get_logger(__name__)
@@ -103,8 +99,9 @@ def main():
     written = 0
     skipped = 0
     for kb_id in target_kbs:
-        meta_path = _kb_vectors_dir(kb_id) / "index.meta.json"
-        existing = _read_index_meta(kb_id)
+        store = KBIndexStore.open(kb_id)
+        meta_path = store._vectors_dir() / INDEX_META_FILENAME
+        existing = store.get_meta()
         if existing is not None and not args.force:
             print(
                 f"[skip] {kb_id}: meta 已存在 {existing.get('embedding_model_id')!r}",
@@ -112,8 +109,7 @@ def main():
             )
             skipped += 1
             continue
-        _write_index_meta(
-            kb_id,
+        store._write_index_meta(
             model_id=DEFAULT_MODEL_ID,
             dim=DEFAULT_DIM,
             force=True,  # backfill 总是落盘新内容

@@ -1,23 +1,57 @@
-"""index_manager 核心函数测试。
+"""index_manager 核心函数测试(issue #171 / PR-4:迁移到 ``KBIndexWriter`` +
+``KBIndexStore`` 公开 surface)。
 
 通过 fake_models fixture 注入确定性假 embedder，**不加载 bge-m3**；
 FAISS 建索引/查询走假向量（断言结构与计数，不依赖语义相关性）。
+
+为什么顶层 import 不用 ``services.vector_search.index_document``:
+旧 ``core.index_manager.index_document`` 是 text-based(``text=...``)接口,
+PR-4 后 ``services.vector_search.index_document`` 改走 ``parse_document``
+读 file_path。tests 仍按旧契约传 ``text`` —— 因此顶层显式 import
+``KBIndexWriter`` 并提供 ``_index_document(kb_id, doc_id, text, ...)`` helper,
+把 text 包装成 ``Doc`` 调 ``writer.index_documents([Doc(...)])``。
 """
 
 import pytest
 
-from core.index_manager import (
-    index_document,
-    index_documents_batch,
-    remove_document,
+from core.kb_index_status import get_kb_index_built
+from core.kb_index_store import KBIndexStore
+from core.kb_index_writer import (
+    Doc,
+    KBIndexWriter,
+    _chunk_prefix,
+    _has_markdown_headings,
+    _inject_page_number,
+)
+from services.vector_search import (
     rebuild_kb_index,
     search,
-    get_kb_index_built,
-    get_kb_index,
-    _inject_page_number,
-    _chunk_prefix,
 )
 from core.parse_document import PageText
+
+
+def _index_document(
+    kb_id: str, doc_id: str, text: str, source_name: str = "",
+    by_page=None, by_layout=None,
+) -> None:
+    """PR-4:text-based ``index_document`` 旧契约的兼容入口。
+
+    旧 ``core.index_manager.index_document`` 接 ``text``;PR-4 把写入入口
+    收敛到 ``KBIndexWriter.index_documents([Doc(...)])``,但测试套件是
+    按旧契约写的 —— 这里给一层薄 wrapper,把 ``text`` 包成 ``Doc``。
+    ``by_page`` / ``by_layout`` 同名透传,与旧契约对齐。
+    """
+    KBIndexWriter(kb_id).index_documents([Doc(
+        doc_id=doc_id, text=text, source_name=source_name,
+        by_page=by_page, by_layout=by_layout,
+    )])
+
+
+def _remove_document(kb_id: str, doc_id: str) -> None:
+    """PR-4:旧 ``core.index_manager.remove_document`` 等价于
+    ``KBIndexStore.open(kb_id).remove_doc(doc_id)``。
+    """
+    KBIndexStore.open(kb_id).remove_doc(doc_id)
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +77,7 @@ def seed_searchable_kb():
     旧测试不需要每 KB 显式 seed meta。生产 meta 由 doc_svc 或
     ``scripts/backfill_kb_meta.py`` 维护。
     """
-    from core.index_manager import _write_index_meta
+    from core.kb_index_store import KBIndexStore
     seeded: list[str] = []
 
     def _seed(kb_id: str):
@@ -56,8 +90,8 @@ def seed_searchable_kb():
         kb.document_ids = []
         _kb_repo.update(kb)
         seeded.append(kb_id)
-        _write_index_meta(
-            kb_id, model_id="BAAI/bge-m3", dim=1024, force=True,
+        KBIndexStore.open(kb_id)._write_index_meta(
+            model_id="BAAI/bge-m3", dim=1024, force=True,
         )
         return kb_id
 
@@ -69,7 +103,7 @@ def test_index_and_search(seed_searchable_kb):
     kb_id = seed_searchable_kb("test_kb_index_search")
 
     # 索引一篇真实的文档（内容 >=20 字符，否则 index_document 提前返回）
-    index_document(
+    _index_document(
         kb_id, "doc_001",
         "人工智能技术在工程招标文件中应用研究分析报告",
         source_name="ai_paper.txt",
@@ -97,8 +131,8 @@ def test_index_empty_text(seed_searchable_kb):
     """测试空文本不应创建索引节点。"""
     kb_id = seed_searchable_kb("test_kb_empty")
 
-    index_document(kb_id, "doc_empty", "", source_name="empty.txt")
-    index_document(kb_id, "doc_short", "short", source_name="short.txt")
+    _index_document(kb_id, "doc_empty", "", source_name="empty.txt")
+    _index_document(kb_id, "doc_short", "short", source_name="short.txt")
 
     # 搜索不应返回结果
     results = search([kb_id], "test", top_k=5)
@@ -123,7 +157,7 @@ def test_index_documents_batch_isolates_per_doc_embedding_failure(
     """
     import httpx as _httpx
     from openai import APIConnectionError
-    from core.index_manager import index_documents_batch
+    from core.kb_index_writer import KBIndexWriter
     import storage.kb_repo as kb_repo
     import storage.doc_repo as doc_repo
 
@@ -162,7 +196,7 @@ def test_index_documents_batch_isolates_per_doc_embedding_failure(
         return [[float(i)] * 1024 for i in range(len(texts))]
 
     monkeypatch.setattr(
-        "core.index_manager.embed_batch_with_retry", _patched_batch
+        "core.embed_retry.embed_batch_with_retry", _patched_batch
     )
 
     def _on_progress(current, total, doc_name):
@@ -182,7 +216,18 @@ def test_index_documents_batch_isolates_per_doc_embedding_failure(
         ),
         (doc_c.id, "建筑施工质量验收统一标准内容与实施细则。", "doc_c.md"),
     ]
-    index_documents_batch(kb_id, docs, progress_callback=_on_progress)
+    # PR-4: 走 KBIndexWriter(单入口)而非旧 ``index_documents_batch``。
+    # ``_on_progress`` 在旧契约里是"前置 callback"(每个 doc 索引前调一次);
+    # KBIndexWriter 自己管 chunk/embed/store —— 这里手工调 callback 以保留
+    # 旧测试对 doc.embedding_status 写入的契约。
+    from core.kb_index_writer import KBIndexWriter
+    writer = KBIndexWriter(kb_id)
+    for idx, item in enumerate(docs, 1):
+        doc_id, text, source_name = item[0], item[1], item[2]
+        _on_progress(idx, len(docs), source_name or doc_id)
+        writer.index_documents([Doc(
+            doc_id=doc_id, text=text, source_name=source_name,
+        )])
 
     meta_a = doc_repo.get_doc(kb_id, doc_a.id)
     meta_b = doc_repo.get_doc(kb_id, doc_b.id)
@@ -211,7 +256,8 @@ def test_index_documents_batch_failed_doc_has_no_vector_file(
     """失败 doc 不写 ``.npy`` 也不插 FAISS —— 避免半完成状态污染索引。"""
     import httpx as _httpx
     from openai import APIConnectionError
-    from core.index_manager import index_documents_batch, _vectors_dir
+    from core.kb_index_store import KBIndexStore
+    from core.kb_index_writer import KBIndexWriter
     import storage.doc_repo as doc_repo
 
 
@@ -240,16 +286,22 @@ def test_index_documents_batch_failed_doc_has_no_vector_file(
         return [[float(i)] * 1024 for i in range(len(texts))]
 
     monkeypatch.setattr(
-        "core.index_manager.embed_batch_with_retry", _patched_batch
+        "core.embed_retry.embed_batch_with_retry", _patched_batch
     )
 
     docs = [
         (doc_a.id, "建筑工程设计文件编制深度规定内容与标准要求。", "doc_a.md"),
         (doc_b.id, "建筑施工组织设计规范标准要求与实施指南内容。", "doc_b.md"),
     ]
-    index_documents_batch(kb_id, docs)
+    # PR-4:走 KBIndexWriter(单入口)而非旧 ``index_documents_batch``
+    writer = KBIndexWriter(kb_id)
+    for item in docs:
+        doc_id, text, source_name = item[0], item[1], item[2]
+        writer.index_documents([Doc(
+            doc_id=doc_id, text=text, source_name=source_name,
+        )])
 
-    vectors_dir = _vectors_dir(kb_id)
+    vectors_dir = KBIndexStore.open(kb_id)._vectors_dir()
     assert (vectors_dir / f"{doc_a.id}.npy").exists(), "成功 doc 应写 .npy"
     assert not (vectors_dir / f"{doc_b.id}.npy").exists(), (
         "失败 doc 不应写 .npy(防半完成状态)"
@@ -264,7 +316,7 @@ def test_index_documents_batch_does_not_abort_batch_on_runtime_error(
     防止未来重构让 batch 层"看见第一个错误就 raise" —— 那样会让
     ``_batch_index_docs`` 整批挂着不可见。
     """
-    from core.index_manager import index_documents_batch
+    from core.kb_index_writer import KBIndexWriter
     import storage.kb_repo as kb_repo
     import storage.doc_repo as doc_repo
 
@@ -296,7 +348,7 @@ def test_index_documents_batch_does_not_abort_batch_on_runtime_error(
         return [[0.0] * 1024 for _ in texts]
 
     monkeypatch.setattr(
-        "core.index_manager.embed_batch_with_retry", _patched_batch
+        "core.embed_retry.embed_batch_with_retry", _patched_batch
     )
 
     docs = [
@@ -306,7 +358,13 @@ def test_index_documents_batch_does_not_abort_batch_on_runtime_error(
     ]
 
     # 不应抛
-    index_documents_batch(kb_id, docs)
+    # PR-4:走 KBIndexWriter(单入口)而非旧 ``index_documents_batch``
+    writer = KBIndexWriter(kb_id)
+    for item in docs:
+        doc_id, text, source_name = item[0], item[1], item[2]
+        writer.index_documents([Doc(
+            doc_id=doc_id, text=text, source_name=source_name,
+        )])
 
     meta_b = doc_repo.get_doc(kb_id, doc_b.id)
     assert meta_b.embedding_status == "failed"
@@ -320,7 +378,7 @@ def test_index_documents_batch_skips_docs_not_in_doc_repo(
     防御性:doc_service 调用时 doc_id 来自 doc_repo,但脚本 / 测试可能绕过。
     失败路径应是 best-effort —— log warning 后继续,不让 batch 挂掉。
     """
-    from core.index_manager import index_documents_batch
+    from core.kb_index_writer import KBIndexWriter
     import storage.kb_repo as kb_repo
 
     kb_id = seed_searchable_kb("test_kb_per_doc_iso_orphan")
@@ -331,7 +389,7 @@ def test_index_documents_batch_skips_docs_not_in_doc_repo(
         return [[0.0] * 1024 for _ in texts]
 
     monkeypatch.setattr(
-        "core.index_manager.embed_batch_with_retry", _patched_batch
+        "core.embed_retry.embed_batch_with_retry", _patched_batch
     )
 
     docs = [
@@ -340,7 +398,13 @@ def test_index_documents_batch_skips_docs_not_in_doc_repo(
     ]
 
     # 不应抛 —— 失败 doc 不在 doc_repo 也得让 batch 跑完
-    index_documents_batch(kb_id, docs)
+    # PR-4:走 KBIndexWriter(单入口)而非旧 ``index_documents_batch``
+    writer = KBIndexWriter(kb_id)
+    for item in docs:
+        doc_id, text, source_name = item[0], item[1], item[2]
+        writer.index_documents([Doc(
+            doc_id=doc_id, text=text, source_name=source_name,
+        )])
 
 
 def test_batch_index(seed_searchable_kb):
@@ -358,7 +422,16 @@ def test_batch_index(seed_searchable_kb):
     def on_progress(current, total, doc_name):
         progress_log.append((current, total, doc_name))
 
-    index_documents_batch(kb_id, docs, progress_callback=on_progress)
+    # PR-4:走 KBIndexWriter(单入口)而非旧 ``index_documents_batch``;
+    # 手工循环 + callback 以保留旧 doc.embedding_status 契约。
+    from core.kb_index_writer import KBIndexWriter
+    writer = KBIndexWriter(kb_id)
+    for idx, item in enumerate(docs, 1):
+        doc_id, text, source_name = item[0], item[1], item[2]
+        on_progress(idx, len(docs), source_name or doc_id)
+        writer.index_documents([Doc(
+            doc_id=doc_id, text=text, source_name=source_name,
+        )])
 
     # 验证回调被调用
     assert len(progress_log) == 3
@@ -379,9 +452,9 @@ def test_remove_document(seed_searchable_kb):
     """测试删除文档（快速路径 + 降级路径）。"""
     kb_id = seed_searchable_kb("test_kb_remove")
 
-    index_document(kb_id, "doc_001", "建设工程质量管理条例内容分析与解读规范文件", source_name="quality.txt")
-    index_document(kb_id, "doc_002", "建设工程安全生产管理条例全文规定与实施细则", source_name="safety.txt")
-    index_document(kb_id, "doc_003", "招标投标法实施条例详细解读版本全文内容整理", source_name="bid.txt")
+    _index_document(kb_id, "doc_001", "建设工程质量管理条例内容分析与解读规范文件", source_name="quality.txt")
+    _index_document(kb_id, "doc_002", "建设工程安全生产管理条例全文规定与实施细则", source_name="safety.txt")
+    _index_document(kb_id, "doc_003", "招标投标法实施条例详细解读版本全文内容整理", source_name="bid.txt")
 
     import storage.kb_repo as _kb_repo
     kb = _kb_repo.get(kb_id)
@@ -393,7 +466,7 @@ def test_remove_document(seed_searchable_kb):
     assert len(results_before) >= 1
 
     # 删除 doc_003
-    remove_document(kb_id, "doc_003")
+    _remove_document(kb_id, "doc_003")
 
     # 确认删除后搜索结果变化（关于招标的内容不再出现）
     results_after = search([kb_id], "招标", top_k=5)
@@ -413,11 +486,13 @@ def test_rebuild_kb_index():
     # 先通过 doc_svc.import_document 导入文档（自动处理 doc_id → document_ids 映射）
     import services.doc_service as doc_svc
     import services.kb_service as kb_svc
-    from core.index_manager import _write_index_meta
+    from core.kb_index_store import KBIndexStore
     kb = kb_svc.create_kb(name="测试重建", category="national")
     # issues/144 AC#3:production 索引路径在 import 时由 doc_svc 维护 meta,
     # 单元测试绕过 doc_svc,显式 seed。
-    _write_index_meta(kb.id, model_id="BAAI/bge-m3", dim=1024, force=True)
+    KBIndexStore.open(kb.id)._write_index_meta(
+            model_id="BAAI/bge-m3", dim=1024, force=True,
+        )
 
     doc_001 = doc_svc.import_document(
         kb.id, "设计说明.md",
@@ -434,12 +509,12 @@ def test_rebuild_kb_index():
     assert doc_002.id in kb.document_ids
 
     # 先索引一篇，使 FAISS 文件建立
-    index_document(kb.id, doc_001.id, "建筑工程设计文件编制深度规定内容与标准要求")
+    _index_document(kb.id, doc_001.id, "建筑工程设计文件编制深度规定内容与标准要求")
 
     # 中间检查：FAISS 文件落盘了（ADR-0002 下"已建"含义需以字段为准，
     # index_document 不动 kb 元数据；rebuild_kb_index 才会写字段）
-    from core.index_manager import _vectors_dir
-    vectors_dir = _vectors_dir(kb.id)
+    from core.kb_index_store import KBIndexStore
+    vectors_dir = KBIndexStore.open(kb.id)._vectors_dir()
     assert (vectors_dir / "default__vector_store.json").exists(), (
         "index_document 应已落盘 FAISS 文件"
     )
@@ -480,8 +555,8 @@ def test_index_same_doc_twice(seed_searchable_kb):
     """测试重复索引同一文档不报错。"""
     kb_id = seed_searchable_kb("test_kb_duplicate")
 
-    index_document(kb_id, "doc_001", "重复索引测试文档内容验证是否可以多次添加", source_name="dup.txt")
-    index_document(kb_id, "doc_001", "重复索引测试文档内容验证是否可以多次添加", source_name="dup.txt")
+    _index_document(kb_id, "doc_001", "重复索引测试文档内容验证是否可以多次添加", source_name="dup.txt")
+    _index_document(kb_id, "doc_001", "重复索引测试文档内容验证是否可以多次添加", source_name="dup.txt")
 
     import storage.kb_repo as _kb_repo
     kb = _kb_repo.get(kb_id)
@@ -495,7 +570,7 @@ def test_index_same_doc_twice(seed_searchable_kb):
 
 def test_index_markdown_with_headings(seed_searchable_kb):
     """测试带 ## 标题的 Markdown 内容触发 MarkdownNodeParser 分块路径。"""
-    from core.index_manager import _has_markdown_headings
+    from core.kb_index_writer import _has_markdown_headings
 
     kb_id = seed_searchable_kb("test_kb_md_headings")
 
@@ -525,7 +600,7 @@ def test_index_markdown_with_headings(seed_searchable_kb):
     # 验证 _has_markdown_headings 能正确检测 ## 标题
     assert _has_markdown_headings(md_text), "应检测到 Markdown 标题"
 
-    index_document(kb_id, "doc_md", md_text, source_name="standard.md")
+    _index_document(kb_id, "doc_md", md_text, source_name="standard.md")
 
     import storage.kb_repo as _kb_repo
     kb = _kb_repo.get(kb_id)
@@ -555,11 +630,13 @@ def test_async_md_index_builds_faiss():
     import services.kb_service as kb_svc
     import services.doc_service as doc_svc
     import storage.kb_repo as kb_repo
-    from core.index_manager import _write_index_meta
+    from core.kb_index_store import KBIndexStore
 
     kb = kb_svc.create_kb(name="异步MD建索引", category="national")
     # issues/144 AC#3（见上）
-    _write_index_meta(kb.id, model_id="BAAI/bge-m3", dim=1024, force=True)
+    KBIndexStore.open(kb.id)._write_index_meta(
+            model_id="BAAI/bge-m3", dim=1024, force=True,
+        )
     content = (
         "# 技术规范\n\n## 第一章 总则\n\n本规范规定技术要求与验收标准内容。\n\n"
         "## 第二章 要求\n\n各项参数应符合国家标准规定要求。"
@@ -586,26 +663,23 @@ def test_async_md_index_builds_faiss():
 
 def test_save_and_cleanup_doc_vectors():
     """索引文档后验证 .npy 和 _nodes.json 文件落盘，删除后验证清理。"""
-    from core.index_manager import (
-        _save_doc_vectors,
-        _cleanup_doc_vectors,
-        _vectors_dir,
-        _write_index_meta,
-    )
+    from core.kb_index_store import KBIndexStore
 
     kb_id = "test_kb_vectors_persist"
     # issues/144 AC#3:index_document 写入前断言 meta 一致;production 路径
     # 由 doc_svc 自然维护或 backfill 一次性回填。这里直接写测试用 meta。
-    _write_index_meta(kb_id, model_id="BAAI/bge-m3", dim=1024, force=True)
+    KBIndexStore.open(kb_id)._write_index_meta(
+        model_id="BAAI/bge-m3", dim=1024, force=True,
+    )
 
     # 索引文档
-    index_document(
+    _index_document(
         kb_id, "doc_v1",
         "向量持久化测试文档内容，验证 .npy 文件和节点元数据 JSON 文件是否正确落盘。",
         source_name="vectors_test.txt",
     )
 
-    vectors_dir = _vectors_dir(kb_id)
+    vectors_dir = KBIndexStore.open(kb_id)._vectors_dir()
     npy_file = vectors_dir / "doc_v1.npy"
     nodes_file = vectors_dir / "doc_v1_nodes.json"
 
@@ -629,14 +703,14 @@ def test_save_and_cleanup_doc_vectors():
         assert "metadata" in nd
 
     # 清理并验证
-    _cleanup_doc_vectors(kb_id, "doc_v1")
+    KBIndexStore.open(kb_id)._cleanup_doc_vectors("doc_v1")
     assert not npy_file.exists(), ".npy 文件应已删除"
     assert not nodes_file.exists(), "_nodes.json 文件应已删除"
 
 
 def test_rebuild_from_vectors(seed_searchable_kb):
     """从已保存的 .npy 向量文件重建索引后可搜索。"""
-    from core.index_manager import _rebuild_from_vectors, _vectors_dir, clear_cache, _save_doc_vectors, _cleanup_doc_vectors
+    from core.kb_index_store import KBIndexStore
     import storage.kb_repo as _kb_repo
 
     # 用 llm mocked? 不，先正常 index 生成缓存
@@ -646,25 +720,28 @@ def test_rebuild_from_vectors(seed_searchable_kb):
     _kb_repo_cached.document_ids = ["doc_vec_rebuild"]
     _kb_repo.update(_kb_repo_cached)
 
-    index_document(
+    _index_document(
         kb_id, "doc_vec_rebuild",
         "从向量缓存重建索引的功能测试文档，验证重建后仍能正确搜索到相关内容与关键字匹配。",
         source_name="rebuild_test.txt",
     )
 
     # 确认向量文件存在
-    vectors_dir = _vectors_dir(kb_id)
+    vectors_dir = KBIndexStore.open(kb_id)._vectors_dir()
     assert (vectors_dir / "doc_vec_rebuild.npy").exists()
 
     # 清缓存 + 删 FAISS 索引文件，模拟"只有向量缓存，没有索引"的状态
-    clear_cache()
+    from core.kb_index_store import reset_singletons
+    reset_singletons()
     store_file = vectors_dir / "default__vector_store.json"
     if store_file.exists():
         store_file.unlink()
 
     # 重建
     progress = []
-    _rebuild_from_vectors(kb_id, ["doc_vec_rebuild"], progress_callback=lambda c, t, n: progress.append((c, t, n)))
+    KBIndexStore.open(kb_id).rebuild_from_vectors(
+        ["doc_vec_rebuild"], progress_callback=lambda c, t, n: progress.append((c, t, n))
+    )
 
     # 验证 progress 回调
     assert len(progress) >= 1
@@ -681,18 +758,18 @@ def test_rebuild_from_vectors(seed_searchable_kb):
     assert len(results) >= 1, "从向量缓存重建后应能搜索到结果"
 
     # 清理
-    _cleanup_doc_vectors(kb_id, "doc_vec_rebuild")
+    KBIndexStore.open(kb_id)._cleanup_doc_vectors("doc_vec_rebuild")
 
 
 def test_remove_document_fallback_path(monkeypatch, seed_searchable_kb):
     """强制 delete_ref_doc 抛异常 → fallback 到 _rebuild_from_vectors 路径。"""
-    from core.index_manager import _vectors_dir
+    from core.kb_index_store import KBIndexStore
     import storage.kb_repo as kb_repo
 
     kb_id = seed_searchable_kb("test_kb_remove_fallback")
 
-    index_document(kb_id, "doc_fb_1", "建设工程质量管理条例内容分析与解读规范文件全文", source_name="fb1.txt")
-    index_document(kb_id, "doc_fb_2", "建设工程安全生产管理条例全文规定与实施细则", source_name="fb2.txt")
+    _index_document(kb_id, "doc_fb_1", "建设工程质量管理条例内容分析与解读规范文件全文", source_name="fb1.txt")
+    _index_document(kb_id, "doc_fb_2", "建设工程安全生产管理条例全文规定与实施细则", source_name="fb2.txt")
 
     # 更新 KB document_ids（正常路径由 doc_service 维护，这里手动补上）
     kb = kb_repo.get(kb_id)
@@ -703,18 +780,19 @@ def test_remove_document_fallback_path(monkeypatch, seed_searchable_kb):
     assert get_kb_index_built(kb_id)
 
     # 强制 delete_ref_doc 抛异常，触发 fallback 路径
-    original_delete = get_kb_index(kb_id).delete_ref_doc
+    from core.kb_index_store import KBIndexStore
+    original_delete = KBIndexStore.open(kb_id)._get_index().delete_ref_doc
 
     def _raise(*a, **k):
         raise RuntimeError("simulated delete_ref_doc failure")
 
-    monkeypatch.setattr(get_kb_index(kb_id), "delete_ref_doc", _raise)
+    monkeypatch.setattr(KBIndexStore.open(kb_id)._get_index(), "delete_ref_doc", _raise)
 
     # 删除 doc_fb_2（应该走 fallback 路径）
-    remove_document(kb_id, "doc_fb_2")
+    _remove_document(kb_id, "doc_fb_2")
 
     # 恢复后验证：doc_fb_1 仍然可搜索
-    monkeypatch.setattr(get_kb_index(kb_id), "delete_ref_doc", original_delete)
+    monkeypatch.setattr(KBIndexStore.open(kb_id)._get_index(), "delete_ref_doc", original_delete)
     # rebuild 路径手工镜像 searchable（fallback 走过 _rebuild_from_vectors）
     kb = kb_repo.get(kb_id)
     kb.index_status = "searchable"
@@ -723,7 +801,7 @@ def test_remove_document_fallback_path(monkeypatch, seed_searchable_kb):
     assert len(results) >= 1, "fallback 重建后应仍能搜索到剩余文档"
 
     # 验证被删除文档的向量文件已清理
-    vectors_dir = _vectors_dir(kb_id)
+    vectors_dir = KBIndexStore.open(kb_id)._vectors_dir()
     assert not (vectors_dir / "doc_fb_2.npy").exists(), "被删除文档的向量缓存应已清理"
     assert (vectors_dir / "doc_fb_1.npy").exists(), "剩余文档的向量缓存应保留"
 
@@ -734,11 +812,13 @@ def test_rebuild_kb_index_mixed_vectors():
     import services.doc_service as doc_svc
     import storage.kb_repo as kb_repo
     import storage.doc_repo as doc_repo
-    from core.index_manager import _write_index_meta
+    from core.kb_index_store import KBIndexStore
 
     kb = kb_svc.create_kb(name="混合重建", category="national")
     # issues/144 AC#3
-    _write_index_meta(kb.id, model_id="BAAI/bge-m3", dim=1024, force=True)
+    KBIndexStore.open(kb.id)._write_index_meta(
+            model_id="BAAI/bge-m3", dim=1024, force=True,
+        )
 
     # doc_A：正常导入（会建索引 + 向量缓存）
     doc_a = doc_svc.import_document(
@@ -759,8 +839,8 @@ def test_rebuild_kb_index_mixed_vectors():
     kb_repo.update(kb)
 
     # 确认 doc_A 有向量缓存，doc_B 没有
-    from core.index_manager import _vectors_dir
-    vectors_dir = _vectors_dir(kb.id)
+    from core.kb_index_store import KBIndexStore
+    vectors_dir = KBIndexStore.open(kb.id)._vectors_dir()
     assert (vectors_dir / f"{doc_a.id}.npy").exists(), "doc_A 应有向量缓存"
     assert not (vectors_dir / f"{doc_b.id}.npy").exists(), "doc_B 应无向量缓存"
 
@@ -920,11 +1000,11 @@ def test_index_document_does_not_impose_per_page_cuts(seed_searchable_kb):
     # 整篇文本：pages 顺序合并 + 段间空行（heading 后换行）。
     full_text = "\n\n".join([page0, page1, page2, page3])
 
-    index_document("kb_cross", "doc_cross", full_text,
+    _index_document("kb_cross", "doc_cross", full_text,
                    source_name="GB50034", by_page=by_page)
 
-    from core.index_manager import get_kb_index
-    idx = get_kb_index("kb_cross")
+    from core.kb_index_store import KBIndexStore
+    idx = KBIndexStore.open("kb_cross")._get_index()
     nodes = list(idx.docstore.docs.values())
 
     # 核心不变量 1：5.2 节作为一个完整 chunk 存在（同时含 500lx 与 100lx）
@@ -980,7 +1060,7 @@ def _make_chunk_node(text: str, page_number: int | None):
 
 def test_inject_block_range_no_layout_all_none():
     """by_layout=None → 所有 chunk.block_range = None(走 fallback 高亮)。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     nodes = [
         _make_chunk_node("文本 A", 0),
@@ -993,7 +1073,7 @@ def test_inject_block_range_no_layout_all_none():
 
 def test_inject_block_range_empty_nodes_noop():
     """空 nodes → 不抛。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     # 不应抛
     _inject_block_range([], by_page=None, by_layout=[])
@@ -1002,7 +1082,7 @@ def test_inject_block_range_empty_nodes_noop():
 
 def test_inject_block_range_single_block_match():
     """单 block chunk:覆盖 1 个 block → block_range = (n, n)。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     by_layout = _make_layout([
         _make_block("公司各应急保障单位应当配置", 5),
@@ -1016,7 +1096,7 @@ def test_inject_block_range_single_block_match():
 
 def test_inject_block_range_multi_block_range():
     """OCR 把 chunk 拆散到多个 block → block_range = (min, max),max > min。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     by_layout = _make_layout([
         _make_block("无关内容", 0),
@@ -1036,7 +1116,7 @@ def test_inject_block_range_multi_block_range():
 
 def test_inject_block_range_picks_block_by_order():
     """block 乱序时按 block_order 升序扫描,命中区间正确。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     # 故意把 block 乱序传入
     by_layout = _make_layout([
@@ -1055,7 +1135,7 @@ def test_inject_block_range_picks_block_by_order():
 
 def test_inject_block_range_no_match_yields_none():
     """找不到任何命中 → block_range = None,不阻塞。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     by_layout = _make_layout([
         _make_block("完全无关的 PDF 内容", 0),
@@ -1069,7 +1149,7 @@ def test_inject_block_range_no_match_yields_none():
 
 def test_inject_block_range_page_out_of_range_yields_none():
     """page_number 越界 → None(不抛)。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     by_layout = _make_layout([_make_block("内容", 0)])
     nodes = [_make_chunk_node("内容", 99)]  # 越界
@@ -1079,7 +1159,7 @@ def test_inject_block_range_page_out_of_range_yields_none():
 
 def test_inject_block_range_no_page_number_yields_none():
     """page_number = None → None(由 _inject_page_number 已写过,这里读出来兜底)。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     by_layout = _make_layout([_make_block("内容", 0)])
     nodes = [_make_chunk_node("内容", None)]
@@ -1089,7 +1169,7 @@ def test_inject_block_range_no_page_number_yields_none():
 
 def test_inject_block_range_picks_correct_page():
     """chunk 在第 2 页,只在该页 blocks 里找,不在第 1 页找。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     by_layout = _make_layout(
         # 第 0 页有"公司各应急保障"——与第 1 页 chunk 无关,不能误匹配
@@ -1108,7 +1188,7 @@ def test_inject_block_range_picks_correct_page():
 
 def test_inject_block_range_punctuation_normalized():
     """标点差异经归一化后命中(NFKC + 去标点)。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     by_layout = _make_layout([
         _make_block("公司各应急保障单位。应当配置——800兆对讲机", 0),
@@ -1123,7 +1203,7 @@ def test_inject_block_range_punctuation_normalized():
 
 def test_inject_block_range_fullwidth_normalized():
     """全角字符经 NFKC 归一化后命中(对齐 layoutMatch.norm 的 NFKC 契约)。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     by_layout = _make_layout([
         _make_block("800兆对讲机", 0),
@@ -1138,7 +1218,7 @@ def test_inject_block_range_fullwidth_normalized():
 
 def test_inject_block_range_ocr_typo_lcs_fallback():
     """OCR 单字错但 chunk 够长 → LCS 兜底命中。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     long_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
     by_layout = _make_layout([
@@ -1153,7 +1233,7 @@ def test_inject_block_range_ocr_typo_lcs_fallback():
 
 def test_inject_block_range_short_string_no_lcs():
     """短串(< 4 字符)includes miss 时不跑 LCS,直接 None。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     by_layout = _make_layout([
         _make_block("wxyz", 0),
@@ -1166,7 +1246,7 @@ def test_inject_block_range_short_string_no_lcs():
 
 def test_inject_block_range_empty_page_blocks():
     """该页没有 layout blocks(layout 退化)→ chunk.block_range = None。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     by_layout = _make_layout([])  # 第 0 页 blocks=[]
     nodes = [_make_chunk_node("任何内容", 0)]
@@ -1176,7 +1256,7 @@ def test_inject_block_range_empty_page_blocks():
 
 def test_inject_block_range_layout_dict_input_compat():
     """by_layout 传 list[dict] 时也能工作(旧 API 残留兼容)。"""
-    from core.index_manager import _inject_block_range
+    from core.kb_index_writer import _inject_block_range
 
     layout_dicts = [
         {"page": 0, "blocks": [{"block_content": "公司各应急保障", "block_order": 0}], "width": 0, "height": 0},
@@ -1194,7 +1274,7 @@ def test_index_document_writes_block_range_for_pdf_layout(seed_searchable_kb, fa
 
     这是 V8-S2 的核心不变量:不再 no-op,真实产出 block_range。
     """
-    from core.index_manager import get_kb_index
+    from core.kb_index_store import KBIndexStore
     from core.parse_document import PageLayout, PageText
 
     kb_id = seed_searchable_kb("test_kb_block_range")
@@ -1212,7 +1292,7 @@ def test_index_document_writes_block_range_for_pdf_layout(seed_searchable_kb, fa
         ],
     )]
 
-    index_document(
+    _index_document(
         kb_id, "doc_br",
         full_text,
         source_name="br_test.txt",
@@ -1227,7 +1307,7 @@ def test_index_document_writes_block_range_for_pdf_layout(seed_searchable_kb, fa
     _kb_repo.update(kb)
 
     # 读 nodes,验证 block_range
-    idx = get_kb_index(kb_id)
+    idx = KBIndexStore.open(kb_id)._get_index()
     nodes = list(idx.docstore.docs.values())
     assert len(nodes) >= 1, "应至少有 1 个 chunk"
 
@@ -1263,7 +1343,7 @@ def test_search_hit_dict_includes_block_range(seed_searchable_kb, fake_models):
         ],
     )]
 
-    index_document(
+    _index_document(
         kb_id, "doc_br_search",
         full_text,
         source_name="br_search.txt",
@@ -1297,7 +1377,7 @@ def test_search_hit_dict_block_range_none_for_old_kb(seed_searchable_kb, fake_mo
 
     # 直接构造 node(模拟旧 KB metadata 不含 block_range 的场景)
     # 通过 index_document + 直接修改 metadata 来模拟
-    index_document(
+    _index_document(
         kb_id, "doc_old",
         "旧知识库内容文本测试用例,验证无 block_range 时 hit 字段透传为 None。",
         source_name="old.txt",
@@ -1309,7 +1389,7 @@ def test_search_hit_dict_block_range_none_for_old_kb(seed_searchable_kb, fake_mo
     _kb_repo.update(kb)
 
     # 直接 pop metadata["block_range"] 模拟旧 KB chunk
-    idx = get_kb_index(kb_id)
+    idx = KBIndexStore.open(kb_id)._get_index()
     for doc_id in list(idx.docstore.docs.keys()):
         try:
             node = idx.docstore.get_document(doc_id)

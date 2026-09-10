@@ -16,11 +16,12 @@ import pytest
 import services.doc_service as doc_svc
 import services.kb_service as kb_svc
 import storage.kb_repo as kb_repo
-from core.index_manager import (
-    rebuild_kb_index,
-    get_kb_index_built,
-    _vectors_dir,
+from core.kb_index_status import get_kb_index_built
+from core.kb_index_store import KBIndexStore
+from core.kb_index_writer import KBIndexWriter
+from services.vector_search import (
     index_document,
+    rebuild_kb_index,
 )
 from models.knowledge_base import KnowledgeBase
 
@@ -73,11 +74,13 @@ def test_rebuild_failure_writes_failed_with_error():
     函数顶层 try/except 把字段写回 'failed' 并保留错误信息。
     """
     import unittest.mock as mock
-    from core.index_manager import _write_index_meta
+    from core.kb_index_store import KBIndexStore
 
     kb = kb_svc.create_kb(name="fail KB", category="national")
     # issues/144 AC#3：让 doc_svc.import_document 不被新断言阻断
-    _write_index_meta(kb.id, model_id="BAAI/bge-m3", dim=1024, force=True)
+    KBIndexStore.open(kb.id)._write_index_meta(
+        model_id="BAAI/bge-m3", dim=1024, force=True,
+    )
     doc_svc.import_document(
         kb.id, "x.md",
         "# 重建失败测试\n\n## 一章\n\n用于触发 KB rebuild 的失败路径。".encode(),

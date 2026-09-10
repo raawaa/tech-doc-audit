@@ -17,7 +17,8 @@ import threading
 import pytest
 
 import storage.kb_repo as kb_repo
-from core.index_manager import _vectors_dir, get_kb_index_built
+from core.kb_index_status import get_kb_index_built
+from core.kb_index_store import KBIndexStore
 from models.knowledge_base import KnowledgeBase
 
 
@@ -31,7 +32,7 @@ def _kb_with_doc_vectors(kb_id: str, doc_ids: list[str]):
     kb = KnowledgeBase(id=kb_id, name=f"分层测试-{kb_id}", category="national")
     kb.document_ids = doc_ids
     kb_repo.update(kb)
-    vectors_dir = _vectors_dir(kb_id)
+    vectors_dir = KBIndexStore.open(kb_id)._vectors_dir()
     vectors_dir.mkdir(parents=True, exist_ok=True)
     for did in doc_ids:
         # 写一个有效但空的 numpy 数组占位

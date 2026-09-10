@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import contextlib
 import json as _json
-import os
 import shutil
 import threading
 from datetime import datetime, timezone
@@ -53,14 +52,10 @@ from llama_index.vector_stores.faiss import FaissVectorStore
 
 import faiss
 
+from core.data_dir import get_data_dir
 from core.logger import get_logger
 
 _logger = get_logger(__name__)
-
-
-def get_data_dir() -> Path:
-    """解析数据根目录;每次调用读取 env(issue #137 per-test 隔离)。"""
-    return Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 
 
 # ── 单例化:同一 kb_id 在不同调用方之间共享同一份 KBIndexStore ──────────────

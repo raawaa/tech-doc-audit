@@ -17,18 +17,13 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Optional
 
+from core.data_dir import get_data_dir
 from core.logger import get_logger
 
 _logger = get_logger(__name__)
-
-
-def get_data_dir() -> Path:
-    """解析数据根目录；每次调用读取 env（issue #137 per-test 隔离）。"""
-    return Path(os.environ.get("AUDIT_DATA_DIR", "./data"))
 
 
 # 报告文件名。模块级常量：测试与 #111 的报告端点都据此定位，不各自拼字符串。

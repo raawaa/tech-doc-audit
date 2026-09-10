@@ -217,10 +217,10 @@ def test_reparse_end_to_end_stores_pages_and_reindexes(reparse_target_kb_text):
     assert isinstance(pages.get("layout"), list)
 
     # 验证：重建索引后 chunks 包含文档文本（正路闭环，#135 补齐原断言缺口）
-    from core.index_manager import search
+    from services.vector_search import search
     hits = search(
         [kb.id], "Safety Production Responsibility System",
-        top_k=3, use_reranker=False,
+        top_k=3, rebuild_if_missing=False,
     )
     assert any(
         h.get("doc_id") == doc.id
@@ -326,6 +326,7 @@ def test_reparse_passes_by_layout_to_index_document(
     """
     from unittest.mock import MagicMock, patch
     from core.parse_document import Block, PageLayout, PageText, ParseResult
+    from core.kb_index_store import KBIndexStore
 
     kb, doc, _ = reparse_target_kb
 
@@ -339,10 +340,14 @@ def test_reparse_passes_by_layout_to_index_document(
 
     # 用 unittest.mock.patch 拦截 import 时已绑定的名字（monkeypatch.setattr 对
     # `from x import y` 形式的 import 无效 —— y 是模块级本地名, 不能从外部重绑）
+    # issue #171 / PR-4:reparse 走 ``KBIndexWriter.index_documents`` 而非旧
+    # ``index_document`` —— 测的是"reparse 把 by_layout 透传到 writer"的契约,
+    # 因此把 patch 切到 ``KBIndexWriter.index_documents``。
+    from core.kb_index_writer import KBIndexWriter
     with patch("services.reparse_service.parse_document", return_value=fake_parse_result), \
          patch("services.reparse_service.save_pages", return_value=None), \
-         patch("services.reparse_service.remove_document", return_value=None), \
-         patch("services.reparse_service.index_document", return_value=None) as mock_idx, \
+         patch.object(KBIndexStore, "remove_doc", return_value=None), \
+         patch.object(KBIndexWriter, "index_documents", return_value=[]) as mock_idx, \
          patch("services.reparse_service.kb_repo") as mock_kb_repo, \
          patch("services.reparse_service.doc_repo") as mock_doc_repo:
         # 模拟 kb_repo.get(kb_id) → KB 实例(index_status 等可写)
@@ -360,10 +365,12 @@ def test_reparse_passes_by_layout_to_index_document(
         _reparse_async(kb.id, doc.id, kb_writer)
 
     mock_idx.assert_called_once()
-    call = mock_idx.call_args
-    # 位置/关键字参数: by_layout 必须在 kwargs 里
-    assert call.kwargs.get("by_layout") is fake_layout, (
-        f"reparse 必须把 parse_result.layout 传给 index_document.by_layout，"
+    # KBIndexWriter.index_documents([Doc(...)]):第一个位置参数是 docs 列表。
+    docs_arg = mock_idx.call_args.args[0]
+    assert len(docs_arg) == 1
+    doc_input = docs_arg[0]
+    assert doc_input.by_layout is fake_layout, (
+        f"reparse 必须把 parse_result.layout 传给 KBIndexWriter 的 Doc.by_layout，"
         f"否则 _inject_block_range 永远拿不到 layout, block_range 永远 None。"
-        f"实际 call={call!r}"
+        f"实际 doc_input={doc_input!r}"
     )

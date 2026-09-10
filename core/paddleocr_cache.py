@@ -16,9 +16,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-def get_data_dir() -> Path:
-    """解析数据根目录；每次调用读取 env（issue #137 per-test 隔离）。"""
-    return Path(os.environ.get("AUDIT_DATA_DIR", "data"))
+from core.data_dir import get_data_dir
 
 
 def get_cache_dir() -> Path:

@@ -62,17 +62,15 @@ import storage.doc_repo as doc_repo
 
 
 def _get_embed_batch_with_retry():
-    """Lazily resolve ``embed_batch_with_retry`` from ``core.index_manager``.
+    """Lazily resolve ``embed_batch_with_retry`` from ``core.embed_retry``.
 
-    走 ``core.index_manager.embed_batch_with_retry``(re-export 同一函数对象)
-    而非 ``core.embed_retry.embed_batch_with_retry`` 直接 import —— 这样
-    现有 tests ``monkeypatch.setattr("core.index_manager.embed_batch_with_retry", ...)``
-    仍能拦截 writer 的真实调用路径,无需把 test 改去 patch 不同的模块路径。
-    改为 lazy import 是为了打破 ``core.kb_index_writer`` ↔ ``core.index_manager``
-    的循环 import(后者从前者 import ``KBIndexWriter`` / ``Doc`` / ``DocResult``)。
+    issue #171 / PR-4 之前曾通过 ``core.index_manager.embed_batch_with_retry``
+    间接访问,让既有测试 ``monkeypatch.setattr("core.index_manager.embed_batch_with_retry", ...)``
+    能拦截 writer 的真实调用路径。``core.index_manager`` 删除后,直接走
+    ``core.embed_retry.embed_batch_with_retry`` —— 单点源头、零转发开销。
     """
-    import core.index_manager as _im
-    return _im.embed_batch_with_retry
+    from core.embed_retry import embed_batch_with_retry
+    return embed_batch_with_retry
 
 _logger = get_logger(__name__)
 
@@ -475,7 +473,7 @@ def _inject_page_number(nodes: list, by_page) -> None:
         node.metadata["page_number"] = page_num
 
 
-def _inject_block_range(nodes: list, by_layout=None) -> list:
+def _inject_block_range(nodes: list, by_layout=None, by_page=None) -> list:
     """把 chunk 覆盖的 KB layout block 区间写进 ``node.metadata["block_range"]``。
 
     这是 "for-all-nodes inject" 循环(issue #165 PR-3 决策:留在 Writer,
@@ -489,6 +487,10 @@ def _inject_block_range(nodes: list, by_layout=None) -> list:
       - ``by_layout``:``list[PageLayout]`` / ``list[dict]`` / ``None``。
         ``None`` 或缺页 → ``chunk.block_range = None``(非 PDF / 旧 KB /
         异常 layout 走 fallback)。
+      - ``by_page``:PR-4 兼容旧契约参数(传 ``None`` 即可,实际不使用)。
+        历史上 ``_inject_block_range(nodes, by_page=..., by_layout=...)`` 同时
+        接两个,实际只有 ``by_layout`` 被消费,这里把 ``by_page`` 也接受以
+        保留 tests 与旧调用方的契约;值被忽略。
       - 输出:原 nodes(原地改 ``metadata``),便于调用方链式接住。
       - 找不到任何命中(罕见,OCR 重排 / 字符差异大)→ 写 ``None``,不抛、
         不阻塞索引。
@@ -497,6 +499,7 @@ def _inject_block_range(nodes: list, by_layout=None) -> list:
     """
     if not nodes:
         return nodes
+    del by_page  # 兼容旧契约;实际注入路径只读 by_layout
     normalized_layout = normalize_layout(by_layout)
     for node in nodes:
         if normalized_layout is None:

@@ -27,6 +27,8 @@ import pytest
 import storage.doc_repo as doc_repo
 import storage.kb_repo as kb_repo
 from core import bulk_reparse_report_store, paddleocr_cache, pages_store
+from core.kb_index_store import KBIndexStore
+from core.kb_index_writer import KBIndexWriter
 from models.knowledge_base import KnowledgeBase
 
 
@@ -424,8 +426,8 @@ def test_every_target_doc_has_non_empty_layout_after_a_bulk_run(kb, monkeypatch)
     )
 
     with patch("services.reparse_service.parse_document", return_value=parsed), \
-         patch("services.reparse_service.index_document"), \
-         patch("services.reparse_service.remove_document"):
+         patch.object(KBIndexWriter, "index_documents"), \
+         patch.object(KBIndexStore, "remove_doc"):
         result = svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=2)
 
     assert sorted(result.done) == sorted(d.id for d in docs), result.failed

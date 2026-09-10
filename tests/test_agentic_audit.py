@@ -165,14 +165,14 @@ class TestV8S4FlagIssueBlockRange:
 
     def test_lookup_chunk_block_range_with_valid_inputs(self, fake_models):
         """合法 doc_id + page_number + chunk_text → 命中,返回 block_range。"""
-        from core.index_manager import index_document
+        from core.kb_index_writer import Doc, KBIndexWriter
         from core.parse_document import PageLayout, PageText
         from services.agentic_audit import _lookup_chunk_block_range
 
         kb_id = "test_kb_v8s4_lookup"
         import storage.kb_repo as _kb_repo
         from models.knowledge_base import KnowledgeBase
-        from core.index_manager import _write_index_meta
+        from core.kb_index_store import KBIndexStore
         kb = KnowledgeBase(id=kb_id, name="v8s4", category="national")
         _kb_repo.update(kb)
         kb = _kb_repo.get(kb_id)
@@ -180,12 +180,14 @@ class TestV8S4FlagIssueBlockRange:
         kb.index_status = "searchable"
         _kb_repo.update(kb)
         # issues/144 AC#3
-        _write_index_meta(kb_id, model_id="BAAI/bge-m3", dim=1024, force=True)
+        KBIndexStore.open(kb_id)._write_index_meta(
+            model_id="BAAI/bge-m3", dim=1024, force=True,
+        )
 
         full_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
-        index_document(
-            kb_id, "doc_v8s4",
-            full_text,
+        KBIndexWriter(kb_id).index_documents([Doc(
+            doc_id="doc_v8s4",
+            text=full_text,
             source_name="v8s4.txt",
             by_page=[PageText(page=0, text=full_text)],
             by_layout=[PageLayout(
@@ -196,7 +198,7 @@ class TestV8S4FlagIssueBlockRange:
                     _make_block("设备至少两套", 2),
                 ],
             )],
-        )
+        )])
 
         result = _lookup_chunk_block_range(
             standard_doc_id="doc_v8s4",
@@ -228,14 +230,14 @@ class TestV8S4FlagIssueBlockRange:
 
     def test_lookup_chunk_block_range_page_number_zero_no_filter(self, fake_models):
         """page_number=0(LLM 越界)→ 不按页过滤,仍能按 doc_id + chunk_text 命中。"""
-        from core.index_manager import index_document
+        from core.kb_index_writer import Doc, KBIndexWriter
         from core.parse_document import PageLayout, PageText
         from services.agentic_audit import _lookup_chunk_block_range
 
         kb_id = "test_kb_v8s4_p0"
         import storage.kb_repo as _kb_repo
         from models.knowledge_base import KnowledgeBase
-        from core.index_manager import _write_index_meta
+        from core.kb_index_store import KBIndexStore
         kb = KnowledgeBase(id=kb_id, name="v8s4p0", category="national")
         _kb_repo.update(kb)
         kb = _kb_repo.get(kb_id)
@@ -243,18 +245,21 @@ class TestV8S4FlagIssueBlockRange:
         kb.index_status = "searchable"
         _kb_repo.update(kb)
         # issues/144 AC#3
-        _write_index_meta(kb_id, model_id="BAAI/bge-m3", dim=1024, force=True)
+        KBIndexStore.open(kb_id)._write_index_meta(
+            model_id="BAAI/bge-m3", dim=1024, force=True,
+        )
 
         full_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
-        index_document(
-            kb_id, "doc_v8s4p0",
-            full_text, source_name="p0.txt",
+        KBIndexWriter(kb_id).index_documents([Doc(
+            doc_id="doc_v8s4p0",
+            text=full_text,
+            source_name="p0.txt",
             by_page=[PageText(page=0, text=full_text)],
             by_layout=[PageLayout(
                 page=0, width=0, height=0,
                 blocks=[_make_block("公司各应急保障单位应当配置无线对讲设备至少两套", 0)],
             )],
-        )
+        )])
 
         result = _lookup_chunk_block_range(
             standard_doc_id="doc_v8s4p0",
@@ -266,14 +271,14 @@ class TestV8S4FlagIssueBlockRange:
 
     def test_lookup_chunk_block_range_chunk_text_mismatch_returns_none(self, fake_models):
         """chunk_text 不匹配该节点 → None(LLM 幻觉/乱填)。"""
-        from core.index_manager import index_document
+        from core.kb_index_writer import Doc, KBIndexWriter
         from core.parse_document import PageLayout, PageText
         from services.agentic_audit import _lookup_chunk_block_range
 
         kb_id = "test_kb_v8s4_mismatch"
         import storage.kb_repo as _kb_repo
         from models.knowledge_base import KnowledgeBase
-        from core.index_manager import _write_index_meta
+        from core.kb_index_store import KBIndexStore
         kb = KnowledgeBase(id=kb_id, name="v8s4mm", category="national")
         _kb_repo.update(kb)
         kb = _kb_repo.get(kb_id)
@@ -281,18 +286,21 @@ class TestV8S4FlagIssueBlockRange:
         kb.index_status = "searchable"
         _kb_repo.update(kb)
         # issues/144 AC#3
-        _write_index_meta(kb_id, model_id="BAAI/bge-m3", dim=1024, force=True)
+        KBIndexStore.open(kb_id)._write_index_meta(
+            model_id="BAAI/bge-m3", dim=1024, force=True,
+        )
 
         full_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
-        index_document(
-            kb_id, "doc_v8s4mm",
-            full_text, source_name="mm.txt",
+        KBIndexWriter(kb_id).index_documents([Doc(
+            doc_id="doc_v8s4",
+            text=full_text,
+            source_name="v8s4.txt",
             by_page=[PageText(page=0, text=full_text)],
             by_layout=[PageLayout(
                 page=0, width=0, height=0,
                 blocks=[_make_block(full_text, 0)],
             )],
-        )
+        )])
 
         result = _lookup_chunk_block_range(
             standard_doc_id="doc_v8s4mm",
@@ -304,7 +312,7 @@ class TestV8S4FlagIssueBlockRange:
 
     def test_tool_flag_issue_fills_block_range_from_kb(self, fake_models):
         """_tool_flag_issue: LLM 提交合法 standard_* → block_range 非空。"""
-        from core.index_manager import index_document
+        from core.kb_index_writer import Doc, KBIndexWriter
         from core.parse_document import PageLayout, PageText
         from services.agentic_audit import _tool_flag_issue
         from models.llm_schemas import AgentAction
@@ -312,7 +320,7 @@ class TestV8S4FlagIssueBlockRange:
         kb_id = "test_kb_v8s4_flag"
         import storage.kb_repo as _kb_repo
         from models.knowledge_base import KnowledgeBase
-        from core.index_manager import _write_index_meta
+        from core.kb_index_store import KBIndexStore
         kb = KnowledgeBase(id=kb_id, name="v8s4flag", category="national")
         _kb_repo.update(kb)
         kb = _kb_repo.get(kb_id)
@@ -321,12 +329,15 @@ class TestV8S4FlagIssueBlockRange:
         _kb_repo.update(kb)
         # issues/144 AC#3：production 路径走 services.kb_service.create_kb
         # 自动落 meta;此处直接建 KB 元数据,显式 seed。
-        _write_index_meta(kb_id, model_id="BAAI/bge-m3", dim=1024, force=True)
+        KBIndexStore.open(kb_id)._write_index_meta(
+            model_id="BAAI/bge-m3", dim=1024, force=True,
+        )
 
         full_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
-        index_document(
-            kb_id, "doc_flag",
-            full_text, source_name="flag.txt",
+        KBIndexWriter(kb_id).index_documents([Doc(
+            doc_id="doc_flag",
+            text=full_text,
+            source_name="flag.txt",
             by_page=[PageText(page=0, text=full_text)],
             by_layout=[PageLayout(
                 page=0, width=0, height=0,
@@ -336,7 +347,7 @@ class TestV8S4FlagIssueBlockRange:
                     _make_block("设备至少两套", 2),
                 ],
             )],
-        )
+        )])
 
         issues = []
         action = AgentAction(

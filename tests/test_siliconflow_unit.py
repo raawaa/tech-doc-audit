@@ -27,30 +27,29 @@ def test_index_meta_path_is_consistent():
 
     防重构破坏路径常量(issues/144 AC#1 要求文件名一致)。
     """
-    from core.index_manager import _index_meta_path, _vectors_dir, INDEX_META_FILENAME
+    from core.kb_index_store import KBIndexStore, INDEX_META_FILENAME
 
-    assert _index_meta_path("kb_xyz") == _vectors_dir("kb_xyz") / INDEX_META_FILENAME
+    store = KBIndexStore.open("kb_xyz")
+    assert store._index_meta_path() == store._vectors_dir() / INDEX_META_FILENAME
     assert INDEX_META_FILENAME == "index.meta.json"
 
 
 def test_write_then_read_index_meta_roundtrip(tmp_path, monkeypatch):
-    """``_write_index_meta`` 写入后 ``_read_index_meta`` 能读回同样字段。"""
+    """``_write_index_meta`` 写入后 ``get_meta`` 能读回同样字段。"""
     monkeypatch.setenv("AUDIT_DATA_DIR", str(tmp_path))
     # 清缓存:测试隔离
-    from core import index_manager as im
-    im.clear_cache()
+    from core import kb_index_store as store_mod
+    store_mod.reset_singletons()
 
-    from core.index_manager import (
-        _write_index_meta,
-        _read_index_meta,
+    from core.kb_index_store import KBIndexStore
+
+    store = KBIndexStore.open("kb_roundtrip")
+    assert store.get_meta() is None
+
+    store._write_index_meta(
+        model_id="BAAI/bge-m3", dim=1024, force=True,
     )
-
-    assert _read_index_meta("kb_roundtrip") is None
-
-    _write_index_meta(
-        "kb_roundtrip", model_id="BAAI/bge-m3", dim=1024, force=True,
-    )
-    meta = _read_index_meta("kb_roundtrip")
+    meta = store.get_meta()
     assert meta is not None
     assert meta["embedding_model_id"] == "BAAI/bge-m3"
     assert meta["embedding_dim"] == 1024
@@ -60,37 +59,36 @@ def test_write_then_read_index_meta_roundtrip(tmp_path, monkeypatch):
 def test_write_index_meta_force_preserves_created_at(tmp_path, monkeypatch):
     """``force=False`` 二次写入不会改 ``created_at``(只在首次设一次)。"""
     monkeypatch.setenv("AUDIT_DATA_DIR", str(tmp_path))
-    from core.index_manager import _write_index_meta, _read_index_meta
+    from core.kb_index_store import KBIndexStore
 
-    _write_index_meta(
-        "kb_idempotent", model_id="BAAI/bge-m3", dim=1024, force=True,
+    store = KBIndexStore.open("kb_idempotent")
+    store._write_index_meta(
+        model_id="BAAI/bge-m3", dim=1024, force=True,
     )
-    first = _read_index_meta("kb_idempotent")["created_at"]
+    first = store.get_meta()["created_at"]
 
-    _write_index_meta(
-        "kb_idempotent", model_id="BAAI/bge-m3", dim=1024, force=False,
+    store._write_index_meta(
+        model_id="BAAI/bge-m3", dim=1024, force=False,
     )
-    second = _read_index_meta("kb_idempotent")["created_at"]
+    second = store.get_meta()["created_at"]
 
     assert first == second, "force=False 不应改写 created_at"
 
 
 def test_assert_kb_embedding_system_matches_raises_on_mismatch(tmp_path, monkeypatch):
-    """``_assert_kb_embedding_system_matches`` 发现 dim 不一致时 raise。"""
+    """``assert_embedding_system_matches`` 发现 dim 不一致时 raise。"""
     monkeypatch.setenv("AUDIT_DATA_DIR", str(tmp_path))
-    from core.index_manager import (
-        _write_index_meta,
-        _assert_kb_embedding_system_matches,
-    )
+    from core.kb_index_store import KBIndexStore
 
+    store = KBIndexStore.open("kb_mismatch")
     # 写入一个错误 dim 标记(模拟 T4 §5.1 repro_kb 事件)
-    _write_index_meta(
-        "kb_mismatch", model_id="some-other-encoder", dim=512, force=True,
+    store._write_index_meta(
+        model_id="some-other-encoder", dim=512, force=True,
     )
 
     with pytest.raises(RuntimeError, match="embedding 体系不一致"):
-        _assert_kb_embedding_system_matches(
-            "kb_mismatch", model_id="BAAI/bge-m3", dim=1024,
+        store.assert_embedding_system_matches(
+            model_id="BAAI/bge-m3", dim=1024,
         )
 
 
@@ -101,48 +99,47 @@ def test_assert_kb_embedding_system_matches_raises_when_meta_missing(tmp_path, m
     ""缺" = "未知状态",任何隐式假定都错。先跑 backfill。
     """
     monkeypatch.setenv("AUDIT_DATA_DIR", str(tmp_path))
-    from core.index_manager import (
-        _read_index_meta,
-        _assert_kb_embedding_system_matches,
-    )
+    from core.kb_index_store import KBIndexStore
 
-    assert _read_index_meta("kb_no_meta") is None
+    store = KBIndexStore.open("kb_no_meta")
+    assert store.get_meta() is None
 
     with pytest.raises(RuntimeError, match="缺 index.meta.json"):
-        _assert_kb_embedding_system_matches(
-            "kb_no_meta", model_id="BAAI/bge-m3", dim=1024,
+        store.assert_embedding_system_matches(
+            model_id="BAAI/bge-m3", dim=1024,
         )
 
     # 应保持缺失(没自动写)
-    assert _read_index_meta("kb_no_meta") is None
+    assert store.get_meta() is None
 
 
 def test_index_document_asserts_embedding_system(seed_searchable_kb, fake_models, tmp_path, monkeypatch):
-    """issues/144 AC#3:写入新 chunk 前 _assert_kb_embedding_system_matches 被调,
+    """issues/144 AC#3:写入新 chunk 前 assert_embedding_system_matches 被调,
     model_id/dim 不符就 raise 不入库。
     """
     monkeypatch.setenv("AUDIT_DATA_DIR", str(tmp_path))
-    import storage.kb_repo as _kb_repo
-    from core.index_manager import (
-        index_document,
-        _write_index_meta,
-        _vectors_dir,
-    )
+    from core.kb_index_store import KBIndexStore
+    from core.kb_index_writer import Doc, KBIndexWriter
 
     seed_searchable_kb("kb_index_doc_assert")
 
     # 写入与 production 不一致的 meta(模拟 T4 §5.1 repro_kb 混入事件)
-    _write_index_meta("kb_index_doc_assert", model_id="wrong-model", dim=512, force=True)
+    KBIndexStore.open("kb_index_doc_assert")._write_index_meta(
+        model_id="wrong-model", dim=512, force=True,
+    )
 
     from core.parse_document import PageText
     by_page = [PageText(page=0, text="hello content page 0 padding for chunking")]
 
+    # PR-4:走 ``KBIndexWriter.index_documents`` 触发 ``KBIndexStore.add_doc`` →
+    # ``assert_embedding_system_matches`` 断言。旧路径 ``index_document(text)``
+    # 已折叠到本入口。
     with pytest.raises(RuntimeError, match="embedding 体系不一致"):
-        index_document(
-            "kb_index_doc_assert", "doc1",
-            "文本长度足够产生 chunks 用于 embedding 体系断言测试。",
+        KBIndexWriter("kb_index_doc_assert").index_documents([Doc(
+            doc_id="doc1",
+            text="文本长度足够产生 chunks 用于 embedding 体系断言测试。",
             by_page=by_page,
-        )
+        )])
 
 
 # ── XLM-R tokenizer 截断 ────────────────────────────────────────────────────

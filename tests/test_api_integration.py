@@ -406,7 +406,8 @@ def test_audit_task_result_exposes_standard_block_range(fake_models):
     """
     from fastapi.testclient import TestClient
     from core.parse_document import Block, PageLayout, PageText
-    from core.index_manager import index_document, get_kb_index
+    from core.kb_index_writer import Doc, KBIndexWriter
+    from core.kb_index_store import KBIndexStore
     from models.llm_schemas import AgentAction
     from services.agentic_audit import _tool_flag_issue
     from models.audit_task import AuditIssue
@@ -432,13 +433,13 @@ def test_audit_task_result_exposes_standard_block_range(fake_models):
             Block(block_order=2, block_content="设备至少两套", bbox_norm=[0, 0.66, 1, 1.0]),
         ],
     )]
-    index_document(
-        kb_id, fake_doc_id,
+    KBIndexWriter(kb_id).index_documents([Doc(
+        doc_id=fake_doc_id,
         text=chunk_text,
         source_name="v8-e2e.pdf",
         by_page=by_page,
         by_layout=fake_layout,
-    )
+    )])
 
     # 3. 把 KB 切回 searchable(让 _lookup_chunk_block_range 能 read)
     kb = _kb_repo.get(kb_id)
@@ -446,7 +447,7 @@ def test_audit_task_result_exposes_standard_block_range(fake_models):
     _kb_repo.update(kb)
 
     # 验证 chunk 真的被写入了 block_range
-    idx = get_kb_index(kb_id)
+    idx = KBIndexStore.open(kb_id)._get_index()
     nodes = [n for n in idx.docstore.docs.values()
              if n.metadata.get("doc_id") == fake_doc_id]
     assert nodes, f"index_document 应当写入了至少一个 chunk, 实际 {len(nodes)} 个"

@@ -11,6 +11,7 @@ import storage.doc_repo as doc_repo
 import storage.kb_repo as kb_repo
 from services.vector_search import index_document as _index_vec
 from core.kb_index_status import KbIndexStatusWriter
+from core.kb_index_writer import Doc, KBIndexWriter
 from core.logger import get_logger
 
 _logger = get_logger(__name__)
@@ -343,8 +344,24 @@ def _batch_index_docs(kb_id: str, docs: list[KBDocument]):
             kb_writer.note_in_flight(doc_name)
 
     try:
-        from core.index_manager import index_documents_batch
-        index_documents_batch(kb_id, texts, progress_callback=_on_progress)
+        # PR-4 / issue #171:走 KBIndexWriter(单入口)而非旧 ``index_documents_batch``。
+        # ``_on_progress`` 在旧契约里承担"前置 callback"职责(每个 doc 索引前调一次),
+        # 而 KBIndexWriter 的进度由 ``kb_status_writer`` 接管 —— 这里显式调
+        # ``note_in_flight`` + ``advance`` 走 writer 通道(避免再次把 per-doc 状态
+        # 写在 ``progress_callback`` 上)。
+        writer = KBIndexWriter(kb_id)
+        for i, (doc_id, text, source_name, by_page) in enumerate(texts, 1):
+            doc_name = source_name or doc_id
+            _on_progress(i, len(texts), doc_name)
+            kb_writer.note_in_flight(doc_name)
+            result = writer.index_documents([Doc(
+                doc_id=doc_id, text=text, source_name=source_name,
+                by_page=by_page,
+            )])
+            if result and result[0].status == "failed":
+                _logger.warning(
+                    "batch indexing: doc %s failed: %s", doc_id, result[0].error,
+                )
         # 锁内 read-modify-write 原子更新完成状态；KB 已删则跳过（不写回陈旧对象）
         # 批量路径此处直接 searchable 而非依赖 rebuild_kb_index（因为我们没调用它）
         with _get_lock(kb_id):

@@ -75,13 +75,14 @@ def inspect(
     max_chunks: int = typer.Option(10, "--max", help="最多显示 chunks"),
 ):
     """查看 KB 的 FAISS 索引状态。"""
-    from core.index_manager import get_kb_index_built, _vectors_dir
+    from core.kb_index_status import get_kb_index_built
+    from core.kb_index_store import KBIndexStore
 
     if not get_kb_index_built(kb_id):
         typer.echo(f"KB {kb_id} 没有 FAISS 索引")
         raise typer.Exit(1)
 
-    d = _vectors_dir(kb_id)
+    d = KBIndexStore.open(kb_id)._vectors_dir()
     import os as _os
     index_path = d / "faiss.index"
     file_size = _os.path.getsize(str(index_path)) if index_path.exists() else 0

@@ -36,12 +36,13 @@ def _seed_kb_with_searchable(kb_id: str = "test_kb_src"):
 
 def test_get_kb_index_built_follows_field_searchable():
     """字段=searchable → 函数返回 True（无需看磁盘）。"""
-    from core.index_manager import get_kb_index_built, _vectors_dir
+    from core.kb_index_status import get_kb_index_built
+    from core.kb_index_store import KBIndexStore
 
     kb = _seed_kb_with_searchable()
 
     # 删除可能不存在的索引目录（彻底无 FAISS 文件）
-    vectors_dir = _vectors_dir(kb.id)
+    vectors_dir = KBIndexStore.open(kb.id)._vectors_dir()
     if vectors_dir.exists():
         shutil.rmtree(vectors_dir)
 
@@ -52,11 +53,12 @@ def test_get_kb_index_built_follows_field_searchable():
 
 def test_get_kb_index_built_returns_false_when_field_none():
     """字段=none → 函数返回 False（即便磁盘上有人造了 FAISS 文件也不变）。"""
-    from core.index_manager import get_kb_index_built, _vectors_dir
+    from core.kb_index_status import get_kb_index_built
+    from core.kb_index_store import KBIndexStore
 
     kb = kb_svc.create_kb(name="空 KB", category="national")
     # 强行构造一个伪造的索引文件
-    vectors_dir = _vectors_dir(kb.id)
+    vectors_dir = KBIndexStore.open(kb.id)._vectors_dir()
     vectors_dir.mkdir(parents=True, exist_ok=True)
     (vectors_dir / "default__vector_store.json").write_text("{}")
 
@@ -69,7 +71,7 @@ def test_get_kb_index_built_returns_false_when_field_none():
 
 
 def test_get_kb_index_built_returns_false_when_field_building():
-    from core.index_manager import get_kb_index_built, _vectors_dir
+    from core.kb_index_status import get_kb_index_built
 
     kb = kb_svc.create_kb(name="building KB", category="national")
     kb.index_status = "building"
@@ -83,7 +85,7 @@ def test_get_kb_index_built_returns_false_when_field_building():
 
 def test_get_kb_index_built_returns_false_for_missing_kb():
     """不存在的 KB → False（与文件 fallback 行为一致）。"""
-    from core.index_manager import get_kb_index_built
+    from core.kb_index_status import get_kb_index_built
 
     assert get_kb_index_built("nonexistent_kb") is False
 
@@ -97,10 +99,11 @@ def test_delete_faiss_files_does_not_flip_truth():
     即使运维误删 FAISS 缓存文件，只要 kb.index_status='searchable'，函数仍返 True
     ——故障不会让状态字段与能力脱钩。
     """
-    from core.index_manager import get_kb_index_built, _vectors_dir
+    from core.kb_index_status import get_kb_index_built
+    from core.kb_index_store import KBIndexStore
 
     kb = _seed_kb_with_searchable()
-    vectors_dir = _vectors_dir(kb.id)
+    vectors_dir = KBIndexStore.open(kb.id)._vectors_dir()
     vectors_dir.mkdir(parents=True, exist_ok=True)
     # 造一个空 FAISS 文件再删掉
     (vectors_dir / "default__vector_store.json").write_text("{}")

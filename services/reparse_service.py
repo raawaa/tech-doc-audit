@@ -21,13 +21,10 @@ from typing import Optional
 
 from core.kb_index_status import KbIndexStatusWriter
 from core.kb_index_store import KBIndexStore
+from core.kb_index_writer import Doc, KBIndexWriter
 from core.logger import get_logger
 from core.parse_document import parse_document, MIN_FULL_TEXT_CHARS, ParseResult
 from core.pages_store import save_pages
-from core.index_manager import (
-    index_document,
-    remove_document,
-)
 import storage.doc_repo as doc_repo
 import storage.kb_repo as kb_repo
 
@@ -110,15 +107,16 @@ def _persist_index(kb_id: str, doc_id: str, parse_result: ParseResult, doc) -> N
         file_hash=doc.content_hash,
     )
     try:
-        remove_document(kb_id, doc_id)
+        KBIndexStore.open(kb_id).remove_doc(doc_id)
     except Exception as e:
         _logger.warning("reparse: failed to remove old nodes for %s: %s", doc_id, e)
-    index_document(
-        kb_id, doc_id, parse_result.full_text,
+    KBIndexWriter(kb_id).index_documents([Doc(
+        doc_id=doc_id,
+        text=parse_result.full_text,
         source_name=doc.original_name,
         by_page=parse_result.by_page,
         by_layout=parse_result.layout,
-    )
+    )])
 
 
 def _reparse_async(
