@@ -180,7 +180,7 @@ class TestV8S4FlagIssueBlockRange:
         kb.index_status = "searchable"
         _kb_repo.update(kb)
         # issues/144 AC#3
-        KBIndexStore.open(kb_id)._write_index_meta(
+        KBIndexStore.open(kb_id).write_index_meta(
             model_id="BAAI/bge-m3", dim=1024, force=True,
         )
 
@@ -245,7 +245,7 @@ class TestV8S4FlagIssueBlockRange:
         kb.index_status = "searchable"
         _kb_repo.update(kb)
         # issues/144 AC#3
-        KBIndexStore.open(kb_id)._write_index_meta(
+        KBIndexStore.open(kb_id).write_index_meta(
             model_id="BAAI/bge-m3", dim=1024, force=True,
         )
 
@@ -286,7 +286,7 @@ class TestV8S4FlagIssueBlockRange:
         kb.index_status = "searchable"
         _kb_repo.update(kb)
         # issues/144 AC#3
-        KBIndexStore.open(kb_id)._write_index_meta(
+        KBIndexStore.open(kb_id).write_index_meta(
             model_id="BAAI/bge-m3", dim=1024, force=True,
         )
 
@@ -329,7 +329,7 @@ class TestV8S4FlagIssueBlockRange:
         _kb_repo.update(kb)
         # issues/144 AC#3：production 路径走 services.kb_service.create_kb
         # 自动落 meta;此处直接建 KB 元数据,显式 seed。
-        KBIndexStore.open(kb_id)._write_index_meta(
+        KBIndexStore.open(kb_id).write_index_meta(
             model_id="BAAI/bge-m3", dim=1024, force=True,
         )
 

@@ -247,7 +247,7 @@ def seed_searchable_kb():
         seeded.append(kb_id)
         # issues/144 写入前的硬关（issues/144 AC#3）—— 测试 fixture 同步
         # 提供生产体系元数据（生产路径由 doc_svc 落，或由 backfill 回填）。
-        KBIndexStore.open(kb_id)._write_index_meta(
+        KBIndexStore.open(kb_id).write_index_meta(
             model_id="BAAI/bge-m3", dim=1024, force=True,
         )
         return kb_id

@@ -307,7 +307,7 @@ class KBIndexWriter:
             if not kb:
                 return
 
-            vectors_dir = Path(store._vectors_dir())
+            vectors_dir = Path(store.vectors_dir)
             doc_ids = list(kb.document_ids)
 
             with_vectors: list[str] = []

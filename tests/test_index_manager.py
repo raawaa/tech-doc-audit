@@ -90,7 +90,7 @@ def seed_searchable_kb():
         kb.document_ids = []
         _kb_repo.update(kb)
         seeded.append(kb_id)
-        KBIndexStore.open(kb_id)._write_index_meta(
+        KBIndexStore.open(kb_id).write_index_meta(
             model_id="BAAI/bge-m3", dim=1024, force=True,
         )
         return kb_id
@@ -301,7 +301,7 @@ def test_index_documents_batch_failed_doc_has_no_vector_file(
             doc_id=doc_id, text=text, source_name=source_name,
         )])
 
-    vectors_dir = KBIndexStore.open(kb_id)._vectors_dir()
+    vectors_dir = KBIndexStore.open(kb_id).vectors_dir
     assert (vectors_dir / f"{doc_a.id}.npy").exists(), "成功 doc 应写 .npy"
     assert not (vectors_dir / f"{doc_b.id}.npy").exists(), (
         "失败 doc 不应写 .npy(防半完成状态)"
@@ -490,7 +490,7 @@ def test_rebuild_kb_index():
     kb = kb_svc.create_kb(name="测试重建", category="national")
     # issues/144 AC#3:production 索引路径在 import 时由 doc_svc 维护 meta,
     # 单元测试绕过 doc_svc,显式 seed。
-    KBIndexStore.open(kb.id)._write_index_meta(
+    KBIndexStore.open(kb.id).write_index_meta(
             model_id="BAAI/bge-m3", dim=1024, force=True,
         )
 
@@ -514,7 +514,7 @@ def test_rebuild_kb_index():
     # 中间检查：FAISS 文件落盘了（ADR-0002 下"已建"含义需以字段为准，
     # index_document 不动 kb 元数据；rebuild_kb_index 才会写字段）
     from core.kb_index_store import KBIndexStore
-    vectors_dir = KBIndexStore.open(kb.id)._vectors_dir()
+    vectors_dir = KBIndexStore.open(kb.id).vectors_dir
     assert (vectors_dir / "default__vector_store.json").exists(), (
         "index_document 应已落盘 FAISS 文件"
     )
@@ -634,7 +634,7 @@ def test_async_md_index_builds_faiss():
 
     kb = kb_svc.create_kb(name="异步MD建索引", category="national")
     # issues/144 AC#3（见上）
-    KBIndexStore.open(kb.id)._write_index_meta(
+    KBIndexStore.open(kb.id).write_index_meta(
             model_id="BAAI/bge-m3", dim=1024, force=True,
         )
     content = (
@@ -668,7 +668,7 @@ def test_save_and_cleanup_doc_vectors():
     kb_id = "test_kb_vectors_persist"
     # issues/144 AC#3:index_document 写入前断言 meta 一致;production 路径
     # 由 doc_svc 自然维护或 backfill 一次性回填。这里直接写测试用 meta。
-    KBIndexStore.open(kb_id)._write_index_meta(
+    KBIndexStore.open(kb_id).write_index_meta(
         model_id="BAAI/bge-m3", dim=1024, force=True,
     )
 
@@ -679,7 +679,7 @@ def test_save_and_cleanup_doc_vectors():
         source_name="vectors_test.txt",
     )
 
-    vectors_dir = KBIndexStore.open(kb_id)._vectors_dir()
+    vectors_dir = KBIndexStore.open(kb_id).vectors_dir
     npy_file = vectors_dir / "doc_v1.npy"
     nodes_file = vectors_dir / "doc_v1_nodes.json"
 
@@ -703,7 +703,7 @@ def test_save_and_cleanup_doc_vectors():
         assert "metadata" in nd
 
     # 清理并验证
-    KBIndexStore.open(kb_id)._cleanup_doc_vectors("doc_v1")
+    KBIndexStore.open(kb_id).cleanup_doc_vectors("doc_v1")
     assert not npy_file.exists(), ".npy 文件应已删除"
     assert not nodes_file.exists(), "_nodes.json 文件应已删除"
 
@@ -727,7 +727,7 @@ def test_rebuild_from_vectors(seed_searchable_kb):
     )
 
     # 确认向量文件存在
-    vectors_dir = KBIndexStore.open(kb_id)._vectors_dir()
+    vectors_dir = KBIndexStore.open(kb_id).vectors_dir
     assert (vectors_dir / "doc_vec_rebuild.npy").exists()
 
     # 清缓存 + 删 FAISS 索引文件，模拟"只有向量缓存，没有索引"的状态
@@ -758,7 +758,7 @@ def test_rebuild_from_vectors(seed_searchable_kb):
     assert len(results) >= 1, "从向量缓存重建后应能搜索到结果"
 
     # 清理
-    KBIndexStore.open(kb_id)._cleanup_doc_vectors("doc_vec_rebuild")
+    KBIndexStore.open(kb_id).cleanup_doc_vectors("doc_vec_rebuild")
 
 
 def test_remove_document_fallback_path(monkeypatch, seed_searchable_kb):
@@ -801,7 +801,7 @@ def test_remove_document_fallback_path(monkeypatch, seed_searchable_kb):
     assert len(results) >= 1, "fallback 重建后应仍能搜索到剩余文档"
 
     # 验证被删除文档的向量文件已清理
-    vectors_dir = KBIndexStore.open(kb_id)._vectors_dir()
+    vectors_dir = KBIndexStore.open(kb_id).vectors_dir
     assert not (vectors_dir / "doc_fb_2.npy").exists(), "被删除文档的向量缓存应已清理"
     assert (vectors_dir / "doc_fb_1.npy").exists(), "剩余文档的向量缓存应保留"
 
@@ -816,7 +816,7 @@ def test_rebuild_kb_index_mixed_vectors():
 
     kb = kb_svc.create_kb(name="混合重建", category="national")
     # issues/144 AC#3
-    KBIndexStore.open(kb.id)._write_index_meta(
+    KBIndexStore.open(kb.id).write_index_meta(
             model_id="BAAI/bge-m3", dim=1024, force=True,
         )
 
@@ -840,7 +840,7 @@ def test_rebuild_kb_index_mixed_vectors():
 
     # 确认 doc_A 有向量缓存，doc_B 没有
     from core.kb_index_store import KBIndexStore
-    vectors_dir = KBIndexStore.open(kb.id)._vectors_dir()
+    vectors_dir = KBIndexStore.open(kb.id).vectors_dir
     assert (vectors_dir / f"{doc_a.id}.npy").exists(), "doc_A 应有向量缓存"
     assert not (vectors_dir / f"{doc_b.id}.npy").exists(), "doc_B 应无向量缓存"
 
@@ -1027,11 +1027,16 @@ def test_index_document_does_not_impose_per_page_cuts(seed_searchable_kb):
     )
 
 
-# ── V8-S2: _inject_block_range 单元测试 ──────────────────────────────────────────
+# ── V8-S2: 端到端 index_document 集成测试 ──────────────────────────────────────
 
 
 def _make_block(block_content: str, block_order: int, page: int = 0):
-    """构造测试用 layout Block,只填 _inject_block_range 实际读的几个字段。"""
+    """构造测试用 layout Block,只填 V8-S2 端到端路径实际读的几个字段。
+
+    issue #171 / PR-4:删除了 ``_inject_block_range`` 单元测试块,这条 helper
+    被两条端到端测试复用(``test_index_document_writes_block_range_for_pdf_layout``
+    + ``test_search_hit_dict_includes_block_range``)。
+    """
     from types import SimpleNamespace
     return SimpleNamespace(
         block_content=block_content,
@@ -1040,233 +1045,6 @@ def _make_block(block_content: str, block_order: int, page: int = 0):
         bbox_norm=[],
         block_label="text",
     )
-
-
-def _make_layout(*pages_blocks):
-    """构造测试用 by_layout:``pages_blocks[i]`` 是第 i 页的 block 列表。"""
-    from types import SimpleNamespace
-    return [
-        SimpleNamespace(page=i, blocks=list(blocks), width=0, height=0)
-        for i, blocks in enumerate(pages_blocks)
-    ]
-
-
-def _make_chunk_node(text: str, page_number: int | None):
-    """构造测试用 chunk node。"""
-    from types import SimpleNamespace
-    n = SimpleNamespace(text=text, metadata={"page_number": page_number})
-    return n
-
-
-def test_inject_block_range_no_layout_all_none():
-    """by_layout=None → 所有 chunk.block_range = None(走 fallback 高亮)。"""
-    from core.kb_index_writer import _inject_block_range
-
-    nodes = [
-        _make_chunk_node("文本 A", 0),
-        _make_chunk_node("文本 B", 1),
-    ]
-    _inject_block_range(nodes, by_page=None, by_layout=None)
-    assert nodes[0].metadata["block_range"] is None
-    assert nodes[1].metadata["block_range"] is None
-
-
-def test_inject_block_range_empty_nodes_noop():
-    """空 nodes → 不抛。"""
-    from core.kb_index_writer import _inject_block_range
-
-    # 不应抛
-    _inject_block_range([], by_page=None, by_layout=[])
-    assert _inject_block_range(None or [], by_page=None, by_layout=[]) == []
-
-
-def test_inject_block_range_single_block_match():
-    """单 block chunk:覆盖 1 个 block → block_range = (n, n)。"""
-    from core.kb_index_writer import _inject_block_range
-
-    by_layout = _make_layout([
-        _make_block("公司各应急保障单位应当配置", 5),
-        _make_block("无关内容", 6),
-    ])
-    nodes = [_make_chunk_node("公司各应急保障单位应当配置", 0)]
-    _inject_block_range(nodes, by_layout=by_layout)
-
-    assert nodes[0].metadata["block_range"] == (5, 5)
-
-
-def test_inject_block_range_multi_block_range():
-    """OCR 把 chunk 拆散到多个 block → block_range = (min, max),max > min。"""
-    from core.kb_index_writer import _inject_block_range
-
-    by_layout = _make_layout([
-        _make_block("无关内容", 0),
-        _make_block("公司各应急", 1),
-        _make_block("保障单位应当", 2),
-        _make_block("配置无线对讲", 3),
-        _make_block("设备至少两套", 4),
-        _make_block("其它", 5),
-    ])
-    nodes = [
-        _make_chunk_node("公司各应急保障单位应当配置无线对讲设备至少两套", 0),
-    ]
-    _inject_block_range(nodes, by_layout=by_layout)
-    # 5 个 block 全命中,区间 (1, 4)——1-based 不动,关键在包含
-    assert nodes[0].metadata["block_range"] == (1, 4)
-
-
-def test_inject_block_range_picks_block_by_order():
-    """block 乱序时按 block_order 升序扫描,命中区间正确。"""
-    from core.kb_index_writer import _inject_block_range
-
-    # 故意把 block 乱序传入
-    by_layout = _make_layout([
-        _make_block("无关", 0),
-        _make_block("配置至少两套", 7),
-        _make_block("公司各应急", 3),
-        _make_block("保障单位", 5),
-    ])
-    nodes = [
-        _make_chunk_node("公司各应急保障单位配置至少两套", 0),
-    ]
-    _inject_block_range(nodes, by_layout=by_layout)
-    # 3 个 block 命中,排序后 order 是 3, 5, 7 → 区间 (3, 7)
-    assert nodes[0].metadata["block_range"] == (3, 7)
-
-
-def test_inject_block_range_no_match_yields_none():
-    """找不到任何命中 → block_range = None,不阻塞。"""
-    from core.kb_index_writer import _inject_block_range
-
-    by_layout = _make_layout([
-        _make_block("完全无关的 PDF 内容", 0),
-    ])
-    nodes = [
-        _make_chunk_node("公司各应急保障单位应当配置无线对讲机", 0),
-    ]
-    _inject_block_range(nodes, by_layout=by_layout)
-    assert nodes[0].metadata["block_range"] is None
-
-
-def test_inject_block_range_page_out_of_range_yields_none():
-    """page_number 越界 → None(不抛)。"""
-    from core.kb_index_writer import _inject_block_range
-
-    by_layout = _make_layout([_make_block("内容", 0)])
-    nodes = [_make_chunk_node("内容", 99)]  # 越界
-    _inject_block_range(nodes, by_layout=by_layout)
-    assert nodes[0].metadata["block_range"] is None
-
-
-def test_inject_block_range_no_page_number_yields_none():
-    """page_number = None → None(由 _inject_page_number 已写过,这里读出来兜底)。"""
-    from core.kb_index_writer import _inject_block_range
-
-    by_layout = _make_layout([_make_block("内容", 0)])
-    nodes = [_make_chunk_node("内容", None)]
-    _inject_block_range(nodes, by_layout=by_layout)
-    assert nodes[0].metadata["block_range"] is None
-
-
-def test_inject_block_range_picks_correct_page():
-    """chunk 在第 2 页,只在该页 blocks 里找,不在第 1 页找。"""
-    from core.kb_index_writer import _inject_block_range
-
-    by_layout = _make_layout(
-        # 第 0 页有"公司各应急保障"——与第 1 页 chunk 无关,不能误匹配
-        [_make_block("第一页内容 公司各应急保障", 0)],
-        # 第 1 页有"第二章要求"——chunk 落点
-        [_make_block("第二章要求的内容", 1)],
-    )
-    nodes = [
-        _make_chunk_node("第二章要求的内容", 1),  # chunk 落在第 1 页
-    ]
-    _inject_block_range(nodes, by_layout=by_layout)
-    assert nodes[0].metadata["block_range"] == (1, 1), (
-        f"应只匹配第 1 页的 block(1,1),实际 {nodes[0].metadata.get('block_range')}"
-    )
-
-
-def test_inject_block_range_punctuation_normalized():
-    """标点差异经归一化后命中(NFKC + 去标点)。"""
-    from core.kb_index_writer import _inject_block_range
-
-    by_layout = _make_layout([
-        _make_block("公司各应急保障单位。应当配置——800兆对讲机", 0),
-    ])
-    nodes = [
-        # chunk 标点格式不同,但归一化后应一致
-        _make_chunk_node("公司各应急保障单位应当配置800兆对讲机", 0),
-    ]
-    _inject_block_range(nodes, by_layout=by_layout)
-    assert nodes[0].metadata["block_range"] == (0, 0)
-
-
-def test_inject_block_range_fullwidth_normalized():
-    """全角字符经 NFKC 归一化后命中(对齐 layoutMatch.norm 的 NFKC 契约)。"""
-    from core.kb_index_writer import _inject_block_range
-
-    by_layout = _make_layout([
-        _make_block("800兆对讲机", 0),
-    ])
-    # chunk 用了全角 ８
-    nodes = [
-        _make_chunk_node("８00兆对讲机", 0),
-    ]
-    _inject_block_range(nodes, by_layout=by_layout)
-    assert nodes[0].metadata["block_range"] == (0, 0)
-
-
-def test_inject_block_range_ocr_typo_lcs_fallback():
-    """OCR 单字错但 chunk 够长 → LCS 兜底命中。"""
-    from core.kb_index_writer import _inject_block_range
-
-    long_text = "公司各应急保障单位应当配置无线对讲设备至少两套"
-    by_layout = _make_layout([
-        _make_block(long_text, 0),
-    ])
-    # chunk 单字错(讲 → 话),14 字符差异 1 → ratio = 13/14 = 0.928 >= 0.85
-    typo = "公司各应急保障单位应当配置无线对话设备至少两套"
-    nodes = [_make_chunk_node(typo, 0)]
-    _inject_block_range(nodes, by_layout=by_layout)
-    assert nodes[0].metadata["block_range"] == (0, 0)
-
-
-def test_inject_block_range_short_string_no_lcs():
-    """短串(< 4 字符)includes miss 时不跑 LCS,直接 None。"""
-    from core.kb_index_writer import _inject_block_range
-
-    by_layout = _make_layout([
-        _make_block("wxyz", 0),
-    ])
-    # 3 字符 < MIN_LCS_LEN,includes miss → 不命中
-    nodes = [_make_chunk_node("abc", 0)]
-    _inject_block_range(nodes, by_layout=by_layout)
-    assert nodes[0].metadata["block_range"] is None
-
-
-def test_inject_block_range_empty_page_blocks():
-    """该页没有 layout blocks(layout 退化)→ chunk.block_range = None。"""
-    from core.kb_index_writer import _inject_block_range
-
-    by_layout = _make_layout([])  # 第 0 页 blocks=[]
-    nodes = [_make_chunk_node("任何内容", 0)]
-    _inject_block_range(nodes, by_layout=by_layout)
-    assert nodes[0].metadata["block_range"] is None
-
-
-def test_inject_block_range_layout_dict_input_compat():
-    """by_layout 传 list[dict] 时也能工作(旧 API 残留兼容)。"""
-    from core.kb_index_writer import _inject_block_range
-
-    layout_dicts = [
-        {"page": 0, "blocks": [{"block_content": "公司各应急保障", "block_order": 0}], "width": 0, "height": 0},
-    ]
-    nodes = [_make_chunk_node("公司各应急保障单位", 0)]
-    _inject_block_range(nodes, by_layout=layout_dicts)
-    assert nodes[0].metadata["block_range"] == (0, 0)
-
-
-# ── V8-S2: 端到端 index_document 集成测试 ──────────────────────────────────────
 
 
 def test_index_document_writes_block_range_for_pdf_layout(seed_searchable_kb, fake_models):

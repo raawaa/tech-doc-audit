@@ -78,7 +78,7 @@ def test_rebuild_failure_writes_failed_with_error():
 
     kb = kb_svc.create_kb(name="fail KB", category="national")
     # issues/144 AC#3：让 doc_svc.import_document 不被新断言阻断
-    KBIndexStore.open(kb.id)._write_index_meta(
+    KBIndexStore.open(kb.id).write_index_meta(
         model_id="BAAI/bge-m3", dim=1024, force=True,
     )
     doc_svc.import_document(

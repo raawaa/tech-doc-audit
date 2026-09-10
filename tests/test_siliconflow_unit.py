@@ -23,19 +23,25 @@ from llama_index.core import Settings as _LISettings
 
 
 def test_index_meta_path_is_consistent():
-    """``_index_meta_path`` 永远指向 ``vectors/index.meta.json``。
+    """``vectors_dir / INDEX_META_FILENAME`` 永远指向 ``vectors/index.meta.json``。
 
     防重构破坏路径常量(issues/144 AC#1 要求文件名一致)。
+    issue #171 / PR-4:从 ``_index_meta_path()``(已降为私有)切到公开
+    ``vectors_dir`` property,断言依然成立。
     """
     from core.kb_index_store import KBIndexStore, INDEX_META_FILENAME
 
     store = KBIndexStore.open("kb_xyz")
-    assert store._index_meta_path() == store._vectors_dir() / INDEX_META_FILENAME
+    # 公开表面下,``write_index_meta`` 写入后用 ``get_meta`` 读回,
+    # 内部 ``_index_meta_path()`` 与 ``vectors_dir / INDEX_META_FILENAME`` 同路径。
+    store.write_index_meta(force=True)
+    expected = store.vectors_dir / INDEX_META_FILENAME
+    assert expected.exists()
     assert INDEX_META_FILENAME == "index.meta.json"
 
 
 def test_write_then_read_index_meta_roundtrip(tmp_path, monkeypatch):
-    """``_write_index_meta`` 写入后 ``get_meta`` 能读回同样字段。"""
+    """``write_index_meta`` 写入后 ``get_meta`` 能读回同样字段。"""
     monkeypatch.setenv("AUDIT_DATA_DIR", str(tmp_path))
     # 清缓存:测试隔离
     from core import kb_index_store as store_mod
@@ -46,7 +52,7 @@ def test_write_then_read_index_meta_roundtrip(tmp_path, monkeypatch):
     store = KBIndexStore.open("kb_roundtrip")
     assert store.get_meta() is None
 
-    store._write_index_meta(
+    store.write_index_meta(
         model_id="BAAI/bge-m3", dim=1024, force=True,
     )
     meta = store.get_meta()
@@ -62,12 +68,12 @@ def test_write_index_meta_force_preserves_created_at(tmp_path, monkeypatch):
     from core.kb_index_store import KBIndexStore
 
     store = KBIndexStore.open("kb_idempotent")
-    store._write_index_meta(
+    store.write_index_meta(
         model_id="BAAI/bge-m3", dim=1024, force=True,
     )
     first = store.get_meta()["created_at"]
 
-    store._write_index_meta(
+    store.write_index_meta(
         model_id="BAAI/bge-m3", dim=1024, force=False,
     )
     second = store.get_meta()["created_at"]
@@ -82,7 +88,7 @@ def test_assert_kb_embedding_system_matches_raises_on_mismatch(tmp_path, monkeyp
 
     store = KBIndexStore.open("kb_mismatch")
     # 写入一个错误 dim 标记(模拟 T4 §5.1 repro_kb 事件)
-    store._write_index_meta(
+    store.write_index_meta(
         model_id="some-other-encoder", dim=512, force=True,
     )
 
@@ -124,7 +130,7 @@ def test_index_document_asserts_embedding_system(seed_searchable_kb, fake_models
     seed_searchable_kb("kb_index_doc_assert")
 
     # 写入与 production 不一致的 meta(模拟 T4 §5.1 repro_kb 混入事件)
-    KBIndexStore.open("kb_index_doc_assert")._write_index_meta(
+    KBIndexStore.open("kb_index_doc_assert").write_index_meta(
         model_id="wrong-model", dim=512, force=True,
     )
 

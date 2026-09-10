@@ -12,7 +12,7 @@
   kb_id)`` 构造被 ``__init__`` 显式拒绝——绕开 ``open()`` 会让锁不共享,
   失去唯一性保证。
 
-公开 API(issue #168 AC #2 六方法):
+公开 API(issue #168 AC #2 六方法 + issue #171 / PR-4 三个升格):
 - ``add_doc(doc_id, nodes, vectors)``     — 写向量缓存 + 插 FAISS + 落盘
 - ``remove_doc(doc_id)``                  — 优先 ``delete_ref_doc``,降级 rebuild
 - ``search(query_embedding, top_k)``      — 单 KB 向量检索
@@ -20,20 +20,27 @@
 - ``get_meta()``                          — 读 ``index.meta.json``
 - ``assert_embedding_system_matches()``   — 写入前 meta 断言(防"非 bge-m3
                                               向量混入生产路径")
-
-编排层(``index_document`` / ``index_documents_batch`` / ``rebuild_kb_index``)
-仍留在 ``core.index_manager``——它做 chunking / metadata 富化 / page-num /
-block-range 注入 / embed 重试,完成后再 ``store.add_doc(doc_id, nodes,
-vectors)``。这跟 issue #165 后续 KBIndexWriter ticket 的边界一致
-(orchestrator 与 storage 各司其职)。
+- ``write_index_meta(model_id, dim, *, force=False)`` — issue #171 / PR-4
+  升格自 ``_write_index_meta``。唯一写入侧 meta 的公开入口,
+  ``services.kb_service.create_kb`` 与 ``scripts/backfill_kb_meta`` 都走
+  此方法。
+- ``save_doc_vectors(doc_id, nodes, vectors)`` — issue #171 / PR-4
+  升格自 ``_save_doc_vectors``。被 ``add_doc`` 内部调用;测试需要预
+  置向量缓存时也走它(代替直接 ``.npy`` 写文件)。
+- ``vectors_dir`` — issue #171 / PR-4 升格自 ``_vectors_dir()`` property。
+  ``core.kb_index_writer.rebuild_kb_index`` 与 ``scripts/backfill_kb_meta``
+  需要"这个 KB 的向量目录在哪里",走它即可,不再 import 私有路径拼接。
 
 私有边界:
-- ``_lock`` / ``_index_cache`` / ``_vectors_dir()`` 等以下划线开头,但
-  ``rebuild_kb_index`` 编排需要跨多个 store 调用持锁,本模块以
+- ``_lock`` / ``_index_cache`` / ``_index_meta_path()`` / ``_create_index()``
+  / ``_load_index()`` / ``_get_index()`` / ``_persist()`` 仍以下划线开头,
+  这些是 FAISS plumbing 内部细节,test 仅在 ``tests/test_kb_index_store.py``
+  内测本类不变量时引用——不作为跨模块契约。
+- ``rebuild_kb_index`` 编排需要跨多个 store 调用持锁,本模块以
   ``acquire_write_lock()`` contextmanager 显式提供这条通道——这是
   issue #165 spec "code reviewer 可读一处验证 lock 语义" 的兑现。
 - ``_inject_*`` 系列(chunk→layout 注入)不在本模块——见
-  ``core.chunk_layout_mapper`` 后续 ticket。
+  ``core.chunk_layout_mapper``。
 """
 from __future__ import annotations
 
@@ -133,7 +140,7 @@ class KBIndexStore:
         """
         with self._lock:
             self.assert_embedding_system_matches()
-            self._save_doc_vectors(doc_id, nodes, vectors)
+            self.save_doc_vectors(doc_id, nodes, vectors)
             index = self._get_index()
             index.insert_nodes(nodes)
             self._persist(index)
@@ -156,7 +163,7 @@ class KBIndexStore:
                 ):
                     index.delete_ref_doc(doc_id, delete_from_docstore=True)
                     self._persist(index)
-                    self._cleanup_doc_vectors(doc_id)
+                    self.cleanup_doc_vectors(doc_id)
                     _logger.info(
                         "removed doc %s from kb %s via delete_ref_doc",
                         doc_id, self._kb_id,
@@ -183,7 +190,7 @@ class KBIndexStore:
                 return
 
             remaining_ids = [did for did in kb.document_ids if did != doc_id]
-            vectors_dir = self._vectors_dir()
+            vectors_dir = self.vectors_dir
 
             if not remaining_ids:
                 meta_p = self._index_meta_path()
@@ -193,12 +200,12 @@ class KBIndexStore:
                 if meta_existed:
                     # 重建空 vectors/(已经在 rmtree 里被删);只保留 meta
                     vectors_dir.mkdir(parents=True, exist_ok=True)
-                    self._write_index_meta(force=True)
+                    self.write_index_meta(force=True)
                 return
 
             # 从向量缓存重建(成功后 _persist 会覆盖旧 FAISS 文件)
             self.rebuild_from_vectors(remaining_ids)
-            self._cleanup_doc_vectors(doc_id)
+            self.cleanup_doc_vectors(doc_id)
 
     def search(self, query_embedding: list, top_k: int) -> list:
         """单 KB 向量检索;返回 ``[NodeWithScore]``(供 ``core.index_manager.search``
@@ -238,7 +245,7 @@ class KBIndexStore:
         ——配合外部 ``acquire_write_lock()`` 使用,避免与并发 ``add_doc`` 撞车。
         """
         with self._lock:
-            vectors_dir = self._vectors_dir()
+            vectors_dir = self.vectors_dir
             new_index = self._create_index()
             self._index_cache[self._kb_id] = new_index
 
@@ -317,7 +324,7 @@ class KBIndexStore:
             # ``index.meta.json`` 存在,后续 ``index_document`` 写入前断言可过。
             # 留用现有 meta;若没有(极端:纯裸重建)写一份(给生产体系 = bge-m3)。
             if self.get_meta() is None:
-                self._write_index_meta(force=True)
+                self.write_index_meta(force=True)
             _logger.info(
                 "rebuilt index for kb %s from %d/%d docs (cached vectors)",
                 self._kb_id, loaded, len(doc_ids),
@@ -396,18 +403,27 @@ class KBIndexStore:
 
     # ── 内部:路径 / meta / FAISS HNSW build+persist ─────────────────────
 
-    def _vectors_dir(self) -> Path:
+    @property
+    def vectors_dir(self) -> Path:
+        """该 KB 的 vectors 目录路径(``$DATA_DIR/kbs/<kb_id>/vectors``)。
+
+        ``scripts/backfill_kb_meta.py`` / ``KBIndexWriter.rebuild_kb_index``
+        等编排层需要知道"这个 KB 的向量落在哪里"时走本属性;不再 import
+        私有 ``_vectors_dir()`` 拼接路径。
+        """
         return get_data_dir() / "kbs" / self._kb_id / "vectors"
 
     def _index_meta_path(self) -> Path:
-        return self._vectors_dir() / INDEX_META_FILENAME
+        return self.vectors_dir / INDEX_META_FILENAME
 
-    def _write_index_meta(
+    def write_index_meta(
         self, *, model_id: str = "BAAI/bge-m3", dim: int = 1024,
         created_at: Optional[str] = None,
         force: bool = False,
     ) -> None:
         """原子写入 ``index.meta.json``(``scripts/backfill_kb_meta.py`` 也调用)。
+
+        唯一写入侧 meta 的公开入口(issue #171 / PR-4 升格自 ``_write_index_meta``)。
 
         Args:
             model_id / dim: 来自 provider 的当前标识(``BAAI/bge-m3`` / 1024)。
@@ -462,7 +478,7 @@ class KBIndexStore:
     def _load_index(self) -> Optional[VectorStoreIndex]:
         """从磁盘加载已有 FAISS 索引;失败返回 ``None``(让 ``_get_index``
         走新建空索引路径)。"""
-        vectors_dir = self._vectors_dir()
+        vectors_dir = self.vectors_dir
         store_file = vectors_dir / "default__vector_store.json"
         if not store_file.exists():
             return None
@@ -514,14 +530,17 @@ class KBIndexStore:
 
     def _persist(self, index: VectorStoreIndex) -> None:
         """持久化 FAISS 索引 + docstore 到磁盘。"""
-        vectors_dir = self._vectors_dir()
+        vectors_dir = self.vectors_dir
         vectors_dir.mkdir(parents=True, exist_ok=True)
         index.storage_context.persist(persist_dir=str(vectors_dir))
 
-    def _save_doc_vectors(
+    def save_doc_vectors(
         self, doc_id: str, nodes: list, embeddings: list,
     ) -> None:
         """保存文档的 embedding 向量和节点元数据到磁盘(``.npy`` + ``_nodes.json``)。
+
+        issue #171 / PR-4 升格自 ``_save_doc_vectors``。被 ``add_doc`` 内部
+        调用;测试需要预置向量缓存(代替直接 ``.npy`` 写文件)时也走它。
 
         每个文档保存两个文件:
         - ``{doc_id}.npy``: float32 向量矩阵 (n_chunks, 1024)
@@ -533,7 +552,7 @@ class KBIndexStore:
 
         这些文件使索引重建时无需重新 embedding(纯 CPU 操作)。
         """
-        vectors_dir = self._vectors_dir()
+        vectors_dir = self.vectors_dir
         vectors_dir.mkdir(parents=True, exist_ok=True)
 
         # 先写节点元数据(非原子写入可能崩溃残留,但 .npy 不存在时不会触发重建)
@@ -556,9 +575,13 @@ class KBIndexStore:
         vec_array = np.array(embeddings, dtype=np.float32)
         np.save(str(vectors_dir / f"{doc_id}.npy"), vec_array)
 
-    def _cleanup_doc_vectors(self, doc_id: str) -> None:
-        """删除文档的向量缓存文件(``.npy`` + ``_nodes.json``)。"""
-        vectors_dir = self._vectors_dir()
+    def cleanup_doc_vectors(self, doc_id: str) -> None:
+        """删除文档的向量缓存文件(``.npy`` + ``_nodes.json``)。
+
+        issue #171 / PR-4 升格自 ``_cleanup_doc_vectors``。被 ``remove_doc``
+        内部调用;测试需要"验 add_doc → remove_doc 真的清了缓存"时也走它。
+        """
+        vectors_dir = self.vectors_dir
         for suffix in (".npy", "_nodes.json"):
             f = vectors_dir / f"{doc_id}{suffix}"
             if f.exists():

@@ -42,7 +42,7 @@ def test_get_kb_index_built_follows_field_searchable():
     kb = _seed_kb_with_searchable()
 
     # 删除可能不存在的索引目录（彻底无 FAISS 文件）
-    vectors_dir = KBIndexStore.open(kb.id)._vectors_dir()
+    vectors_dir = KBIndexStore.open(kb.id).vectors_dir
     if vectors_dir.exists():
         shutil.rmtree(vectors_dir)
 
@@ -58,7 +58,7 @@ def test_get_kb_index_built_returns_false_when_field_none():
 
     kb = kb_svc.create_kb(name="空 KB", category="national")
     # 强行构造一个伪造的索引文件
-    vectors_dir = KBIndexStore.open(kb.id)._vectors_dir()
+    vectors_dir = KBIndexStore.open(kb.id).vectors_dir
     vectors_dir.mkdir(parents=True, exist_ok=True)
     (vectors_dir / "default__vector_store.json").write_text("{}")
 
@@ -103,7 +103,7 @@ def test_delete_faiss_files_does_not_flip_truth():
     from core.kb_index_store import KBIndexStore
 
     kb = _seed_kb_with_searchable()
-    vectors_dir = KBIndexStore.open(kb.id)._vectors_dir()
+    vectors_dir = KBIndexStore.open(kb.id).vectors_dir
     vectors_dir.mkdir(parents=True, exist_ok=True)
     # 造一个空 FAISS 文件再删掉
     (vectors_dir / "default__vector_store.json").write_text("{}")

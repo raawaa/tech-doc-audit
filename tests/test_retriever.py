@@ -38,7 +38,7 @@ def _index(kb_id: str, docs: list[tuple[str, str]]):
     """
     from core.kb_index_store import KBIndexStore
     store = KBIndexStore.open(kb_id)
-    store._write_index_meta(
+    store.write_index_meta(
         model_id="BAAI/bge-m3", dim=1024, force=True,
     )
     writer = KBIndexWriter(kb_id)

@@ -17,7 +17,7 @@ def create_kb(name: str, description: str = "", category: Literal["national", "i
     """
     kb = KnowledgeBase(name=name, description=description, category=category)
     kb = kb_repo.create(kb)
-    KBIndexStore.open(kb.id)._write_index_meta(
+    KBIndexStore.open(kb.id).write_index_meta(
         model_id="BAAI/bge-m3", dim=1024, force=True,
     )
     return kb

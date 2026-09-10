@@ -25,11 +25,9 @@ P2 路径(LCS ratio):
   - ``normalize_layout([])`` → ``[]``(与 None 语义不同:caller 想"跑
     注入但 layout 实际为空")
 
-``inject_block_range``:
-  - chunk.metadata["block_range"] 写入预期区间
-  - by_layout=None → 全 None
-  - page_number 越界 / None → None
-  - by_layout 传 list[dict] 兼容
+注入循环(``KBIndexWriter._inject_block_range``)的端到端契约由
+``tests/test_kb_index_writer.py`` 通过 ``KBIndexWriter.index_documents``
+覆盖(issue #171 / PR-4:把私有符号测试迁到公开 surface 端到端路径)。
 """
 from __future__ import annotations
 
@@ -41,7 +39,6 @@ from core.chunk_layout_mapper import (
     map_chunk_to_blocks,
     normalize_layout,
 )
-from core.kb_index_writer import _inject_block_range as inject_block_range
 from core.parse_document import Block, PageLayout, PageText
 
 
@@ -76,10 +73,6 @@ def _make_single_page(blocks):
     ``blocks`` 是该页的 block 列表。
     """
     return PageLayout(page=0, blocks=list(blocks), width=0, height=0)
-
-
-def _make_chunk_node(text: str, page_number):
-    return SimpleNamespace(text=text, metadata={"page_number": page_number})
 
 
 # ── map_chunk_to_blocks:T1 双向 includes ──────────────────────────────────
@@ -311,87 +304,6 @@ def test_normalize_layout_dict_with_dict_blocks():
     assert len(result[0].blocks) == 2
     assert result[0].blocks[0].block_order == 5
     assert result[0].blocks[1].block_content == "y"
-
-
-# ── inject_block_range ─────────────────────────────────────────────────────
-
-
-def test_inject_block_range_no_layout_all_none():
-    """by_layout=None → 所有 chunk.block_range = None(走 fallback 高亮)。"""
-    nodes = [
-        _make_chunk_node("文本 A", 0),
-        _make_chunk_node("文本 B", 1),
-    ]
-    inject_block_range(nodes, None)
-    assert nodes[0].metadata["block_range"] is None
-    assert nodes[1].metadata["block_range"] is None
-
-
-def test_inject_block_range_empty_nodes_noop():
-    """空 nodes → 不抛、不改。"""
-    inject_block_range([], None)
-    inject_block_range(None or [], None)  # type: ignore
-
-
-def test_inject_block_range_no_match_yields_none():
-    """找不到任何命中 → block_range = None,不阻塞。"""
-    layouts = _make_layout([_make_block("完全无关的 PDF 内容", 0)])
-    nodes = [_make_chunk_node("公司各应急保障单位", 0)]
-    inject_block_range(nodes, layouts)
-    assert nodes[0].metadata["block_range"] is None
-
-
-def test_inject_block_range_page_out_of_range_yields_none():
-    """page_number 越界 → None(不抛)。"""
-    layouts = _make_layout([_make_block("内容", 0)])
-    nodes = [_make_chunk_node("内容", 99)]  # 越界
-    inject_block_range(nodes, layouts)
-    assert nodes[0].metadata["block_range"] is None
-
-
-def test_inject_block_range_no_page_number_yields_none():
-    """page_number = None → None(由 ``_inject_page_number`` 已写过,这里读出来兜底)。"""
-    layouts = _make_layout([_make_block("内容", 0)])
-    nodes = [_make_chunk_node("内容", None)]
-    inject_block_range(nodes, layouts)
-    assert nodes[0].metadata["block_range"] is None
-
-
-def test_inject_block_range_writes_correct_range():
-    """Happy path:chunk 命中 → ``block_range`` 写预期区间。"""
-    layouts = _make_layout([
-        _make_block("无关", 0),
-        _make_block("公司各应急", 1),
-        _make_block("保障单位", 2),
-        _make_block("配置无线对讲", 3),
-    ])
-    nodes = [_make_chunk_node("公司各应急保障单位配置无线对讲", 0)]
-    inject_block_range(nodes, layouts)
-    assert nodes[0].metadata["block_range"] == (1, 3)
-
-
-def test_inject_block_range_dict_input_compat():
-    """by_layout 传 list[dict] 时也能工作(旧 API 残留兼容)。"""
-    layout_dicts = [{
-        "page": 0,
-        "blocks": [{"block_content": "公司各应急保障", "block_order": 0}],
-        "width": 0,
-        "height": 0,
-    }]
-    nodes = [_make_chunk_node("公司各应急保障单位", 0)]
-    inject_block_range(nodes, layout_dicts)
-    assert nodes[0].metadata["block_range"] == (0, 0)
-
-
-def test_inject_block_range_picks_page_by_page_number():
-    """chunk.page_number 决定去 layout[page_number] 找,不会跨页误匹配。"""
-    layouts = _make_layout(
-        [_make_block("第一页内容 公司各应急保障", 0)],
-        [_make_block("第二章要求的内容", 1)],
-    )
-    nodes = [_make_chunk_node("第二章要求的内容", 1)]
-    inject_block_range(nodes, layouts)
-    assert nodes[0].metadata["block_range"] == (1, 1)
 
 
 # ── 与 ``core.text_norm_fixtures.json`` 共享用例(issue #167 / #169)────

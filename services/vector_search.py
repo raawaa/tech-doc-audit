@@ -181,7 +181,7 @@ def _all_docs_have_vectors(kb_id: str) -> bool:
     kb = kb_repo.get(kb_id)
     if kb is None or not kb.document_ids:
         return False
-    vectors_dir = KBIndexStore.open(kb_id)._vectors_dir()
+    vectors_dir = KBIndexStore.open(kb_id).vectors_dir
     return all((vectors_dir / f"{did}.npy").exists() for did in kb.document_ids)
 
 

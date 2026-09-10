@@ -62,7 +62,7 @@ def _seed_kb_meta(kb_id: str) -> None:
     kb.index_status = "searchable"
     kb.document_ids = []
     kb_repo.update(kb)
-    KBIndexStore.open(kb_id)._write_index_meta(force=True)
+    KBIndexStore.open(kb_id).write_index_meta(force=True)
 
 
 def _make_layout(*pages_blocks):
@@ -336,7 +336,7 @@ def test_index_documents_failed_doc_has_no_vector_file(monkeypatch):
 
     from core.kb_index_store import KBIndexStore
     store = KBIndexStore.open("test_writer_no_vec")
-    vectors_dir = store._vectors_dir()
+    vectors_dir = store.vectors_dir
     assert (vectors_dir / "doc_a.npy").exists(), "成功 doc 应写 .npy"
     assert not (vectors_dir / "doc_b.npy").exists(), "失败 doc 不应写 .npy"
 

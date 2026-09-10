@@ -100,7 +100,7 @@ def main():
     skipped = 0
     for kb_id in target_kbs:
         store = KBIndexStore.open(kb_id)
-        meta_path = store._vectors_dir() / INDEX_META_FILENAME
+        meta_path = store.vectors_dir / INDEX_META_FILENAME
         existing = store.get_meta()
         if existing is not None and not args.force:
             print(
@@ -109,7 +109,7 @@ def main():
             )
             skipped += 1
             continue
-        store._write_index_meta(
+        store.write_index_meta(
             model_id=DEFAULT_MODEL_ID,
             dim=DEFAULT_DIM,
             force=True,  # backfill 总是落盘新内容

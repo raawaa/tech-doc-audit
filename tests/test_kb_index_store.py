@@ -36,7 +36,7 @@ def _seed_kb(kb_id):
     kb = kb_repo.get(kb_id)
     kb.index_status = "searchable"
     kb_repo.update(kb)
-    KBIndexStore.open(kb_id)._write_index_meta(force=True)
+    KBIndexStore.open(kb_id).write_index_meta(force=True)
 
 
 def _make_text_node(text, embedding, *, doc_id):
@@ -81,7 +81,7 @@ def test_hnsw_persist_round_trip():
     store = KBIndexStore.open("kb_hnsw_persist")
     index = store._create_index()
     store._persist(index)
-    store_file = store._vectors_dir() / "default__vector_store.json"
+    store_file = store.vectors_dir / "default__vector_store.json"
     assert store_file.exists()
     reset_singletons()
     fresh_store = KBIndexStore.open("kb_hnsw_persist")
@@ -99,7 +99,7 @@ def test_add_doc_persists_index_to_disk():
         [0.1] * 1024, doc_id="d1",
     )]
     store.add_doc("d1", nodes, [[0.1] * 1024])
-    vectors_dir = store._vectors_dir()
+    vectors_dir = store.vectors_dir
     assert (vectors_dir / "default__vector_store.json").exists()
     assert (vectors_dir / "docstore.json").exists()
     assert (vectors_dir / f"d1.npy").exists()
@@ -113,7 +113,7 @@ def test_get_meta_returns_none_when_missing():
 
 def test_write_then_read_meta_round_trip():
     store = KBIndexStore.open("kb_meta_round")
-    store._write_index_meta(force=True)
+    store.write_index_meta(force=True)
     meta = store.get_meta()
     assert meta is not None
     assert meta["embedding_model_id"] == "BAAI/bge-m3"
@@ -123,9 +123,9 @@ def test_write_then_read_meta_round_trip():
 
 def test_write_meta_without_force_preserves_created_at():
     store = KBIndexStore.open("kb_meta_preserve")
-    store._write_index_meta(force=True)
+    store.write_index_meta(force=True)
     first = store.get_meta()["created_at"]
-    store._write_index_meta(force=False)
+    store.write_index_meta(force=False)
     second = store.get_meta()["created_at"]
     assert second == first
 
@@ -138,21 +138,21 @@ def test_assert_embedding_system_matches_raises_when_missing():
 
 def test_assert_embedding_system_matches_raises_on_mismatch():
     store = KBIndexStore.open("kb_assert_mismatch")
-    store._write_index_meta(force=True)
+    store.write_index_meta(force=True)
     with pytest.raises(RuntimeError, match="embedding 体系不一致"):
         store.assert_embedding_system_matches(model_id="BAAI/bge-m3", dim=999)
 
 
 def test_assert_embedding_system_matches_passes_on_consistent_meta():
     store = KBIndexStore.open("kb_assert_ok")
-    store._write_index_meta(force=True)
+    store.write_index_meta(force=True)
     store.assert_embedding_system_matches()
 
 
 def test_index_meta_filename_constant_matches_disk():
     store = KBIndexStore.open("kb_filename")
-    store._write_index_meta(force=True)
-    assert (store._vectors_dir() / INDEX_META_FILENAME).exists()
+    store.write_index_meta(force=True)
+    assert (store.vectors_dir / INDEX_META_FILENAME).exists()
     assert INDEX_META_FILENAME == "index.meta.json"
 
 
@@ -164,8 +164,8 @@ def test_save_doc_vectors_writes_npy_and_nodes_json():
         for i in range(3)
     ]
     embeddings = [[float(i)] * 1024 for i in range(3)]
-    store._save_doc_vectors("d_cache", nodes, embeddings)
-    vectors_dir = store._vectors_dir()
+    store.save_doc_vectors("d_cache", nodes, embeddings)
+    vectors_dir = store.vectors_dir
     assert (vectors_dir / "d_cache.npy").exists()
     assert (vectors_dir / "d_cache_nodes.json").exists()
     import numpy as np
@@ -209,11 +209,11 @@ def test_cleanup_doc_vectors_removes_both_files():
     _seed_kb("kb_cleanup")
     store = KBIndexStore.open("kb_cleanup")
     nodes = [_make_text_node("clean me", [0.5] * 1024, doc_id="d_clean")]
-    store._save_doc_vectors("d_clean", nodes, [[0.5] * 1024])
-    vectors_dir = store._vectors_dir()
+    store.save_doc_vectors("d_clean", nodes, [[0.5] * 1024])
+    vectors_dir = store.vectors_dir
     assert (vectors_dir / "d_clean.npy").exists()
     assert (vectors_dir / "d_clean_nodes.json").exists()
-    store._cleanup_doc_vectors("d_clean")
+    store.cleanup_doc_vectors("d_clean")
     assert not (vectors_dir / "d_clean.npy").exists()
     assert not (vectors_dir / "d_clean_nodes.json").exists()
 
