@@ -196,11 +196,25 @@ def _parse_pdf(file_path: str, *, use_cache: bool) -> ParseResult:
     4. **PyMuPDF + PaddleOCR 都不可用 → 抛 ``RuntimeError``**，不再静默降级。
     5. PyMuPDF 文字版检测抛异常（损坏 / 加密 PDF 在检测阶段）→ 也走 PaddleOCR。
     6. 写 cache 时 ``source="pymupdf"`` 标识，与现有 ``"paddleocr"`` 并列。
+    7. 缓存命中后做**页数对账**（issue #177）—— 源 PDF 物理页数 ``n`` 已知且
+       ``len(cached["by_page"]) < n`` → 视为未命中,落解析 + 写新条目覆盖截断
+       缓存。``n`` 读不出（损坏 / 加密 / 非 PDF）→ 跳过对账,信任缓存。
     """
     cached: Optional[dict] = None
     if use_cache:
         from core.paddleocr_cache import get_cached
         cached = get_cached(file_path)
+
+    if cached is not None:
+        # 页数对账（issue #177）："#87 之前的假成功"截断缓存（仅前 100 页）
+        # 在 ``#173`` 的拆分裂缝之前是合法的命中态；现在若能读出源 PDF 物理
+        # 页数 ``n``,比对 ``len(cached["by_page"])``——少于 ``n`` 即视为截断,
+        # 降级为未命中,落到下面的解析路径（超限则走 T03 splitter）。
+        # ``pdf_page_count`` 读不出（损坏 / 加密 / 非 PDF / pymupdf 不可用）→
+        # 返回 ``None``,跳过对账,信任缓存 —— 与既有 happy path 行为兼容。
+        n = pdf_page_count(file_path)
+        if n is not None and len(cached.get("by_page", [])) < n:
+            cached = None
 
     if cached is not None:
         return ParseResult.from_dict(cached)

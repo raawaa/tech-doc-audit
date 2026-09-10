@@ -17,6 +17,15 @@ from core.parse_document import (
     parse_document, _paddleocr_call, _is_text_layer_pdf,
 )
 
+# pymupdf 是页数对账测试（issue #177）造多页 PDF 与读取页数的唯一依赖；
+# 无 wheel 整文件 skip(与 test_pdf_splitter.py 同款契约)。
+try:
+    import pymupdf  # type: ignore[import-not-found]
+    _HAVE_PYMUPDF = True
+except Exception:
+    pymupdf = None  # type: ignore[assignment]
+    _HAVE_PYMUPDF = False
+
 
 # ── marker 声明（与 test_reparse_service.py / test_kb_reparse_e2e.py 对齐）────────
 
@@ -249,6 +258,260 @@ def test_pdf_use_cache_false_skips_cache_lookup(tmp_path, monkeypatch):
 
     pr = parse_document(str(pdf), use_cache=False)
     assert pr.full_text == "fresh"
+
+
+# ── PDF 路径：缓存命中后页数对账（issue #177 / spec §B 4）──────────────────────
+#
+# ``_parse_pdf`` 在缓存命中后,源 PDF 物理页数 ``n`` 已知且
+# ``len(cached["by_page"]) < n`` → 视为截断未命中,落解析（超限则进 T03 splitter）
+# + 写一条 ``len(by_page) == n`` 的新条目覆盖旧条目。``n`` 读不出（损坏 / 加密 /
+# 非 PDF）→ 跳过对账,信任缓存。
+# 四条 AC：
+#   AC1 — 100 页缓存 + 247 页 PDF → 重新解析 + 写 247 页条目
+#   AC2 — by_page 与源 PDF 等长 → 命中缓存,零 PaddleOCR 调用
+#   AC3 — 损坏 PDF 缓存 → 仍命中（既有 test_pdf_cache_hit_skips_paddleocr 覆盖）
+#   AC4 — pdf_page_count 仅在缓存命中路径上调用一次;新解析路径不重复调
+
+
+def _make_blank_pdf(path: Path, page_count: int) -> Path:
+    """生成 ``page_count`` 页空白 PDF（不插文字 → 文字层空 → 扫描件 → 走 PaddleOCR）。
+    本地 helper;与 ``test_pdf_splitter._make_blank_pdf`` 同语义,不复用避免跨文件
+    拉取私有 fixture。
+    """
+    if not _HAVE_PYMUPDF:
+        pytest.skip("pymupdf wheel not installed")
+    doc = pymupdf.open()
+    for _ in range(page_count):
+        doc.new_page(width=595, height=842)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+@pytest.mark.skipif(not _HAVE_PYMUPDF, reason="pymupdf wheel not installed")
+def test_reconciliation_truncated_cache_reparses(tmp_path, monkeypatch):
+    """AC1 — 预置 100 页缓存 + 真 247 页 PDF → 二次 parse_document 不命中缓存,
+    落解析 + 写一条 len(by_page) == 247 的新条目（覆盖旧条目）。
+    """
+    from core import paddleocr_cache as cache_module
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr(cache_module, "get_cache_dir", lambda: cache_dir)
+
+    # 247 页扫描件（文字层空 → 走 PaddleOCR 路径;超 100 页 → 走 splitter）
+    pdf = _make_blank_pdf(tmp_path / "big.pdf", 247)
+
+    # 预置"截断"缓存条目 —— 仅 100 页（模拟 #87 之前的假成功残留）
+    truncated_payload = {
+        "by_page": [PageText(page=i, text=f"truncated page {i}").__dict__ for i in range(100)],
+        "full_text": "truncated",
+        "layout": [],
+    }
+    cache_module.save_cached(str(pdf), truncated_payload, source="paddleocr")
+
+    # 旧条目断言已落盘,且是 100 页
+    pre_cached = cache_module.get_cached(str(pdf))
+    assert pre_cached is not None
+    assert len(pre_cached["by_page"]) == 100
+
+    # Mock _paddleocr_call：按被调文件的真实页数生成 by_page（splitter 会按
+    # chunk 路径调 N 次,每次 page_count 与 chunk 一致）
+    def _fake_ocr(file_path, orientation_classify=False):
+        with pymupdf.open(file_path) as d:
+            n = d.page_count
+        by_page = [PageText(page=j, text=f"page-{j:03d}") for j in range(n)]
+        full_text = "\n\n".join(f"page-{j:03d}" for j in range(n))
+        layout = [PageLayout(page=j, width=595, height=842) for j in range(n)]
+        return ParseResult(by_page=by_page, full_text=full_text, layout=layout)
+
+    monkeypatch.setattr(pd_module, "_paddleocr_call", _fake_ocr)
+    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: True)
+
+    # 二次解析 → 应识别为截断 → 重新解析
+    pr = parse_document(str(pdf))
+
+    # 1. 解析结果应为完整 247 页
+    assert len(pr.by_page) == 247
+
+    # 2. 缓存条目已被覆盖 → 新条目 len(by_page) == 247
+    new_cached = cache_module.get_cached(str(pdf))
+    assert new_cached is not None
+    assert len(new_cached["by_page"]) == 247, (
+        "对账判废后应写新条目覆盖旧截断条目,但缓存仍为 100 页"
+    )
+
+
+@pytest.mark.skipif(not _HAVE_PYMUPDF, reason="pymupdf wheel not installed")
+def test_reconciliation_matching_cache_hits(tmp_path, monkeypatch):
+    """AC2 — by_page 与源 PDF 页数相等的缓存 + 同源 PDF → 二次 parse_document
+    命中缓存,零 PaddleOCR 调用（_explode 不触发）。
+    """
+    from core import paddleocr_cache as cache_module
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr(cache_module, "get_cache_dir", lambda: cache_dir)
+
+    # 247 页扫描件
+    pdf = _make_blank_pdf(tmp_path / "ok.pdf", 247)
+
+    # 预置一条"正确长度"的缓存（247 页,与源 PDF 等长）
+    matching_payload = {
+        "by_page": [PageText(page=i, text=f"good page {i}").__dict__ for i in range(247)],
+        "full_text": "full match",
+        "layout": [],
+    }
+    cache_module.save_cached(str(pdf), matching_payload, source="paddleocr")
+
+    # PaddleOCR 调用一律触发测试失败（缓存应当命中）
+    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: True)
+
+    def _explode(*a, **k):
+        raise AssertionError(
+            "PaddleOCR must NOT be called when cache page-count matches source"
+        )
+
+    monkeypatch.setattr(pd_module, "_paddleocr_call", _explode)
+    monkeypatch.setattr(pd_module, "_paddleocr_parse", _explode)
+
+    pr = parse_document(str(pdf))
+    assert len(pr.by_page) == 247
+    assert pr.by_page[100].text == "good page 100"
+    assert pr.full_text == "full match"
+
+
+@pytest.mark.skipif(not _HAVE_PYMUPDF, reason="pymupdf wheel not installed")
+def test_reconciliation_skipped_when_page_count_unreadable(tmp_path, monkeypatch):
+    """AC3 强化 — 损坏 / 加密 / 非 PDF 缓存条目仍然命中（pdf_page_count 返回 None
+    → 跳过对账）。既有 ``test_pdf_cache_hit_skips_paddleocr`` 已用 ``%PDF-1.4 dummy``
+    触发;本测试再加一条"条目 by_page 与 mtime 故意不一致"的极端边界,
+    确认对账只在 pdf_page_count 返回 int 时才生效,None 即跳过。
+    """
+    from core import paddleocr_cache as cache_module
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr(cache_module, "get_cache_dir", lambda: cache_dir)
+
+    # 写入一个损坏 PDF —— pymupdf 打不开 → pdf_page_count 返回 None
+    corrupt = tmp_path / "corrupt.pdf"
+    corrupt.write_bytes(b"%PDF-1.4 dummy not a real pdf")
+
+    cached_payload = {
+        "by_page": [PageText(page=0, text="cached text").__dict__],
+        "full_text": "cached text",
+        "layout": [],
+    }
+    cache_module.save_cached(str(corrupt), cached_payload, source="paddleocr")
+
+    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: True)
+
+    def _explode(*a, **k):
+        raise AssertionError("corrupt PDF cache must hit without OCR call")
+
+    monkeypatch.setattr(pd_module, "_paddleocr_call", _explode)
+    monkeypatch.setattr(pd_module, "_paddleocr_parse", _explode)
+
+    # pdf_page_count 返回 None → 跳过对账 → 命中缓存
+    pr = parse_document(str(corrupt))
+    assert pr.full_text == "cached text"
+    assert pr.by_page[0].text == "cached text"
+
+
+@pytest.mark.skipif(not _HAVE_PYMUPDF, reason="pymupdf wheel not installed")
+def test_reconciliation_calls_pdf_page_count_once_on_cache_hit(tmp_path, monkeypatch):
+    """AC4 — 缓存命中路径上 ``pdf_page_count`` 调一次。
+
+    ``pdf_page_count`` 用一个计数包装,pre-set 长度匹配的缓存,call count 验为 1。
+    """
+    from core import paddleocr_cache as cache_module
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr(cache_module, "get_cache_dir", lambda: cache_dir)
+
+    # 247 页扫描件 + 247 页缓存（命中,不触发解析）
+    pdf = _make_blank_pdf(tmp_path / "ok.pdf", 247)
+    matching_payload = {
+        "by_page": [PageText(page=i, text=f"p{i}").__dict__ for i in range(247)],
+        "full_text": "ok",
+        "layout": [],
+    }
+    cache_module.save_cached(str(pdf), matching_payload, source="paddleocr")
+
+    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: True)
+
+    def _explode(*a, **k):
+        raise AssertionError("must hit cache")
+
+    monkeypatch.setattr(pd_module, "_paddleocr_call", _explode)
+    monkeypatch.setattr(pd_module, "_paddleocr_parse", _explode)
+
+    # 计数 pdf_page_count 调用
+    original_pdf_page_count = pd_module.pdf_page_count
+    call_count = [0]
+
+    def counting(file_path):
+        call_count[0] += 1
+        return original_pdf_page_count(file_path)
+
+    monkeypatch.setattr(pd_module, "pdf_page_count", counting)
+
+    parse_document(str(pdf))
+
+    assert call_count[0] == 1, (
+        f"缓存命中路径上 pdf_page_count 应仅调一次,但调了 {call_count[0]} 次"
+    )
+
+
+@pytest.mark.skipif(not _HAVE_PYMUPDF, reason="pymupdf wheel not installed")
+def test_reconciliation_does_not_call_pdf_page_count_from_parse_pdf_on_cache_miss(
+    tmp_path, monkeypatch,
+):
+    """AC4 反向 — 新解析路径（缓存未命中）上 ``_parse_pdf`` 自身**不**重复调
+    ``pdf_page_count``。splitter / ``_paddleocr_parse`` 调它属于"共享同一份来源",
+    spec 接受。
+    """
+    from core import paddleocr_cache as cache_module
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr(cache_module, "get_cache_dir", lambda: cache_dir)
+
+    # 文字层 PDF（content 存在 → _is_text_layer_pdf 返 True → 走 PyMuPDF 路径）
+    # 走 PyMuPDF 路径**不**调 _paddleocr_parse（也不会调 pdf_page_count）。
+    # 这样 cache miss 后,我们能精确验证 _parse_pdf 自身没额外调一次。
+    text_pdf = tmp_path / "text.pdf"
+    doc = pymupdf.open()
+    for i in range(5):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((50, 50), f"page {i + 1} content body long enough", fontsize=11)
+    doc.save(str(text_pdf))
+    doc.close()
+
+    # 缓存目录是空的（cache miss）
+    assert cache_module.get_cached(str(text_pdf)) is None
+
+    # 拦截 _paddleocr_parse 防止 autouse guard 触发
+    monkeypatch.setattr(pd_module, "_paddleocr_available", lambda: False)
+
+    # 计数 pdf_page_count 调用 —— 仅看 _parse_pdf 内部
+    original_pdf_page_count = pd_module.pdf_page_count
+    call_count = [0]
+
+    def counting(file_path):
+        call_count[0] += 1
+        return original_pdf_page_count(file_path)
+
+    monkeypatch.setattr(pd_module, "pdf_page_count", counting)
+
+    # cache miss + PyMuPDF 文字版路径 → _parse_pdf 自己不该调 pdf_page_count
+    pr = parse_document(str(text_pdf))
+    assert len(pr.by_page) == 5
+    assert call_count[0] == 0, (
+        f"缓存未命中路径上 _parse_pdf 不应调 pdf_page_count,但调了 {call_count[0]} 次"
+    )
 
 
 # ── JSONL 解析：Bbox 归一化 ────────────────────────────────────────────────────
