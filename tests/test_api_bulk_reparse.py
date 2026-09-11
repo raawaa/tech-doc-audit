@@ -187,7 +187,8 @@ def test_preflight_marks_over_cost_limit_in_warning():
 
 
 def test_preflight_exposes_will_split_docs():
-    """#181 验收：走拆分路径的 doc 进 ``will_split_docs``，带 ``chunks_planned``。"""
+    """#181 / #182 验收：走拆分路径的 doc 进 ``will_split_docs``，带 ``chunks_planned``；
+    ``will_split_count`` 与列表长度同义（spec §F）。"""
     from core.pdf_splitter import chunk_ranges
 
     kb_id = _create_kb("preflight-split")
@@ -201,9 +202,49 @@ def test_preflight_exposes_will_split_docs():
     plan = body["will_split_docs"][0]
     assert plan["page_count"] == 247
     assert plan["chunks_planned"] == len(chunk_ranges(247))
+    # issue #182 / spec §F：``will_split_count`` 独立字段
+    assert body["will_split_count"] == 1
     # 整批合计
     assert body["chunks_total"] >= 1
     assert body["ocr_pages_total"] == 247
+
+
+def test_preflight_exposes_force_cost_exceeded_warning_when_force_and_cost_exceeded():
+    """#182 验收：``?force=true`` + 存在 cost-exceeded doc → ``force_cost_exceeded_warning`` 非空。
+
+    这是前端独立渲染 ⚠️ 的唯一信号；spec §F 锁定"force 也不能绕"必须显式提示。
+    """
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    kb_id = _create_kb("preflight-force-warning")
+    _add_doc(
+        kb_id, "huge.pdf", embedding_status="failed",
+        page_count=BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1,
+    )
+
+    # 非 force：warning 应为 None（不报）
+    plain = client.get(
+        f"/api/v1/knowledge-bases/{kb_id}/bulk-reparse/preflight"
+    ).json()
+    assert plain["force_cost_exceeded_warning"] is None
+
+    # force=true：warning 非空，skipped_count 等于 cost_exceeded_docs 长度
+    forced = client.get(
+        f"/api/v1/knowledge-bases/{kb_id}/bulk-reparse/preflight?force=true"
+    ).json()
+    assert forced["force_cost_exceeded_warning"] == {"skipped_count": 1}
+
+
+def test_preflight_force_warning_absent_when_no_cost_exceeded():
+    """``?force=true`` 但没有 cost-exceeded doc → warning 仍为 None（不误报）。"""
+    kb_id = _create_kb("preflight-force-clean")
+    _add_doc(kb_id, "small.pdf", embedding_status="failed", page_count=4)
+
+    body = client.get(
+        f"/api/v1/knowledge-bases/{kb_id}/bulk-reparse/preflight?force=true"
+    ).json()
+
+    assert body["force_cost_exceeded_warning"] is None
 
 
 def test_preflight_force_selects_all_docs():
@@ -329,6 +370,8 @@ def test_trigger_returns_202_and_eventually_heals_to_searchable(monkeypatch):
     assert body["target_count"] == 2
     # AC 3：响应里就带 index_status=building，不必再多发一次 GET
     assert body["index_status"] == "building"
+    # issue #182：非 force 路径下 ``force_cost_exceeded_warning`` 始终为 None
+    assert body["force_cost_exceeded_warning"] is None
 
     final = _poll_until_terminal(kb_id, {"searchable", "failed"})
     assert final["index_status"] == "searchable", (
@@ -498,6 +541,80 @@ def test_trigger_404_on_unknown_kb():
     """KB 不存在 → 404。"""
     r = client.post("/api/v1/knowledge-bases/kb_nope/bulk-reparse")
     assert r.status_code == 404
+
+
+def test_trigger_with_force_and_cost_exceeded_returns_202_with_warning(monkeypatch):
+    """#182 验收：``force=true`` + cost-exceeded doc → trigger 仍 202，响应体带
+    ``force_cost_exceeded_warning``。整批不 abort，被挡 doc 仍按 skipped 路径走。
+
+    设计意图：让前端**在弹 toast / 显示进度前**就能告诉用户"force 不能绕"，
+    而不是要等用户去看报告才知道有 doc 被默默跳过。
+
+    至少一篇 runnable（spec §F 的"force + cost-exceeded → 继续跑"），让 trigger
+    真的起一个批量；目标集仍含被挡 doc，但 runnable 把它排除了。
+
+    ``target_count`` 是目标集大小（与 ``list_target_docs`` 同口径，含 cost-exceeded
+    doc）—— 运行期间由 ``split_by_cost_limit`` 把它移进 skipped 但仍计入目标集；
+    真正的"会被跳过"由 ``force_cost_exceeded_warning.skipped_count`` 显式给出。
+    """
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    kb_id = _create_kb("trigger-force-warning")
+    huge = _add_doc(
+        kb_id, "huge.pdf", embedding_status="failed",
+        page_count=BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1,
+    )
+    small = _add_doc(kb_id, "small.pdf", embedding_status="failed", page_count=3)
+    _stub_reparse(monkeypatch)
+
+    r = client.post(
+        f"/api/v1/knowledge-bases/{kb_id}/bulk-reparse",
+        json={"force": True},
+    )
+    assert r.status_code == 202, r.text
+    body = r.json()
+    # 响应体携带警告：被挡 doc 数
+    assert body["force_cost_exceeded_warning"] == {"skipped_count": 1}
+    # 目标集含两个 doc（force 模式选择全员为目标的语义保持不变）
+    assert body["target_count"] == 2
+    # 跑完确认：被挡 doc 落 skipped 桶，runnable doc 落 done
+    _poll_until_terminal(kb_id, {"searchable", "failed"})
+    rep = client.get(
+        f"/api/v1/knowledge-bases/{kb_id}/bulk-reparse/report"
+    ).json()
+    assert rep["counts"]["skipped"] == 1
+    assert rep["counts"]["done"] == 1
+    assert [e["doc_id"] for e in rep["skipped"]] == [huge.id]
+    assert [e["doc_id"] for e in rep["done"]] == [small.id]
+
+
+def test_trigger_with_ignore_cost_limit_lets_overcost_doc_through(monkeypatch):
+    """#182 验收：``ignore_cost_limit=true`` 让被挡 doc 进入目标集 → target_count +1。
+
+    显式覆盖 ``--force`` 不能绕的成本护栏；前端在用户确认时把
+    ``ignore_cost_limit`` 透传给 trigger 即可。
+    """
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    kb_id = _create_kb("trigger-ignore-cost")
+    huge = _add_doc(
+        kb_id, "huge.pdf", embedding_status="failed",
+        page_count=BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1,
+    )
+    _stub_reparse(monkeypatch)
+
+    r = client.post(
+        f"/api/v1/knowledge-bases/{kb_id}/bulk-reparse",
+        json={"ignore_cost_limit": True},
+    )
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["target_count"] == 1
+    # 没有 force → 没有 force_cost_exceeded_warning
+    assert body["force_cost_exceeded_warning"] is None
+
+    # 跑完确认这篇 doc 真进了 done
+    _poll_until_terminal(kb_id, {"searchable", "failed"})
 
 
 def test_trigger_failure_terminates_kb_failed(monkeypatch):

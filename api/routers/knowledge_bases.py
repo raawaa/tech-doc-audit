@@ -17,6 +17,7 @@ from services.bulk_reparse_service import (
     estimate_ocr_cost,
     list_target_docs,
     run_bulk_reparse,
+    split_by_cost_limit,
 )
 
 _logger = get_logger(__name__)
@@ -274,6 +275,9 @@ class BulkReparsePreflightResponse(BaseModel):
     辅助信息（issue #181 / spec §F）；``cost_exceeded_docs`` 是会进 skipped 的清单
     （拆分成本超阈值）。``done[].source`` 中 ``paddleocr_split`` 是 #178 / #173
     拆分路径的缓存分桶（仍在烧 OCR 配额，但条目打这个桶名而非 ``paddleocr``）。
+
+    ``force_cost_exceeded_warning`` —— ``force=True`` **且**存在被拆分成本阈值挡住的
+    doc 时非空（issue #182 / spec §F），让前端能独立渲染一条 ⚠️（不与主文案混排）。
     """
 
     kb_id: str
@@ -290,8 +294,14 @@ class BulkReparsePreflightResponse(BaseModel):
     targets: list[dict]
     cost_exceeded_docs: list[dict]
     will_split_docs: list[dict] = []
+    # ``will_split_count`` 与 ``len(will_split_docs)`` 语义等价但 API 字段独立列出
+    # （issue #182 / spec §F 拍板），便于前端按字段名直接读取无需 ``.length``。
+    will_split_count: int = 0
     chunks_total: int = 0
     ocr_pages_total: int = 0
+    # issue #182: ``force_cost_exceeded_warning`` 形如 ``{"skipped_count": N}``，
+    # 仅在 ``force=True`` 且存在被成本阈值挡住的 doc 时非空。前端据此独立渲染 ⚠️。
+    force_cost_exceeded_warning: Optional[dict] = None
 
 
 class BulkReparseTriggerRequest(BaseModel):
@@ -303,11 +313,14 @@ class BulkReparseTriggerRequest(BaseModel):
 
 class BulkReparseTriggerResponse(BaseModel):
     """202 响应：AC 明确要求"返回 202 时 KB 处于 ``building``"，把状态塞进响应体，
-    让客户端不必再发一次 GET 就能立即确认；同时携带目标数，便于 UI 立刻渲染。"""
+    让客户端不必再发一次 GET 就能立即确认；同时携带目标数，便于 UI 立刻渲染。
 
+    ``force_cost_exceeded_warning`` —— 同 preflight 的形状；trigger 仍返回 202 并
+    照常起跑（**不** abort，issue #182 / spec §F）。"""
     kb_id: str
     target_count: int
     index_status: str = "building"
+    force_cost_exceeded_warning: Optional[dict] = None
 
 
 def _build_preflight_payload(kb_id: str, *, force: bool) -> BulkReparsePreflightResponse:
@@ -317,9 +330,20 @@ def _build_preflight_payload(kb_id: str, *, force: bool) -> BulkReparsePreflight
     - ``will_split_docs`` —— 走拆分解析路径的 doc + 计划块数
     - ``chunks_total`` / ``ocr_pages_total`` —— 整批的拆分块数 / OCR 总页数合计
     - ``cost_exceeded_docs`` —— 拆分成本超阈值的清单（``reason="split_cost_exceeded"``）
+
+    ``force_cost_exceeded_warning``（issue #182 / spec §F）—— ``force=True`` 且
+    存在被成本阈值挡住的 doc 时非空；语义上"虽然你按了 force、但这些 doc 仍然
+    会被成本护栏挡掉"，供前端独立渲染一条 ⚠️。
     """
     targets = list_target_docs(kb_id, force=force)
     cost: OcrCostEstimate = estimate_ocr_cost(targets)
+    # force=True + 存在 cost-exceeded doc → 触发独立警告。
+    # ``ignore_cost_limit`` 也意味着"我接受任何代价"，与 force 互斥（"我接受
+    # 任何代价"是更激进的覆盖），此时同样不该有 force 警告。
+    force_warning = (
+        {"skipped_count": len(cost.cost_exceeded_docs)}
+        if (force and cost.cost_exceeded_docs) else None
+    )
     return BulkReparsePreflightResponse(
         kb_id=kb_id,
         force=force,
@@ -360,8 +384,10 @@ def _build_preflight_payload(kb_id: str, *, force: bool) -> BulkReparsePreflight
             }
             for p in cost.will_split_docs
         ],
+        will_split_count=len(cost.will_split_docs),
         chunks_total=cost.chunks_total,
         ocr_pages_total=cost.ocr_pages_total,
+        force_cost_exceeded_warning=force_warning,
     )
 
 
@@ -420,17 +446,35 @@ def bulk_reparse_trigger(
     # 算目标数（不缓存，spawn 后线程里也会再算；这里只是为了让响应携带这个数）
     targets = list_target_docs(kb_id, force=req.force)
 
-    # 空批次：不预写 building、不 spawn 线程，run_bulk_reparse 自己也不会改 KB。
-    if not targets:
+    # force=True + 存在 cost-exceeded doc → 响应体携带 ``force_cost_exceeded_warning``
+    # 供前端独立渲染（issue #182 / spec §F）。trigger 仍返回 202 照常起跑 —— 不 abort。
+    cost_for_warning = estimate_ocr_cost(targets) if req.force else None
+    force_warning = (
+        {"skipped_count": len(cost_for_warning.cost_exceeded_docs)}
+        if (cost_for_warning and cost_for_warning.cost_exceeded_docs) else None
+    )
+
+    # 拆分成本分类（与 run_bulk_reparse 内部同口径）—— 决定要不要预写 building。
+    # force + 全部 cost-exceeded 的"目标集非空但 runnable 为空"边界：此时整批
+    # 没东西可跑（``run_bulk_reparse`` 内的 ``if total:`` 不进），KB 不能进
+    # building 又被卡住 —— 走与"target_count == 0"同款的空批次短路。
+    runnable, _cost_exceeded = split_by_cost_limit(
+        targets, ignore_cost_limit=req.ignore_cost_limit,
+    )
+
+    # 空批次（target_count == 0 或 runnable 全空）：不预写 building、
+    # 不 spawn 线程，run_bulk_reparse 自己也不会改 KB。
+    if not targets or not runnable:
         return BulkReparseTriggerResponse(
-            kb_id=kb_id, target_count=0, index_status=kb.index_status,
+            kb_id=kb_id, target_count=len(targets), index_status=kb.index_status,
+            force_cost_exceeded_warning=force_warning,
         )
 
     # 预写 building —— 由 KbIndexStatusWriter 独占写入（issue #148 /
     # #147 / #151）。``run_bulk_reparse`` 内部还会再用它自己的 writer 实例
     # 写一次（同 idempotent 的 begin()），两份都落到同一组字段值
     # （building / 0 / ""）。
-    kb_writer = KbIndexStatusWriter(kb_id, total=len(targets))
+    kb_writer = KbIndexStatusWriter(kb_id, total=len(runnable))
     kb_writer.begin()
 
     def _run():
@@ -458,6 +502,7 @@ def bulk_reparse_trigger(
         kb_id=kb_id,
         target_count=len(targets),
         index_status="building",
+        force_cost_exceeded_warning=force_warning,
     )
 
 

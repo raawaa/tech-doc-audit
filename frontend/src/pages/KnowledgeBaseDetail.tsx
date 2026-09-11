@@ -14,19 +14,31 @@ const isIndexingDoc = (d: KBDocument): boolean =>
 
 // 把预检结果铺成 ``window.confirm`` 文案 —— 沿用 per-doc reparse 的形态，
 // 不引入新 UI 语言（spec #102 story 39）。数字必须来自预检，不能拍脑袋写。
-// AC #112 明确要求四项：目标篇数 / 未命中 / 预计 OCR / 超限跳过；其余信息不在
-// issue 授权范围内，不擅自加入对话框。issue #181 拆分路径下"超 PADDLEOCR_PAGE_LIMIT
-// 走拆分解析"，不再进 skipped；新"超拆分成本阈值进 skipped"才是被跳过的部分。
+// issue #181 拆分路径下"超 PADDLEOCR_PAGE_LIMIT 走拆分解析"，不再进 skipped；
+// 新"超成本阈值进 skipped"才是被跳过的部分。issue #182 进一步把文案从失败主义
+// 改成正面描述（"将拆分解析"），并把 force 模式的成本护栏警告
+// （``force_cost_exceeded_warning``）从主文案里独立出来。
+//
+// ``force_cost_exceeded_warning`` —— 若非空，渲染成独立 ⚠️ 行；不与主文案混排，
+// 让用户能一眼区分"我点 force 也绕不过去"的护栏信号和"将拆分解析 / 超成本"
+// 这些预检信息（spec #182 AC）。
 const buildBulkReparseConfirmMessage = (p: BulkReparsePreflight): string => {
   const lines: string[] = [
     `目标文档：${p.target_count} 篇`,
     `其中未命中缓存：${p.uncached_docs} 篇（将消耗约 ${p.estimated_ocr_pages} 页 OCR 配额）`,
   ]
-  if (p.will_split_docs.length > 0) {
-    lines.push(`超页数上限将走拆分解析：${p.will_split_docs.length} 篇（合计 ${p.chunks_total} 子块）`)
+  if (p.will_split_count > 0) {
+    // 任何一条 0 篇则不渲染（spec #182 / issue AC）；正面描述替代旧版"超页数上限"。
+    lines.push(`将拆分解析：${p.will_split_count} 篇（共 ${p.chunks_total} 块，约 ${p.ocr_pages_total} 页 OCR）`)
   }
   if (p.cost_exceeded_docs.length > 0) {
-    lines.push(`超拆分成本阈值将被跳过：${p.cost_exceeded_docs.length} 篇`)
+    lines.push(`超成本阈值将被跳过：${p.cost_exceeded_docs.length} 篇`)
+  }
+  if (p.force_cost_exceeded_warning) {
+    // 独立 ⚠️ 行；强调"即使 force 也绕不过去"，与"超成本阈值将被跳过"区分。
+    lines.push(
+      `⚠️ force 模式下仍有 ${p.force_cost_exceeded_warning.skipped_count} 篇超成本阈值将被跳过（force 不能绕）`
+    )
   }
   lines.push('')
   lines.push(p.target_count === 0 ? '当前没有待重新解析的文档。' : '确认开始批量重新解析？')

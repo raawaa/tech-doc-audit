@@ -159,11 +159,19 @@ export interface BulkReparseCostExceeded {
   reason: string
 }
 
-export interface BulkReparseWillSplit {
+// 拆分解析计划（issue #173 / #181 / #182）：源 PDF 物理页数 > PADDLEOCR_PAGE_LIMIT
+// 时走拆分解析路径；``chunks_planned`` 来自 core.pdf_splitter.chunk_ranges 唯一实现。
+export interface BulkReparseSplitPlan {
   doc_id: string
   original_name: string
   page_count: number
   chunks_planned: number
+}
+
+// ``force_cost_exceeded_warning`` —— ``--force`` 也不能绕成本护栏，前端拿到此字段
+// 时需独立渲染一条 ⚠️ 提示（issue #182 / spec §F），不混进主文案。
+export interface BulkReparseForceCostExceededWarning {
+  skipped_count: number
 }
 
 export interface BulkReparsePreflight {
@@ -178,9 +186,12 @@ export interface BulkReparsePreflight {
   estimated_ocr_pages: number
   targets: BulkReparseTarget[]
   cost_exceeded_docs: BulkReparseCostExceeded[]
-  will_split_docs: BulkReparseWillSplit[]
+  will_split_docs: BulkReparseSplitPlan[]
+  // 与 ``will_split_docs.length`` 同义；spec §F 独立列出便于前端按字段读取。
+  will_split_count: number
   chunks_total: number
   ocr_pages_total: number
+  force_cost_exceeded_warning: BulkReparseForceCostExceededWarning | null
 }
 
 export interface BulkReparseTriggerRequest {
@@ -193,6 +204,9 @@ export interface BulkReparseTriggerResponse {
   kb_id: string
   target_count: number
   index_status: 'building'
+  // issue #182：trigger 响应也携带 ``force_cost_exceeded_warning``（仅 force=True
+  // + 存在被成本阈值挡住的 doc 时非空），便于前端在 toast 等场景独立提示。
+  force_cost_exceeded_warning: BulkReparseForceCostExceededWarning | null
 }
 
 export interface BulkReparseReportPreflight {

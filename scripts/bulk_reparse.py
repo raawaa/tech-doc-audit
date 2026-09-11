@@ -53,8 +53,11 @@ if _env_path.exists():
 os.environ.setdefault("AUDIT_DATA_DIR", "data")
 
 import storage.kb_repo as kb_repo
-from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES, PADDLEOCR_PAGE_LIMIT
+from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+from core.logger import get_logger
 from services import bulk_reparse_service as bulk_svc
+
+_logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -62,25 +65,36 @@ from services import bulk_reparse_service as bulk_svc
 # ---------------------------------------------------------------------------
 
 def _print_header(kb, kb_id: str, targets, cost, concurrency: int) -> None:
+    """打印批量头信息（issue #181 / #182）。
+
+    段落按"事实→决策辅助→拦截"顺序：先 OCR 估算，再走拆分解析路径的聚合
+    段（issue #181 新口径，#182 改文案），最后才是被成本阈值挡住的清单。
+    旧版"⚠️ 超 PAGE_LIMIT 的 doc 将被跳过"已无意义 —— 拆分路径下不再跳过。
+    """
     print("=" * 70)
     print(f"知识库: {kb.name} ({kb_id})")
     print(f"目标 doc 数: {len(targets)} （其中 {cost.cached} 命中 OCR 缓存 / {cost.uncached} 需重 OCR）")
     print(f"预估 OCR 页数: {cost.pages_uncached} 页（缓存命中页 {cost.pages_cached} 不消耗）")
     if cost.will_split_docs:
+        # 改文案：旧版"⚠️ 超 PADDLEOCR_PAGE_LIMIT=100 的 doc"是失败主义口吻，
+        # 真实语义是"这篇要走拆分解析"，由 issue #182 翻成正面描述（spec #182 AC）。
         print(
-            f"⚠️  超 PADDLEOCR_PAGE_LIMIT={PADDLEOCR_PAGE_LIMIT} 的 doc "
-            f"({len(cost.will_split_docs)} 篇，将走拆分解析路径；"
-            f"合计 {cost.chunks_total} 子块 / {cost.ocr_pages_total} 页)："
+            f"将拆 {len(cost.will_split_docs)} 篇 / "
+            f"共 {cost.chunks_total} 块 / "
+            f"总 {cost.ocr_pages_total} 页 OCR："
         )
         for plan in cost.will_split_docs:
             print(
-                f"   - {plan.doc.id} ({plan.doc.original_name}) "
-                f"约 {plan.page_count} 页 → {plan.chunks_planned} 子块"
+                f"  - {plan.doc.id}: {plan.doc.original_name} "
+                f"({plan.page_count} 页 → {plan.chunks_planned} 块)"
             )
     if cost.cost_exceeded_docs:
+        # 改文案："超拆分成本阈值"→"超成本阈值"（issue #182 / spec §F），
+        # 不动结构 —— 仍然列出被挡的每篇 doc。
         print(
-            f"⚠️  超拆分成本阈值 ({BULK_REPARSE_SPLIT_COST_LIMIT_PAGES} 页) 的 doc "
-            f"({len(cost.cost_exceeded_docs)} 篇，会进 skipped)："
+            f"⚠️  超成本阈值将被跳过 "
+            f"({len(cost.cost_exceeded_docs)} 篇，"
+            f"阈值 {BULK_REPARSE_SPLIT_COST_LIMIT_PAGES} 页)："
         )
         for over in cost.cost_exceeded_docs:
             print(f"   - {over.doc.id} ({over.doc.original_name}) 约 {over.page_count} 页")
@@ -165,7 +179,19 @@ def bulk_reparse(
     runnable, cost_exceeded = bulk_svc.split_by_cost_limit(
         targets, ignore_cost_limit=ignore_cost_limit,
     )
-    if cost_exceeded and not skip_confirm:
+    # ``force + cost-exceeded`` 的特殊路径（issue #182 / spec §F）：
+    # 运维按了 ``--force`` 但被成本护栏挡住的 doc **仍然**会被跳过 —— 在 run
+    # 起始打一条 ⚠️ banner + ``log WARNING``，**继续**跑，退出码不变。
+    # 与"非 force 路径"的提示区分开：那是普通 confirm 前提示，本路径是强提示。
+    if cost_exceeded and force and not ignore_cost_limit:
+        warn = (
+            f"⚠️  --force 模式下仍有 {len(cost_exceeded)} 篇 doc 超拆分成本阈值 "
+            f"({BULK_REPARSE_SPLIT_COST_LIMIT_PAGES} 页) 会被跳过 —— "
+            f"--force 不能绕过成本护栏；显式 --ignore-cost-limit 才可绕过"
+        )
+        print(f"\n{warn}")
+        _logger.warning("bulk_reparse CLI: %s", warn)
+    elif cost_exceeded and not skip_confirm:
         print(
             f"\n⚠️  检测到 {len(cost_exceeded)} 篇 doc 超拆分成本阈值 "
             f"({BULK_REPARSE_SPLIT_COST_LIMIT_PAGES} 页)，"

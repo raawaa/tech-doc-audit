@@ -1150,3 +1150,120 @@ def test_cli_argparse_contract_preserved(cli_module, monkeypatch):
         "force": True,
         "ignore_cost_limit": True,
     }
+
+
+def test_cli_dry_run_prints_split_aggregate_segment(kb, cli_module, capsys):
+    """#182 验收：dry-run 输出含「将拆 X 篇 / 共 Y 块 / 总 Z 页 OCR」聚合段 +
+    per-doc 行（spec #182 / spec §F）。"""
+    _add_doc(
+        kb.id, "huge.pdf", embedding_status="failed",
+        page_count=247,
+    )
+
+    exit_code = cli_module.bulk_reparse(
+        kb.id, dry_run=True, concurrency=4, skip_confirm=True,
+    )
+    out = capsys.readouterr().out
+
+    assert exit_code == 2
+    # 聚合段
+    assert "将拆 1 篇" in out
+    assert "共 3 块" in out  # 247 / 99 = 3
+    assert "总 247 页 OCR" in out
+    # per-doc 行
+    assert "huge.pdf" in out
+    assert "247 页" in out
+
+
+def test_cli_dry_run_uses_positive_wording_for_over_cost(kb, cli_module, capsys):
+    """#182 验收：dry-run 输出的 cost_exceeded 段改为"⚠️ 超成本阈值将被跳过"。
+
+    旧版"超拆分成本阈值"也带"超"，但本 ticket 把"超成本阈值"作为最终文案落定
+    （issue #182 / spec §F 改文案、不动结构）。
+    """
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    _add_doc(
+        kb.id, "huge.pdf", embedding_status="failed",
+        page_count=BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1,
+    )
+
+    exit_code = cli_module.bulk_reparse(
+        kb.id, dry_run=True, concurrency=4, skip_confirm=True,
+    )
+    out = capsys.readouterr().out
+
+    assert exit_code == 2
+    # 新文案
+    assert "⚠️  超成本阈值将被跳过" in out
+    # 旧文案（"超 PAGE_LIMIT"）已退出
+    assert "PAGE_LIMIT" not in out
+
+
+def test_cli_force_with_cost_exceeded_prints_banner_and_keeps_exit_code(
+    kb, cli_module, capsys, monkeypatch, caplog,
+):
+    """#182 验收：``force=True`` + 存在 cost-exceeded doc → stdout 出现 ⚠️ banner +
+    log WARNING，整批**继续**跑，退出码不变。
+
+    与 CLI 既有 "force 不能绕成本护栏" 语义保持一致（issue #181 / spec #181）；
+    本 ticket 把这条 banner 从"被 confirm 才有"提升到"run 起始无条件打"，
+    让 ``--yes`` 直跑也能看见强提示。
+    """
+    import logging
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    _add_doc(
+        kb.id, "huge.pdf", embedding_status="failed",
+        page_count=BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1,
+    )
+    # 让 runnable 非空，确保实际 run 真的跑
+    _add_doc(kb.id, "small.pdf", embedding_status="failed", page_count=3)
+
+    svc = _stub_reparse(monkeypatch, outcomes={})
+
+    with caplog.at_level(logging.WARNING, logger="scripts.bulk_reparse"):
+        exit_code = cli_module.bulk_reparse(
+            kb.id, dry_run=False, concurrency=1, skip_confirm=True, force=True,
+        )
+
+    out = capsys.readouterr().out
+
+    # 退出码：整批没失败 → 0（huge 进 skipped，small 进 done）
+    assert exit_code == 0
+    # stdout 出现 ⚠️ banner
+    assert "⚠️" in out
+    assert "force 不能绕过成本护栏" in out
+    # log WARNING 走 scripts.bulk_reparse logger
+    assert any(
+        "force 不能绕过成本护栏" in rec.getMessage()
+        for rec in caplog.records
+    ), f"应有 WARNING 日志，实测 {[r.getMessage() for r in caplog.records]}"
+
+
+def test_cli_without_force_keeps_existing_confirm_prompt_warning(kb, cli_module, capsys, monkeypatch):
+    """非 force + cost-exceeded 仍走既有的 "确认前提示" 路径（issue #181 AC），
+    **不**升级到 run 起始 banner —— 那是 force 专属信号（issue #182 / spec §F）。"""
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    _add_doc(
+        kb.id, "huge.pdf", embedding_status="failed",
+        page_count=BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1,
+    )
+    _add_doc(kb.id, "small.pdf", embedding_status="failed", page_count=3)
+
+    # 取消用户的回答（"n"）让 CLI 提早返回 2 —— 不实际跑，只看 prompt 前那一段
+    monkey_input = iter(["n"])
+    monkeypatch.setattr("builtins.input", lambda _: next(monkey_input))
+
+    exit_code = cli_module.bulk_reparse(
+        kb.id, dry_run=False, concurrency=1, skip_confirm=False, force=False,
+    )
+    out = capsys.readouterr().out
+
+    # 用户取消 → 2
+    assert exit_code == 2
+    # 既有提示（不是 force 专属 banner）
+    assert "检测到" in out and "run 将自动跳过这些 doc" in out
+    # force 专属的强 banner 不会出现（非 force 路径）
+    assert "force 不能绕过成本护栏" not in out
