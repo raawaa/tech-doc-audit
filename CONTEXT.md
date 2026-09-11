@@ -32,8 +32,12 @@
 
 ## 知识库检索
 
-- **文档向量化 (Document Embedding)** — 单篇 KB 文档被分块、生成向量并缓存的生命周期。它的完成是文档可被纳入检索的**前提**，但**不等于**检索已可用。终态称"**已向量化 (embedded)**"。
+- **文档向量化 (Document Embedding)** — 单篇 KB 文档被分块、生成向量并缓存的生命周期。它的完成是文档可被纳入检索的**前提**，但**不等于**检索已可用。`embedding_status` 六个取值：`none` / `pending_index` / `indexing` / `embedded` / `failed` / `truncated`。
+  - `embedded` — 解析与索引均已完成，可被检索（**已向量化**）。
+  - `failed` — "这次解析炸了"。通常是 PaddleOCR 调用本身 / 子块缝合 / 索引写入等步骤抛错导致整篇失败；批量重新解析的失败明细里能找到原因字符串。
+  - `truncated` — "存着的结果被服务端悄悄截短了"。PaddleOCR SaaS 对 >`PADDLEOCR_PAGE_LIMIT` 的 PDF 会**静默**截到前 100 页（`state=done`、`errorMsg` 为空，从响应无法与正常成功区分——见 #160 调研）。本状态由 `core/truncated_doc_detector.find_truncated_docs` 在存量巡检里标出，或由分块解析的页数对账在重新解析时检测到；**不是** OCR 调用失败的产物。与 `failed` 处置完全不同：`failed` 等人工 / 批量重跑；`truncated` 等下一次分块解析按 `embedding_status != "embedded"` 选取规则自然拾起重跑。
   _Avoid_: "就绪""ready""indexed"——历史上同时被用于文档层与知识库层，造成重载歧义。
+  _Avoid_: 把 `truncated` 当 `failed` 的别名——前者是结果在服务端被截短的产物（修复走新分块路径），后者是这次解析跑挂了（重跑可能再挂）；混用会让 `repair_truncated.py` 跑完一波"假失败"文档后一无所获。
 - **知识库检索索引 (KB Search Index)** — 一个知识库内全部文档向量合并而成的检索服务可用性。它就绪表示该库此刻可被向量检索。终态称"**可检索 (searchable)**"。
   _Avoid_: "就绪""ready"——必须与文档向量化层的终态严格区分。
 - **两者关系** — 文档向量化是知识库检索索引的**构成材料**（前置条件），不是同一回事：全部文档已向量化 ≠ 该库可检索，仍需合并建索引。类比："砖都烧好了 ≠ 墙砌好了"。
@@ -87,8 +91,9 @@ _Avoid_: 直接 `KBIndexStore(kb_id)`（绕开 `open()`）——单例化失效�
   _Avoid_: 叫它"批量索引" / "reindex all"——会与 `POST /{kb_id}/reindex` 混淆，两者消耗的资源完全不同（一个烧 OCR 配额，一个不烧）。
   _Avoid_: 在 CLI / API / 前端各写一份目标选取或成本估算——三条选取规则的第三条是 #93 复盘一整轮才补上的，第二份实现必然让它悄悄丢失。
 - **待重解析文档 (Reparse Target)** — 满足三条选取规则**任一**的 KB 文档：① 未向量化（`embedding_status != "embedded"`）；② 缺按页文本文件；③ 按页文本存在但 `layout == []`（历史的 `_pdf_fallback()` 假成功残留；`force` 模式绕过三条规则，整库皆为目标）。`force` 模式绕过三条规则，整库皆为目标（换解析器后的整库重建入口）。
-- **OCR 成本预检 (Preflight)** — 批量重新解析触发前的**无副作用**估算：命中 / 未命中缓存的篇数与页数、超单文件页数上限（`PADDLEOCR_PAGE_LIMIT`，默认 100，由 `core.settings` 集中管理）的清单。命中判定只有一份实现 —— `core.paddleocr_cache.cache_state_by_hash()`（按 `doc.content_hash` 查，不重算文件哈希），与 `get_cached` 同口径：条目损坏或 model_version 不符算未命中。历史 `source=fallback_pdfplumber` 条目按命中计（#99/05 后 V8 cache defense 已删除，运维清理是单独工单）。
+- **OCR 成本预检 (Preflight)** — 批量重新解析触发前的**无副作用**估算：命中 / 未命中缓存的篇数与页数、`PADDLEOCR_PAGE_LIMIT`（默认 100）触发的**拆分计划**、以及**单篇预估 OCR 页数**（`BULK_REPARSE_SPLIT_COST_LIMIT_PAGES`，默认 20000）触发跳过的清单。**`PAGE_LIMIT` 不再意味着跳过、而是分块解析的触发点**——超 100 页的扫描件进入 `will_split_docs`（每条带 `chunks_planned = len(pdf_splitter.chunk_ranges(page_count))`），不再进 `skipped`；只有**单篇预估 OCR 页数**超过拆分成本阈值（Split Cost Limit）的文档才进 `skipped`，reason 为 `split_cost_exceeded`——语义是"这一篇太贵了，你自己决定"，而不是"做不了"。`--force` **不能**绕过该阈值，要绕必须显式 `--ignore-cost-limit`，防止 `force = 敢烧配额就 OK` 的语义滑落。命中判定只有一份实现 —— `core.paddleocr_cache.cache_state_by_hash()`（按 `doc.content_hash` 查，不重算文件哈希），与 `get_cached` 同口径：条目损坏或 model_version 不符算未命中。历史 `source=fallback_pdfplumber` 条目按命中计（#99/05 后 V8 cache defense 已删除，运维清理是单独工单）。
   _Avoid_: 只探测缓存文件是否存在就报"命中"——会让清单与统计自相矛盾。
+  _Avoid_: 把 `PADDLEOCR_PAGE_LIMIT` 当"会被跳过的页数上限"——它是**拆分触发点**，不是跳过判据；混用会让"超 100 页的扫描件全部要被拆分解析"这件事在 preflight 响应里消失。
 - **KB 检索状态写入者 (KB Index Status Writer)** — `core/kb_index_status.KbIndexStatusWriter` 是 `kb.index_status` / `kb.index_progress` / `kb.index_current_doc` 三个字段的**唯一写入者**（issue #147 / #148）。批量重新解析与单篇 reparse 不再各自手写读—改—写，也不再用 `caller_manages_kb_status` 这类布尔把这层责任在调用方之间切来切去 —— 编排层构造一个 `KbIndexStatusWriter(kb_id, total=...)` 后，整批期间只暴露 5 个 callback：`begin()` / `note_in_flight(name)` / `advance(done)` / `finish(failed=..., *, interrupted=...)` / `clear_building()`。`begin()` 写一次 `building` + `index_progress = 0`，期间只推进 `index_progress`（`done / total`，单调不减）与 `index_current_doc`（在飞文档名），末尾按结果写**唯一一次**终态（全成功 `searchable` / 有失败或中断 `failed` + 一行失败摘要，字符串格式收敛到 writer 内的 `_format_failure_summary` / `_format_interruption`）；崩溃自愈（`api.main.recover_stuck_indexes`）只调 `clear_building()` 把 KB 拉回 `none`，不动 doc 层的 `embedding_status`（那是 `doc_repo._save_doc_meta` 的事）。
   _Avoid_: 在 writer 之外的代码里直接 `kb.index_status = ...` / `kb.index_progress = ...` / `kb.index_current_doc = ...` / `kb_repo.update(kb)` 写这三字段 —— writer 的 API 不暴露"中途把 `index_status` 写成 `searchable`"的入口：批量跑到一半时 `searchable` 按定义不成立（"该库**此刻**可被向量检索"这句话只在终态一次性写），且前端 `KnowledgeBaseDetail.tsx` 以 `index_status === 'building'` 为轮询续订的唯一条件，途中闪 `searchable` 会让进度反复停轮询又重启（#93 实测 154 篇抖动上百次）。writer 的"整批只 `finish()` 一次终态"是这条不变式的执行而非提醒。
   - **`begin()` 归属（issue #155）** — 由 caller 独家承担：单篇路径在 `reparse_document` 构造 `total=1` writer 后**立即**调一次；批量路径在 `run_bulk_reparse` 批次开头调一次。`_reparse_async` / `_index_single_doc_async` 等 per-doc 线程入口**不再**调 `begin()` —— 否则 N 篇批量 = N+1 次 `begin()`，每次把 `_progress` 清零并把 `index_progress=0.0` 写盘，前端轮询会在两帧之间看到 `0/N` 短暂回退。同时 `begin()` 自身有 defense-in-depth：仅在"未开始过（`_progress is None`）"或"KB 当前 `status == 'none'`"时把 `_progress` 重置为 0.0；mid-batch 重复调用保留中间值，让 `_write` 的单调不减守卫自然兜住。
@@ -98,6 +103,11 @@ _Avoid_: 直接 `KBIndexStore(kb_id)`（绕开 `open()`）——单例化失效�
   _Avoid_: 只算 `paddleocr` 一桶 —— 拆分路径的文档仍烧了配额，但条目打的是 `paddleocr_split`，计入会让被拆分的文档在实测 OCR 消耗里凭空少几千页（#178 翻转的 #90 错法）。
 - **PDF 分块解析 (PDF Split Parse)** — 源 PDF 物理页数 > `PADDLEOCR_PAGE_LIMIT` 时（默认 100）在文件层切成若干 ≤99 页子 PDF、逐块送 PaddleOCR、再按源 PDF 物理页号缝合成单一 `ParseResult` 的解析路径（#173 / #176）。对调用方不可见：入口仍是 `parse_document()`，返回仍是 `ParseResult`；缓存写在源 PDF sha256 槽位上。子块解析在缓存条目 `source` 字段打 `paddleocr_split`（与整篇一次性 OCR 的 `paddleocr` 区分），便于 bulk 报告分桶。
   _Avoid_: 在分桶与成本统计里把 `paddleocr_split` 当作"非 OCR 路径"或"零配额"——它就是逐子块喂的 PaddleOCR，配额支出按子块页数之和算（详见上"实测 OCR 消耗"）。
+- **解析分块 (Parse Chunk)** — 一个子 PDF 及其解析结果。默认上限 `PDF_SPLIT_CHUNK_PAGES`（默认 99 页，留 ±1 容差——#160 调研中 SaaS 截断位置精确性未知）。由 `core/pdf_splitter.chunk_ranges(page_count)` 唯一实现"一篇切成哪几个 `[start, end]` 区间"，bulk 预检也调它算 `chunks_planned`，**不**写第二份 `ceil` 除法。每块走完整 `parse_document(chunk_path, use_cache=False)` 入口、复用既有"空结果 → `orientation_classify=True` 重试"逻辑；块 ≤99 页，**不会**递归再拆。
+- **页数对账 (Page-Count Reconciliation)** — 把一份解析结果的 `len(by_page)` 与源 PDF 的物理页数比对。`core/parse_document.pdf_page_count(file_path)` 是"源 PDF 到底几页"的**唯一实现**（pymupdf 打开取 `page_count`，损坏 / 加密 / 非 PDF 时返回 `None` + debug log），四处调用它：分块解析的每块自检、`_parse_pdf` 缓存命中后的判废、存量巡检的 `doc.page_count` 回落、bulk 预检的 `page_count is None` 回落。三处共用同一判据（`len(by_page) < physical` 即视为不一致）；页数读不出（`pdf_page_count` 返回 `None`）时**跳过对账**——不为读不到的信息发明一个坏结论。
+  _Avoid_: 在第二份实现里写"页数对账 = 缓存里读个 `len(by_page)` 就好"——既不查源页数、也不容错，等于把 #93 的"截断存着被当正常成功"问题换了个位置重演。
+- **拆分成本阈值 (Split Cost Limit)** — 单篇文档**预估 OCR 页数**的上限（`BULK_REPARSE_SPLIT_COST_LIMIT_PAGES`，默认 20000），超过该阈值的文档走 `skipped` 而**不**走分块解析，reason 为 `split_cost_exceeded`。语义是"这一篇太贵了，你自己决定"，与历史上 `PADDLEOCR_PAGE_LIMIT` 的"做不了"是两回事。`--force` 不能绕过该阈值；要绕必须显式 `--ignore-cost-limit`（spec §F 锁定），防止 `force = 敢烧配额就 OK` 的语义滑落。
+  _Avoid_: 把它读成"分块块数的上限"——它是**单篇预估 OCR 页数**的上限，块数自然随页数上升，但阈值是页数维度的。
 - **批量重新解析报告 (Bulk Reparse Report)** — 一次批量运行的结构化产出，落在 `data/kbs/{kb_id}/bulk_reparse_report.json`（`pages/` 的兄弟，`core/bulk_reparse_report_store.py` 管路径与读写）。内容：目标集与每篇的入选原因、预检估算与实测消耗**并列**、done / failed / skipped 三类明细（各带 doc id、原始文件名、原因串）、起止时间与耗时、并发度与是否 `force`。只留最近一次，历史归档不在 v1。
   _Avoid_: 预估与实测背离时自动拦截执行——#91 的教训是"差异需要被看见"，不是"差异需要被自动处置"。
   _Avoid_: 把报告塞进 `kb.metadata`——与"按页文本不写在 `doc.metadata`"同源的理由：无 schema、随字段增长膨胀。
