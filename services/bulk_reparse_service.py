@@ -172,8 +172,19 @@ class ActualOcrUsage:
 
     @property
     def actual_ocr_pages(self) -> int:
-        """真正烧掉 OCR 配额的页数 —— 只有 ``paddleocr`` 那一桶算数。"""
-        return self.pages_by_source.get(paddleocr_cache.SOURCE_PADDLEOCR, 0)
+        """真正烧掉 OCR 配额的页数 —— ``paddleocr`` 与 ``paddleocr_split`` 两桶之和。
+
+        ``paddleocr_split`` 是 issue #173 / T03（#176）引入的拆分解析缓存分桶：
+        超 ``PADDLEOCR_PAGE_LIMIT`` 的 PDF 在文件层被切成若干 ≤99 页子块逐块喂
+        PaddleOCR，再按源 PDF 物理页号缝合 —— 仍**在**烧 OCR 配额，只是缓存条目打
+        的是 ``paddleocr_split`` 而不是 ``paddleocr``。只算 ``paddleocr`` 一桶会让
+        被拆分的文档在实测 OCR 消耗里凭空少几千页（镜像版 #90 错法：上次是
+        claim 满 / burn 零，这次是反向的 claim 满 / burn 零）。
+        """
+        return (
+            self.pages_by_source.get(paddleocr_cache.SOURCE_PADDLEOCR, 0)
+            + self.pages_by_source.get(paddleocr_cache.SOURCE_PADDLEOCR_SPLIT, 0)
+        )
 
 
 @dataclass(frozen=True)

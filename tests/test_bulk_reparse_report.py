@@ -214,6 +214,60 @@ def test_failed_docs_do_not_contribute_to_actual_ocr_pages(kb, monkeypatch):
     assert result.usage.docs_by_source == {"paddleocr": 1, "failed": 1}
 
 
+# ── ActualOcrUsage 单元契约：paddleocr ∪ paddleocr_split 算配额支出（issue #178）─
+
+
+def test_actual_ocr_pages_sums_paddleocr_and_paddleocr_split_buckets():
+    """#178 AC1 — ``paddleocr`` 与 ``paddleocr_split`` 两桶之和才是真烧的 OCR 页数。
+
+    拆分解析（issue #173 / T03 引入的 ``paddleocr_split`` 缓存分桶）把超 PADDLEOCR_PAGE_LIMIT
+    的 PDF 切成若干子块逐块喂 PaddleOCR —— 仍然在烧 OCR 配额，只是缓存条目打的是
+    ``paddleocr_split`` 而非 ``paddleocr``。如果只算 ``paddleocr`` 一桶，超限文档
+    的实测 OCR 消耗会凭空少几千页（镜像版 #90 错法：上次是 claim 满 / burn 零，
+    这次是反向的 claim 满 / burn 零）。
+    """
+    from services.bulk_reparse_service import (
+        ActualOcrUsage,
+        DocParseUsage,
+        _aggregate_usage,
+    )
+
+    usages = [
+        DocParseUsage(
+            doc_id="d1", original_name="single.pdf",
+            source=paddleocr_cache.SOURCE_PADDLEOCR, pages=120, succeeded=True,
+        ),
+        DocParseUsage(
+            doc_id="d2", original_name="split.pdf",
+            source=paddleocr_cache.SOURCE_PADDLEOCR_SPLIT, pages=247, succeeded=True,
+        ),
+    ]
+
+    usage = _aggregate_usage(usages)
+
+    # 手搓的两份 ``DocParseUsage`` 经 ``_aggregate_usage`` 落入两桶，property 等于两者之和
+    assert usage.pages_by_source == {
+        paddleocr_cache.SOURCE_PADDLEOCR: 120,
+        paddleocr_cache.SOURCE_PADDLEOCR_SPLIT: 247,
+    }
+    assert usage.actual_ocr_pages == 120 + 247
+
+
+def test_actual_ocr_pages_is_zero_when_only_pymupdf_ran():
+    """#178 AC 反例 — PyMuPDF 零配额路径：``actual_ocr_pages == 0``。
+
+    文字层 PDF 走 PyMuPDF 路径不烧 OCR，配额计数必须保持零，不被新桶破坏。
+    """
+    from services.bulk_reparse_service import ActualOcrUsage
+
+    usage = ActualOcrUsage(
+        pages_by_source={"pymupdf": 500},
+        docs_by_source={"pymupdf": 1},
+    )
+
+    assert usage.actual_ocr_pages == 0
+
+
 def test_parse_source_is_logged_per_completed_doc(kb, monkeypatch, caplog):
     """每篇的解析来源进 run log —— 静默降级在日志里就该暴露（AC 8）。"""
     _add_doc(kb.id, "logged.pdf", page_count=2, content_hash="h_log")
