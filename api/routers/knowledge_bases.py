@@ -446,20 +446,17 @@ def bulk_reparse_trigger(
     # 算目标数（不缓存，spawn 后线程里也会再算；这里只是为了让响应携带这个数）
     targets = list_target_docs(kb_id, force=req.force)
 
-    # force=True + 存在 cost-exceeded doc → 响应体携带 ``force_cost_exceeded_warning``
-    # 供前端独立渲染（issue #182 / spec §F）。trigger 仍返回 202 照常起跑 —— 不 abort。
-    cost_for_warning = estimate_ocr_cost(targets) if req.force else None
-    force_warning = (
-        {"skipped_count": len(cost_for_warning.cost_exceeded_docs)}
-        if (cost_for_warning and cost_for_warning.cost_exceeded_docs) else None
-    )
-
-    # 拆分成本分类（与 run_bulk_reparse 内部同口径）—— 决定要不要预写 building。
-    # force + 全部 cost-exceeded 的"目标集非空但 runnable 为空"边界：此时整批
-    # 没东西可跑（``run_bulk_reparse`` 内的 ``if total:`` 不进），KB 不能进
-    # building 又被卡住 —— 走与"target_count == 0"同款的空批次短路。
-    runnable, _cost_exceeded = split_by_cost_limit(
+    # 拆分成本分类（与 run_bulk_reparse 内部同口径）—— 既决定要不要预写 building，
+    # 也决定 ``force_cost_exceeded_warning`` 的形状：只有当成本护栏**真的**会
+    # 挡住一些 doc 时警告才有意义。``ignore_cost_limit=True`` 是更激进的覆盖
+    # 语义（"我接受任何代价"），此时护栏不生效 → 警告也不该出现，否则前端会
+    # 误报"force 不能绕"（spec §F + issue #182 review 修）。
+    runnable, cost_exceeded = split_by_cost_limit(
         targets, ignore_cost_limit=req.ignore_cost_limit,
+    )
+    force_warning = (
+        {"skipped_count": len(cost_exceeded)}
+        if (req.force and cost_exceeded) else None
     )
 
     # 空批次（target_count == 0 或 runnable 全空）：不预写 building、

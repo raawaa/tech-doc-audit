@@ -617,6 +617,75 @@ def test_trigger_with_ignore_cost_limit_lets_overcost_doc_through(monkeypatch):
     _poll_until_terminal(kb_id, {"searchable", "failed"})
 
 
+def test_trigger_with_force_and_ignore_cost_limit_suppresses_warning(monkeypatch):
+    """#182 review 修：``force=true`` + ``ignore_cost_limit=true`` 同时存在 → 警告不应出现。
+
+    ``ignore_cost_limit`` 是更激进的覆盖语义（"我接受任何代价"），此时成本护栏
+    不生效 → ``force_cost_exceeded_warning`` 不该误报"force 不能绕"。
+    否则前端会告诉用户"按了 force 也跑不动"，但实际行为是"全部都跑"。
+    """
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    kb_id = _create_kb("trigger-force-ignore-cost")
+    _add_doc(
+        kb_id, "huge.pdf", embedding_status="failed",
+        page_count=BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1,
+    )
+    _stub_reparse(monkeypatch)
+
+    r = client.post(
+        f"/api/v1/knowledge-bases/{kb_id}/bulk-reparse",
+        json={"force": True, "ignore_cost_limit": True},
+    )
+    assert r.status_code == 202, r.text
+    body = r.json()
+    # 警告被压住（即使 force=True + 存在 cost-exceeded doc）
+    assert body["force_cost_exceeded_warning"] is None
+
+
+def test_trigger_with_force_and_all_cost_exceeded_does_not_get_kb_stuck(monkeypatch):
+    """#182 review 增：``force=true`` + **全部** doc 都 cost-exceeded → 目标集非空但
+    ``runnable == []``。此时 trigger 不预写 building，不 spawn 线程，避免 KB
+    卡在 building（与 ``target_count == 0`` 同款的空批次短路）。
+
+    ``target_count`` 仍含 cost-exceeded doc（与 ``list_target_docs`` 同口径），
+    但 ``force_cost_exceeded_warning`` 必须**非空**告诉前端"force 也跑不动"。
+    """
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    kb_id = _create_kb("trigger-force-all-cost")
+    _add_doc(
+        kb_id, "huge.pdf", embedding_status="failed",
+        page_count=BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1,
+    )
+    _stub_reparse(monkeypatch)
+
+    import storage.kb_repo as kb_repo
+    before = kb_repo.get(kb_id).index_status
+
+    r = client.post(
+        f"/api/v1/knowledge-bases/{kb_id}/bulk-reparse",
+        json={"force": True},
+    )
+    assert r.status_code == 202, r.text
+    body = r.json()
+    # 目标集非空（force 模式全员入选），warning 告知 skipped 数
+    assert body["target_count"] == 1
+    assert body["force_cost_exceeded_warning"] == {"skipped_count": 1}
+    # index_status 反映 KB 真实状态（runnable 空 → 不预写 building）
+    assert body["index_status"] != "building"
+
+    # 给任何 daemon 线程一点时间落盘（这里根本没起线程）
+    time.sleep(0.1)
+    after = kb_repo.get(kb_id).index_status
+    assert after != "building", (
+        f"force+全 cost-exceeded 不该把 KB 卡在 building, got {after}"
+    )
+    assert after == before, (
+        f"空 runnable 不该改写 KB 状态: before={before} after={after}"
+    )
+
+
 def test_trigger_failure_terminates_kb_failed(monkeypatch):
     """整批中有失败 → KB 终态 ``failed`` + 报告 done/failed 计数如实反映（AC 6）。"""
     kb_id = _create_kb("trigger-mix")
