@@ -1,6 +1,6 @@
 """对整个 KB 触发批量重新解析 (Bulk Reparse) 的命令行入口（Wayfinder #86 / #89）。
 
-**薄 wrapper**：领域逻辑（待重解析文档选取 / OCR 成本预检 / 页数上限分类 /
+**薄 wrapper**：领域逻辑（待重解析文档选取 / OCR 成本预检 / 拆分成本分类 /
 受控并发编排 / 实测 OCR 计数与报告落盘）全部住在 ``services.bulk_reparse_service``，
 与 HTTP API 共用同一实现（issue #108 / #110）。本脚本只负责四件事：
 ``.env`` 加载、argparse 契约、终端渲染、退出码。
@@ -27,6 +27,9 @@
 
   # 忽略三条选取规则，整库重建（换解析器后用）
   uv run python scripts/bulk_reparse.py --kb-id <kb_id> --force
+
+  # 显式绕过拆分成本护栏（``--force`` 不能绕的成本阈值由这个开关出口）
+  uv run python scripts/bulk_reparse.py --kb-id <kb_id> --ignore-cost-limit
 """
 from __future__ import annotations
 
@@ -50,7 +53,7 @@ if _env_path.exists():
 os.environ.setdefault("AUDIT_DATA_DIR", "data")
 
 import storage.kb_repo as kb_repo
-from core.settings import PADDLEOCR_PAGE_LIMIT
+from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES, PADDLEOCR_PAGE_LIMIT
 from services import bulk_reparse_service as bulk_svc
 
 
@@ -63,11 +66,25 @@ def _print_header(kb, kb_id: str, targets, cost, concurrency: int) -> None:
     print(f"知识库: {kb.name} ({kb_id})")
     print(f"目标 doc 数: {len(targets)} （其中 {cost.cached} 命中 OCR 缓存 / {cost.uncached} 需重 OCR）")
     print(f"预估 OCR 页数: {cost.pages_uncached} 页（缓存命中页 {cost.pages_cached} 不消耗）")
-    print(f"并发: {concurrency}")
-    if cost.over_page_limit:
-        print(f"⚠️  超 PADDLEOCR_PAGE_LIMIT={PADDLEOCR_PAGE_LIMIT} 的 doc ({len(cost.over_page_limit)} 篇)：")
-        for over in cost.over_page_limit:
+    if cost.will_split_docs:
+        print(
+            f"⚠️  超 PADDLEOCR_PAGE_LIMIT={PADDLEOCR_PAGE_LIMIT} 的 doc "
+            f"({len(cost.will_split_docs)} 篇，将走拆分解析路径；"
+            f"合计 {cost.chunks_total} 子块 / {cost.ocr_pages_total} 页)："
+        )
+        for plan in cost.will_split_docs:
+            print(
+                f"   - {plan.doc.id} ({plan.doc.original_name}) "
+                f"约 {plan.page_count} 页 → {plan.chunks_planned} 子块"
+            )
+    if cost.cost_exceeded_docs:
+        print(
+            f"⚠️  超拆分成本阈值 ({BULK_REPARSE_SPLIT_COST_LIMIT_PAGES} 页) 的 doc "
+            f"({len(cost.cost_exceeded_docs)} 篇，会进 skipped)："
+        )
+        for over in cost.cost_exceeded_docs:
             print(f"   - {over.doc.id} ({over.doc.original_name}) 约 {over.page_count} 页")
+    print(f"并发: {concurrency}")
     print("=" * 70)
 
 
@@ -76,9 +93,10 @@ def _print_dry_run(targets) -> None:
     for target in targets:
         tag = "CACHED" if bulk_svc.is_cache_hit(target.doc) else "OCR"
         pages_tag = "PAGES" if target.has_pages_file else "NO-PAGES"
+        split_tag = " [SPLIT]" if target.will_split else ""
         print(
             f"  [{tag:5s}] [{pages_tag:9s}] {target.doc.id}  "
-            f"{target.doc.original_name}  ({target.estimated_page_count} 页)"
+            f"{target.doc.original_name}  ({target.estimated_page_count} 页){split_tag}"
         )
 
 
@@ -87,7 +105,7 @@ def _print_summary(result) -> None:
     print(f"完成统计：")
     print(f"  done:    {len(result.done)}")
     print(f"  failed:  {len(result.failed)}")
-    print(f"  skipped: {len(result.skipped)} （超 PADDLEOCR_PAGE_LIMIT={PADDLEOCR_PAGE_LIMIT}）")
+    print(f"  skipped: {len(result.skipped)} （超拆分成本阈值）")
 
     # 预估 vs 实测并排 —— #91 那次"报 1694 页、实际 0 页"的指纹就在这两行的差值里。
     # 差异不拦截，只呈现（spec #102 story 26）。
@@ -103,7 +121,7 @@ def _print_summary(result) -> None:
         for doc_id, reason in result.failed:
             print(f"  {doc_id}  ←  {reason}")
     if result.skipped:
-        print("\n跳过列表（超 PADDLEOCR_PAGE_LIMIT）：")
+        print("\n跳过列表（超拆分成本阈值）：")
         for skipped in result.skipped:
             print(f"  {skipped.doc.id}  （约 {skipped.page_count} 页）")
     if result.report_path:
@@ -122,6 +140,7 @@ def bulk_reparse(
     concurrency: int,
     skip_confirm: bool,
     force: bool = False,
+    ignore_cost_limit: bool = False,
 ) -> int:
     """批量重新解析主入口。返回退出码（0 = 全部 done；1 = 有 failed；2 = dry-run / 用户取消）。"""
     kb = kb_repo.get(kb_id)
@@ -141,16 +160,23 @@ def bulk_reparse(
         _print_dry_run(targets)
         return 2
 
-    # 实际 run：超限 doc 拦截（dry-run 不拦，仅警告）
-    runnable, over_limit = bulk_svc.split_by_page_limit(targets)
-    if over_limit and not skip_confirm:
+    # 实际 run：拆分成本阈值拦截（dry-run 不拦，仅警告）。
+    # ``ignore_cost_limit=True`` 时拆分器返回 ``(targets, [])`` → 全部进 runnable。
+    runnable, cost_exceeded = bulk_svc.split_by_cost_limit(
+        targets, ignore_cost_limit=ignore_cost_limit,
+    )
+    if cost_exceeded and not skip_confirm:
         print(
-            f"\n⚠️  检测到 {len(over_limit)} 篇 doc 超过 {PADDLEOCR_PAGE_LIMIT} 页上限，"
+            f"\n⚠️  检测到 {len(cost_exceeded)} 篇 doc 超拆分成本阈值 "
+            f"({BULK_REPARSE_SPLIT_COST_LIMIT_PAGES} 页)，"
             f"run 将自动跳过这些 doc。"
         )
-        print("   （服务端会截断，避免静默丢内容；issue #87 决议）")
-    elif over_limit:
-        print(f"\n⚠️  跳过 {len(over_limit)} 篇超过 {PADDLEOCR_PAGE_LIMIT} 页的 doc（详见 dry-run 输出）。")
+        print("   （--force 不能绕过；显式 --ignore-cost-limit 才可绕过，issue #181）")
+    elif cost_exceeded:
+        print(
+            f"\n⚠️  跳过 {len(cost_exceeded)} 篇超拆分成本阈值的 doc "
+            f"（详见 dry-run 输出）。"
+        )
 
     if not skip_confirm:
         prompt = (
@@ -166,7 +192,7 @@ def bulk_reparse(
             print("已取消。")
             return 2
 
-    print(f"\n开始 reparse {len(runnable)} 篇（已跳过 {len(over_limit)} 篇超限）...\n")
+    print(f"\n开始 reparse {len(runnable)} 篇（已跳过 {len(cost_exceeded)} 篇超成本）...\n")
 
     def _on_doc_complete(completed: int, total: int, doc, outcome: str) -> None:
         label = "done" if outcome == "embedded" else (
@@ -178,6 +204,7 @@ def bulk_reparse(
         kb_id, targets,
         concurrency=concurrency,
         forced=force,
+        ignore_cost_limit=ignore_cost_limit,
         on_doc_complete=_on_doc_complete,
     )
 
@@ -217,6 +244,11 @@ def main() -> int:
         action="store_true",
         help="忽略三条选取规则，把整库全部 doc 当作目标（换解析器后的整库重建）",
     )
+    parser.add_argument(
+        "--ignore-cost-limit",
+        action="store_true",
+        help="显式绕过拆分成本护栏（--force 不能绕；issue #181）",
+    )
     args = parser.parse_args()
 
     if args.concurrency < 1:
@@ -229,6 +261,7 @@ def main() -> int:
         concurrency=args.concurrency,
         skip_confirm=args.yes,
         force=args.force,
+        ignore_cost_limit=args.ignore_cost_limit,
     )
 
 

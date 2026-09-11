@@ -9,16 +9,17 @@
 2. **OCR 成本预检** —— 按 ``(content_hash, model_version)`` 探测缓存条目，
    区分命中 / 未命中。**无副作用**。历史 ``source=fallback_pdfplumber`` 条目
    （#99/05 之前残留）现在算命中：``get_cached`` 已不再判废，清理是单独工单。
-3. **页数上限分类** —— 超 ``PADDLEOCR_PAGE_LIMIT`` 的文档会被解析器服务端截断（issue #87
-   决议），预检里作为警告呈现、实际 run 里进 ``skipped``。
+3. **拆分成本分类** —— 单篇预估 OCR 页数 > ``BULK_REPARSE_SPLIT_COST_LIMIT_PAGES``
+   的文档进 ``skipped``（``reason == "split_cost_exceeded"``），``--force``
+   不能绕过；``--ignore-cost-limit`` 才可。
 4. **受控并发编排** —— 线程池限流 + 单篇轮询超时，单篇失败不中断整批。
 5. **KB 级检索状态** —— 整批期间把 KB 按在 ``building``，终态末尾写一次
    （issue #109 / #147，由 ``core.kb_index_status.KbIndexStatusWriter`` 独占）。
    批量下单篇入口注入该 writer 取代旧的 ``caller_manages_kb_status=True`` 开关
    （#150），不再各写各的。
 6. **实测 OCR 消耗计数与报告持久化**（issue #110）—— 跑前取缓存条目快照，
-   跑完每篇按 ``paddleocr / cache_hit / 非 OCR 来源 / unknown`` 分桶，预检
-   估算与实测值并列写进 ``data/kbs/{kb_id}/bulk_reparse_report.json``。
+   跑完每篇按 ``paddleocr / paddleocr_split / cache_hit / 非 OCR 来源 / unknown``
+   分桶，预检估算与实测值并列写进 ``data/kbs/{kb_id}/bulk_reparse_report.json``。
 
 为什么在 service 而不是 CLI（issue #108 的全部动机）：三条选取规则里的第三条
 （``layout == []`` 兜底）是 #93 复盘一整轮才加上的，**只要它有第二份实现就必然分叉**。
@@ -39,7 +40,8 @@ import storage.kb_repo as kb_repo
 from core import bulk_reparse_report_store, paddleocr_cache, pages_store
 from core.kb_index_status import KbIndexStatusWriter
 from core.logger import get_logger
-from core.settings import PADDLEOCR_PAGE_LIMIT
+from core.pdf_splitter import chunk_ranges, reap_scratch
+from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES, PADDLEOCR_PAGE_LIMIT
 from models.document import KBDocument
 from services.reparse_service import reparse_document
 
@@ -48,11 +50,7 @@ _logger = get_logger(__name__)
 
 # ── 常量 ───────────────────────────────────────────────────────────────────────
 
-# ``PADDLEOCR_PAGE_LIMIT`` 由 ``core.settings`` 集中管理（issue #174 / spec §B）。
-# 本模块当前消费侧仍是 issue #87 的"超限即 skipped"路径；#173 把这条线的最终语义
-# 翻转为"超限即触发分块解析"，消费侧的迁移在后续 ticket 里完成。
-
-# 默认估算：未带 page_count 元数据的 doc，按此页数估算 OCR 成本。
+# 默认估算：未带 page_count 元数据且源 PDF 不可读时，按此页数估算 OCR 成本。
 # 虹桥公司制度 KB 实测均值 10.93 / 中位 9（research/ocr-cache-hit-estimate.md）。
 DEFAULT_PAGES_ESTIMATE = 11
 
@@ -79,14 +77,14 @@ REASON_MISSING_PAGES = "missing_pages"
 REASON_EMPTY_LAYOUT = "empty_layout"
 REASON_FORCED = "forced"
 
-# 跳过原因（字符串值 ``"page_limit"`` 是写入报告 / API JSON 的 wire 格式，**不改**）。
-# 注：#173 计划把这条重命名为 ``SKIP_REASON_SPLIT_COST_EXCEEDED = "split_cost_exceeded"``
-# （语义从"超 PADDLEOCR_PAGE_LIMIT"翻转到"超拆分成本阈值"），不在本 ticket（T01
-# 术语底座）范围；这里保留旧名以免消费侧做两次 rename。
-SKIP_REASON_PAGE_LIMIT = "page_limit"
+# 跳过原因（spec #173 / issue #181）：拆分路径下预估 OCR 成本超单篇阈值
+# （``BULK_REPARSE_SPLIT_COST_LIMIT_PAGES``，默认 20000 页）的 doc 进 skipped，
+# 避免一篇异常大的 PDF 静默吃掉一天配额（#173 story 28）。
+# ``--force`` 不能绕过；显式 ``--ignore-cost-limit`` 才可。
+SKIP_REASON_COST_EXCEEDED = "split_cost_exceeded"
 
 # 实测 OCR 消耗的两个**非解析器**分桶名（其余分桶名直接就是缓存条目的 ``source``：
-# ``paddleocr`` / ``pymupdf`` / ``fallback_*``）。
+# ``paddleocr`` / ``paddleocr_split`` / ``pymupdf`` / ``fallback_*``）。
 #
 # ``cache_hit`` —— 跑之前该 doc 就已有缓存条目，这一篇没烧配额。缓存条目的
 # ``source`` 仍写着 ``paddleocr``，光看 source 会把缓存命中误报成真实 OCR，
@@ -98,27 +96,51 @@ SOURCE_CACHE_HIT = "cache_hit"
 SOURCE_UNKNOWN = "unknown"
 
 # 报告 schema 版本。字段增删时递增，让 #111 的报告端点与旧文件能互相识别。
-REPORT_SCHEMA_VERSION = 1
+# v2 引入拆分成本分类（``will_split_docs`` / ``chunks_total`` / ``ocr_pages_total``）
+# 与新跳过原因 ``split_cost_exceeded``（issue #181）。
+REPORT_SCHEMA_VERSION = 2
 
 
 # ── 值对象 ─────────────────────────────────────────────────────────────────────
 
 
+def _resolve_estimated_page_count(doc: KBDocument) -> int:
+    """成本估算用页数：``doc.page_count`` → 源 PDF 真实页数 → ``DEFAULT_PAGES_ESTIMATE``。
+
+    优先级：
+    1. ``doc.page_count``（运维在 doc metadata 里写过的值，最权威）
+    2. ``pdf_page_count(doc.file_path)``（运行时实测，捕获 metadata 过期）
+    3. ``DEFAULT_PAGES_ESTIMATE``（无 metadata 且源 PDF 不可读时的兜底）
+
+    唯一实现：``list_target_docs`` 一次性算好 ``ReparseTarget.estimated_page_count``，
+    后续预检 / 拆分都直接读字段，不再各自重算 —— 防止两份实现对同一篇 doc
+    给出不同估值（#181 spec §C：单一实现）。
+    """
+    if doc.page_count:
+        return doc.page_count
+    from core.parse_document import pdf_page_count
+
+    n = pdf_page_count(doc.file_path)
+    return n if n is not None else DEFAULT_PAGES_ESTIMATE
+
+
 @dataclass(frozen=True)
 class ReparseTarget:
-    """一篇**待重解析文档**：文档本身 + 它为什么进名单。"""
+    """一篇**待重解析文档**：文档本身 + 它为什么进名单。
+
+    ``estimated_page_count`` 在 :func:`list_target_docs` 里一次性算好（``doc.page_count``
+    → 源 PDF 真实页数 → ``DEFAULT_PAGES_ESTIMATE``），后续预检 / 拆分直接读字段，
+    不再各自重算。
+    """
 
     doc: KBDocument
     has_pages_file: bool
     reason: str
+    estimated_page_count: int
 
     @property
-    def estimated_page_count(self) -> int:
-        """成本估算用页数：缺 ``page_count`` 元数据时回落到默认估值。"""
-        return self.doc.page_count or DEFAULT_PAGES_ESTIMATE
-
-    @property
-    def over_page_limit(self) -> bool:
+    def will_split(self) -> bool:
+        """是否走拆分路径：源 PDF 物理页数 > ``PADDLEOCR_PAGE_LIMIT``。"""
         return self.estimated_page_count > PADDLEOCR_PAGE_LIMIT
 
 
@@ -132,23 +154,40 @@ class SkippedDoc:
 
 
 @dataclass(frozen=True)
+class SplitPlan:
+    """一篇待拆分 doc 的拆分计划（#173 / #181）：``(doc, page_count, chunks_planned)``。
+
+    ``chunks_planned`` 走 :func:`core.pdf_splitter.chunk_ranges` 的**唯一**实现，
+    本服务不在第二处写 ``ceil`` 除法（spec #173 §C）。
+    """
+
+    doc: KBDocument
+    page_count: int
+    chunks_planned: int
+
+
+@dataclass(frozen=True)
 class OcrCostEstimate:
-    """预检产出：缓存命中 / 未命中的篇数与页数，以及超页数上限的清单。"""
+    """预检产出：缓存命中 / 未命中的篇数与页数，以及超成本阈值的清单。"""
 
     cached: int = 0
     uncached: int = 0
     pages_cached: int = 0
     pages_uncached: int = 0
-    over_page_limit: list[SkippedDoc] = field(default_factory=list)
+    cost_exceeded_docs: list[SkippedDoc] = field(default_factory=list)
+    will_split_docs: list[SplitPlan] = field(default_factory=list)
+    chunks_total: int = 0
+    ocr_pages_total: int = 0
 
 
 @dataclass(frozen=True)
 class DocParseUsage:
     """一篇跑过的文档**实际**是谁解析的、算几页。
 
-    ``source`` 是分桶名：缓存条目的 ``source``（``paddleocr`` / ``pymupdf`` /
-    ``fallback_*``）、``SOURCE_CACHE_HIT`` 或 ``SOURCE_UNKNOWN``。
-    ``pages`` 取落盘的 ``pages/{doc_id}.json`` 的真实页数（读不到才回落到预检估值）。
+    ``source`` 是分桶名：缓存条目的 ``source``（``paddleocr`` /
+    ``paddleocr_split`` / ``pymupdf`` / ``fallback_*``）、``SOURCE_CACHE_HIT`` 或
+    ``SOURCE_UNKNOWN``。``pages`` 取落盘的 ``pages/{doc_id}.json`` 的真实页数
+    （读不到才回落到预检估值）。
     """
 
     doc_id: str
@@ -224,16 +263,29 @@ def list_target_docs(kb_id: str, *, force: bool = False) -> list[ReparseTarget]:
     **仅看状态机无法识别这种假成功**，必须读 pages 文件的 ``layout`` 字段。
 
     ``force=True`` 绕过三条规则，整库皆为目标（换解析器后的整库重建入口）。
+
+    同时把每篇 doc 的 ``estimated_page_count`` 一次性算好（doc.page_count → 源
+    PDF 真实页数 → ``DEFAULT_PAGES_ESTIMATE``），后续预检 / 拆分直接读字段。
     """
     targets: list[ReparseTarget] = []
     for doc in doc_repo.list_docs(kb_id):
         has_pages = _pages_file_exists(kb_id, doc.id)
         if force:
-            targets.append(ReparseTarget(doc=doc, has_pages_file=has_pages, reason=REASON_FORCED))
+            targets.append(ReparseTarget(
+                doc=doc,
+                has_pages_file=has_pages,
+                reason=REASON_FORCED,
+                estimated_page_count=_resolve_estimated_page_count(doc),
+            ))
             continue
         reason = _selection_reason(doc, has_pages)
         if reason is not None:
-            targets.append(ReparseTarget(doc=doc, has_pages_file=has_pages, reason=reason))
+            targets.append(ReparseTarget(
+                doc=doc,
+                has_pages_file=has_pages,
+                reason=reason,
+                estimated_page_count=_resolve_estimated_page_count(doc),
+            ))
     return targets
 
 
@@ -269,17 +321,42 @@ def estimate_ocr_cost(targets: Sequence[ReparseTarget]) -> OcrCostEstimate:
 
     注：#99/05 删了 V8 cache defense 之后，历史 ``source=fallback_pdfplumber``
     条目不再被判废；预检按"命中"计费。运维清理单独 ticket。
+
+    输出：
+    - ``cached`` / ``uncached`` —— 缓存命中的篇数与未命中篇数
+    - ``pages_cached`` / ``pages_uncached`` —— 各自的页数（按真实预估页数计，不再 cap）
+    - ``cost_exceeded_docs`` —— 预估 OCR 成本 > ``BULK_REPARSE_SPLIT_COST_LIMIT_PAGES`` 的清单
+    - ``will_split_docs`` —— 走拆分路径（物理页数 > ``PADDLEOCR_PAGE_LIMIT``）的清单与
+      计划块数（来自 :func:`core.pdf_splitter.chunk_ranges` 的唯一实现）
+    - ``chunks_total`` / ``ocr_pages_total`` —— 整批的拆分块数 / OCR 总页数合计
     """
     cached = uncached = pages_cached = pages_uncached = 0
-    over_page_limit: list[SkippedDoc] = []
+    cost_exceeded_docs: list[SkippedDoc] = []
+    will_split_docs: list[SplitPlan] = []
+    chunks_total = 0
+    ocr_pages_total = 0
 
     for target in targets:
-        if target.over_page_limit:
-            over_page_limit.append(_as_skipped(target))
-            # 超限 doc：服务端会截断，按 PADDLEOCR_PAGE_LIMIT 计费更保守。
-            billed_pages = PADDLEOCR_PAGE_LIMIT
-        else:
-            billed_pages = target.estimated_page_count
+        billed_pages = target.estimated_page_count
+
+        # 拆分成本阈值（issue #181）：单篇预估 OCR 页数 > 该值进 skipped。
+        # 必须在 ``will_split_docs`` 之前判定 —— cost-exceeded doc 语义上**不会**跑，
+        # 自然也不会进拆分路径；否则一篇超成本的大 PDF 会同时出现在两个桶里
+        # （review #181 双计数回归锁）。
+        if billed_pages > BULK_REPARSE_SPLIT_COST_LIMIT_PAGES:
+            cost_exceeded_docs.append(_as_skipped(target))
+            continue
+
+        # 拆分路径：单独计块数 / OCR 页数（spec #173 §C）。
+        if target.will_split:
+            plan = SplitPlan(
+                doc=target.doc,
+                page_count=target.estimated_page_count,
+                chunks_planned=len(chunk_ranges(target.estimated_page_count)),
+            )
+            will_split_docs.append(plan)
+            chunks_total += plan.chunks_planned
+            ocr_pages_total += billed_pages
 
         if cache_state(target.doc) == paddleocr_cache.CACHE_STATE_HIT:
             cached += 1
@@ -293,7 +370,10 @@ def estimate_ocr_cost(targets: Sequence[ReparseTarget]) -> OcrCostEstimate:
         uncached=uncached,
         pages_cached=pages_cached,
         pages_uncached=pages_uncached,
-        over_page_limit=over_page_limit,
+        cost_exceeded_docs=cost_exceeded_docs,
+        will_split_docs=will_split_docs,
+        chunks_total=chunks_total,
+        ocr_pages_total=ocr_pages_total,
     )
 
 
@@ -310,20 +390,27 @@ def is_cache_hit(doc: KBDocument) -> bool:
     return cache_state(doc) == paddleocr_cache.CACHE_STATE_HIT
 
 
-# ── 3) 页数上限分类 ────────────────────────────────────────────────────────────
+# ── 3) 拆分成本分类 ────────────────────────────────────────────────────────────
 
 
-def split_by_page_limit(
+def split_by_cost_limit(
     targets: Sequence[ReparseTarget],
+    *,
+    ignore_cost_limit: bool = False,
 ) -> tuple[list[ReparseTarget], list[SkippedDoc]]:
-    """把目标清单切成"会跑"与"会跳过（超 ``PADDLEOCR_PAGE_LIMIT``）"两半。
+    """把目标清单切成"会跑"与"会跳过（超拆分成本阈值）"两半（issue #181）。
 
     dry-run 用它渲染"会被跳过"的警告；实际 run 用它决定谁进线程池。同一份规则。
+
+    ``ignore_cost_limit=True`` 时**全部**目标都进 runnable（不跳过任何人）——
+    显式覆盖拆分成本护栏（``--force`` 不能绕过；这是运维的"我就是要烧"出口）。
     """
+    if ignore_cost_limit:
+        return list(targets), []
     runnable: list[ReparseTarget] = []
     skipped: list[SkippedDoc] = []
     for target in targets:
-        if target.over_page_limit:
+        if target.estimated_page_count > BULK_REPARSE_SPLIT_COST_LIMIT_PAGES:
             skipped.append(_as_skipped(target))
         else:
             runnable.append(target)
@@ -331,11 +418,11 @@ def split_by_page_limit(
 
 
 def _as_skipped(target: ReparseTarget) -> SkippedDoc:
-    """超页数上限的目标 → 一条带原因的跳过记录。"""
+    """超拆分成本阈值的目标 → 一条带原因的跳过记录。"""
     return SkippedDoc(
         doc=target.doc,
         page_count=target.estimated_page_count,
-        reason=SKIP_REASON_PAGE_LIMIT,
+        reason=SKIP_REASON_COST_EXCEEDED,
     )
 
 
@@ -419,11 +506,14 @@ def run_bulk_reparse(
     concurrency: int = DEFAULT_CONCURRENCY,
     timeout_s: float = PER_DOC_TIMEOUT_S,
     forced: bool = False,
+    ignore_cost_limit: bool = False,
     on_doc_complete: Optional[Callable[[int, int, KBDocument, str], None]] = None,
 ) -> BulkReparseResult:
     """受控并发跑完一批待重解析文档，返回终态统计并落盘一份**批量重新解析报告**。
 
-    - 超 ``PADDLEOCR_PAGE_LIMIT`` 的文档不触发，直接进 ``skipped``（带原因）。
+    - 拆分成本阈值（``BULK_REPARSE_SPLIT_COST_LIMIT_PAGES``）以内的文档全部进
+      ``runnable``；超阈值的进 ``skipped``（``reason="split_cost_exceeded"``）。
+      ``--force`` 不能绕过；显式 ``ignore_cost_limit=True`` 才可。
     - 单篇失败 / 超时 / 抛异常都只记账，不中断整批。
     - 每篇跑完立刻回读它的解析来源，进 run log 也进实测分桶（#110）。
     - 整批期间 KB 被按在 ``building``，终态在末尾写一次（由
@@ -435,9 +525,25 @@ def run_bulk_reparse(
 
     **缓存快照必须在触发任何解析之前取**：区分"缓存命中"与"真实 OCR"的唯一依据
     就是跑之前有没有条目 —— 跑完再问就全是命中了。
+
+    入口第一步调 :func:`core.pdf_splitter.reap_scratch` 回收超龄临时目录
+    （与 T03 splitter 同源动作），避免陈年拆分产物堆积。
     """
-    runnable, skipped = split_by_page_limit(targets)
+    # 入口先回收一次超龄拆分临时目录（#173 / #176 与本 ticket 共用动作）。
+    reap_scratch()
+
+    runnable, skipped = split_by_cost_limit(targets, ignore_cost_limit=ignore_cost_limit)
     total = len(runnable)
+
+    # 超成本阈值 + ``forced``（即 ``--force``）的特殊路径：WARNING 日志 + ⚠️ banner，
+    # 但**不** abort 整批 —— ``forced`` 不能绕过成本护栏，被挡住的 doc 留在
+    # ``skipped`` 里照常把 ``runnable`` 跑完（spec #181 验收 #8）。
+    if skipped and forced and not ignore_cost_limit:
+        _logger.warning(
+            "bulk_reparse: %d 篇 doc 超拆分成本阈值 (%d 页) 仍被 --force 跳过 —— "
+            "--force 不能绕过成本护栏；显式 --ignore-cost-limit 才可绕过",
+            len(skipped), BULK_REPARSE_SPLIT_COST_LIMIT_PAGES,
+        )
 
     cached_before = {t.doc.id: cache_state(t.doc) for t in targets}
     estimate = estimate_ocr_cost(targets)
@@ -609,12 +715,15 @@ def build_report(
     done / failed / skipped 三类明细各自带 doc id、原始文件名与原因串：
     - done 的 ``reason`` 是**入选**原因（这篇当初为什么在名单里）
     - failed 的 ``reason`` 是**失败**原因（终态串 / 异常类型与消息）
-    - skipped 的 ``reason`` 是**跳过**原因（当前只有超页数上限一种）
+    - skipped 的 ``reason`` 是**跳过**原因（拆分成本超阈值为 ``split_cost_exceeded``）
 
     ``cache_state_at_start`` 必须是 run **触发前**的快照（CONTEXT.md 写明的
     "缓存快照必须在触发任何解析之前取"）—— 跑完再回读会让"先 uncached 后 cached"
     的 doc 在预检块与实测块互相打脸，正是 #91 那类误报的反向翻版。
     调用方没传则按"重新查"（与 ``cache_state`` 同口径），仅作退化路径。
+
+    注（#181 / spec §F）：per-doc ``chunks_planned`` **不进**报告 —— bulk 层
+    不记录 ``parse_document`` 的内部细节；决策辅助信息走预检 API 响应。
     """
     by_id = {t.doc.id: t for t in targets}
     usage_by_id = {u.doc_id: u for u in result.doc_usages}

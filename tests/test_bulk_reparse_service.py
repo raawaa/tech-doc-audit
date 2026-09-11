@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -229,33 +230,183 @@ def test_estimate_counts_corrupt_cache_entry_as_uncached(kb):
 # ── 页数上限分类 ───────────────────────────────────────────────────────────────
 
 
-def test_over_page_limit_doc_lands_in_warnings_and_is_billed_at_page_limit(kb):
-    """超 ``PADDLEOCR_PAGE_LIMIT`` → 进 ``over_page_limit`` 清单；成本按 ``PADDLEOCR_PAGE_LIMIT`` 封顶（服务端会截断）。"""
+def test_over_cost_limit_doc_lands_in_warnings(kb):
+    """超拆分成本阈值 → 进 ``cost_exceeded_docs`` 清单；pages_uncached 不再被 cap。"""
     from services import bulk_reparse_service as svc
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
 
-    doc = _add_doc(kb.id, "huge.pdf", embedding_status="failed", page_count=PADDLEOCR_PAGE_LIMIT + 50)
+    doc = _add_doc(
+        kb.id, "huge.pdf", embedding_status="failed",
+        page_count=BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1,
+    )
 
     cost = svc.estimate_ocr_cost(svc.list_target_docs(kb.id))
 
-    assert [over.doc.id for over in cost.over_page_limit] == [doc.id]
-    assert cost.over_page_limit[0].page_count == PADDLEOCR_PAGE_LIMIT + 50
-    assert cost.over_page_limit[0].reason == svc.SKIP_REASON_PAGE_LIMIT
-    assert cost.pages_uncached == PADDLEOCR_PAGE_LIMIT
+    assert [over.doc.id for over in cost.cost_exceeded_docs] == [doc.id]
+    assert cost.cost_exceeded_docs[0].page_count == BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1
+    assert cost.cost_exceeded_docs[0].reason == svc.SKIP_REASON_COST_EXCEEDED
 
 
-def test_split_by_page_limit_separates_runnable_from_skipped(kb):
-    """分类器把"会跑"与"会跳过"分开，跳过项带原因。"""
+def test_pages_uncached_is_not_capped_to_split_trigger_anymore(kb):
+    """#181 验收 #4：``pages_uncached`` 不再被 cap 在 ``PADDLEOCR_PAGE_LIMIT``。
+
+    旧实现把超限 doc 按 ``PADDLEOCR_PAGE_LIMIT`` 计费（服务端会截断），导致
+    实际页数被低估。新实现按真实预估页数计费，超限 doc 进 ``will_split_docs``、
+    进 ``runnable``、走 splitter 拆分路径（不丢失页）。
+    """
     from services import bulk_reparse_service as svc
 
-    small = _add_doc(kb.id, "small.pdf", embedding_status="failed", page_count=10)
-    huge = _add_doc(kb.id, "huge.pdf", embedding_status="failed", page_count=PADDLEOCR_PAGE_LIMIT + 1)
+    _add_doc(
+        kb.id, "huge.pdf", embedding_status="failed",
+        page_count=PADDLEOCR_PAGE_LIMIT + 50,
+    )
 
-    runnable, skipped = svc.split_by_page_limit(svc.list_target_docs(kb.id))
+    cost = svc.estimate_ocr_cost(svc.list_target_docs(kb.id))
+
+    # 真实预估页数（250）全数计入 pages_uncached —— 不再被 cap 到 100。
+    assert cost.pages_uncached == PADDLEOCR_PAGE_LIMIT + 50
+
+
+def test_will_split_docs_uses_pdf_splitter_chunk_ranges(kb):
+    """#181 验收：``will_split_docs`` 调 :func:`pdf_splitter.chunk_ranges` 唯一实现。
+
+    不在本服务里写第二份 ``ceil`` 除法 —— splitter 是 chunks_planned 的**唯一**算法来源。
+    """
+    from services import bulk_reparse_service as svc
+    from core.pdf_splitter import chunk_ranges
+
+    doc = _add_doc(
+        kb.id, "huge.pdf", embedding_status="failed",
+        page_count=PADDLEOCR_PAGE_LIMIT + 47,  # 147 页
+    )
+
+    cost = svc.estimate_ocr_cost(svc.list_target_docs(kb.id))
+
+    assert [plan.doc.id for plan in cost.will_split_docs] == [doc.id]
+    plan = cost.will_split_docs[0]
+    assert plan.page_count == PADDLEOCR_PAGE_LIMIT + 47
+    assert plan.chunks_planned == len(chunk_ranges(plan.page_count))
+    # 147 / 99 = 2 块
+    assert plan.chunks_planned == 2
+    # chunks_total / ocr_pages_total 合计
+    assert cost.chunks_total == 2
+    assert cost.ocr_pages_total == PADDLEOCR_PAGE_LIMIT + 47
+
+
+def test_split_by_cost_limit_separates_runnable_from_skipped(kb):
+    """分类器把"会跑"与"会跳过"分开，跳过项带原因。"""
+    from services import bulk_reparse_service as svc
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    small = _add_doc(kb.id, "small.pdf", embedding_status="failed", page_count=10)
+    huge = _add_doc(
+        kb.id, "huge.pdf", embedding_status="failed",
+        page_count=BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1,
+    )
+
+    runnable, skipped = svc.split_by_cost_limit(svc.list_target_docs(kb.id))
 
     assert [t.doc.id for t in runnable] == [small.id]
     assert [s.doc.id for s in skipped] == [huge.id]
-    assert skipped[0].reason == svc.SKIP_REASON_PAGE_LIMIT
-    assert skipped[0].page_count == PADDLEOCR_PAGE_LIMIT + 1
+    assert skipped[0].reason == svc.SKIP_REASON_COST_EXCEEDED
+    assert skipped[0].page_count == BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1
+
+
+def test_split_by_cost_limit_ignore_cost_limit_keeps_everyone_runnable(kb):
+    """``ignore_cost_limit=True`` → 全员进 runnable（``--force`` 不能绕的成本护栏出口）。"""
+    from services import bulk_reparse_service as svc
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    small = _add_doc(kb.id, "small.pdf", embedding_status="failed", page_count=10)
+    huge = _add_doc(
+        kb.id, "huge.pdf", embedding_status="failed",
+        page_count=BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1,
+    )
+
+    runnable, skipped = svc.split_by_cost_limit(
+        svc.list_target_docs(kb.id), ignore_cost_limit=True,
+    )
+
+    assert {t.doc.id for t in runnable} == {small.id, huge.id}
+    assert skipped == []
+
+
+def test_list_target_docs_resolves_estimated_page_count_from_pdf_when_missing(kb, monkeypatch):
+    """#181 验收 #5：``doc.page_count is None`` + 可读源 PDF → 预检用真实页数而非 ``DEFAULT_PAGES_ESTIMATE``。"""
+    from services import bulk_reparse_service as svc
+
+    doc = _add_doc(kb.id, "x.pdf", embedding_status="failed", page_count=None)
+    # 让 ``pdf_page_count`` 返回一个固定数
+    monkeypatch.setattr(
+        "core.parse_document.pdf_page_count", lambda _path: 42,
+    )
+
+    targets = svc.list_target_docs(kb.id)
+    target = next(t for t in targets if t.doc.id == doc.id)
+    assert target.estimated_page_count == 42
+
+
+def test_will_split_property_uses_split_trigger(kb):
+    """``ReparseTarget.will_split`` = ``estimated_page_count > PADDLEOCR_PAGE_LIMIT``。"""
+    from services import bulk_reparse_service as svc
+
+    small = _add_doc(kb.id, "small.pdf", embedding_status="failed", page_count=10)
+    huge = _add_doc(
+        kb.id, "huge.pdf", embedding_status="failed",
+        page_count=PADDLEOCR_PAGE_LIMIT + 1,
+    )
+
+    targets = {t.doc.id: t for t in svc.list_target_docs(kb.id)}
+
+    assert targets[small.id].will_split is False
+    assert targets[huge.id].will_split is True
+
+
+def test_cost_exceeded_doc_does_not_appear_in_will_split_docs(kb):
+    """review #181 双计数回归锁：超拆分成本阈值的 doc 不会跑，**不**应出现在
+    ``will_split_docs`` 也不应贡献到 ``chunks_total`` / ``ocr_pages_total``。
+
+    修前 bug：cost-exceeded 分支在 ``continue`` 之前先 append ``will_split_docs``
+    并累加 chunks_total / ocr_pages_total。语义上 cost-exceeded doc 跑都不会跑，
+    不可能走拆分路径。
+    """
+    from services import bulk_reparse_service as svc
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    huge = _add_doc(
+        kb.id, "huge.pdf", embedding_status="failed",
+        page_count=BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1,  # 同时超 PADDLEOCR_PAGE_LIMIT + 成本阈值
+    )
+
+    cost = svc.estimate_ocr_cost(svc.list_target_docs(kb.id))
+
+    assert [s.doc.id for s in cost.cost_exceeded_docs] == [huge.id]
+    # 关键：cost-exceeded doc **不**出现在 will_split_docs 也不贡献 totals
+    assert cost.will_split_docs == []
+    assert cost.chunks_total == 0
+    assert cost.ocr_pages_total == 0
+
+
+def test_estimated_page_count_falls_back_to_pdf_then_default(kb, monkeypatch):
+    """``doc.page_count`` → ``pdf_page_count`` → ``DEFAULT_PAGES_ESTIMATE`` 三段回退。"""
+    from services import bulk_reparse_service as svc
+
+    # 三种 doc：无 metadata（fallback to default）/ 有 metadata（用 metadata）/
+    # 无 metadata 但源 PDF 可读（fallback to pdf_page_count 真值）
+    no_meta = _add_doc(kb.id, "no_meta.pdf", embedding_status="failed", page_count=None)
+    explicit = _add_doc(kb.id, "explicit.pdf", embedding_status="failed", page_count=10)
+    pdf_only = _add_doc(kb.id, "pdf_only.pdf", embedding_status="failed", page_count=None)
+
+    monkeypatch.setattr(
+        "core.parse_document.pdf_page_count",
+        lambda path: 42 if "pdf_only" in path else None,
+    )
+
+    targets = {t.doc.id: t for t in svc.list_target_docs(kb.id)}
+
+    assert targets[no_meta.id].estimated_page_count == svc.DEFAULT_PAGES_ESTIMATE
+    assert targets[pdf_only.id].estimated_page_count == 42
+    assert targets[explicit.id].estimated_page_count == 10
 
 
 # ── 批量编排 ───────────────────────────────────────────────────────────────────
@@ -310,21 +461,110 @@ def test_run_bulk_reparse_reports_raised_exception_as_failure(kb, monkeypatch):
     assert "RuntimeError" in failures[boom.id]
 
 
-def test_run_bulk_reparse_skips_over_page_limit_without_raising(kb, monkeypatch):
-    """超页数上限的文档进 skipped，不被触发、不抛错。"""
-    huge = _add_doc(kb.id, "huge.pdf", embedding_status="failed")
+def test_run_bulk_reparse_skips_over_cost_limit_without_raising(kb, monkeypatch):
+    """超拆分成本阈值的文档进 skipped，不被触发、不抛错。"""
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    huge = _add_doc(kb.id, "huge.pdf", embedding_status="failed", page_count=None)
     small = _add_doc(kb.id, "small.pdf", embedding_status="failed", page_count=3)
     svc = _stub_reparse(monkeypatch, {})
-    huge.page_count = PADDLEOCR_PAGE_LIMIT + 1
+    huge.page_count = BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1
     doc_repo._save_doc_meta(huge)
 
     result = svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
 
     assert [s.doc.id for s in result.skipped] == [huge.id]
-    assert result.skipped[0].reason == svc.SKIP_REASON_PAGE_LIMIT
+    assert result.skipped[0].reason == svc.SKIP_REASON_COST_EXCEEDED
     assert result.done == [small.id]
     # 跳过的那篇状态没被动过
     assert doc_repo.get_doc(kb.id, huge.id).embedding_status == "failed"
+
+
+def test_run_bulk_reparse_split_eligible_docs_go_to_runnable_not_skipped(kb, monkeypatch):
+    """#181 验收 #1：超 ``PADDLEOCR_PAGE_LIMIT`` 的文档**进 runnable** 而非 skipped。
+
+    拆分路径让"超 PADDLEOCR_PAGE_LIMIT"不再是跳过理由 —— 它只是要走分块解析。
+    """
+    huge = _add_doc(kb.id, "huge.pdf", embedding_status="failed", page_count=None)
+    svc = _stub_reparse(monkeypatch, {})
+    huge.page_count = PADDLEOCR_PAGE_LIMIT + 50
+    doc_repo._save_doc_meta(huge)
+
+    result = svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
+
+    # 不进 skipped
+    assert result.skipped == []
+    # 进 runnable → done 列表里能找到它（被 stub 标 embedded）
+    assert huge.id in result.done
+
+
+def test_run_bulk_reparse_force_does_not_bypass_cost_guard(kb, monkeypatch, caplog):
+    """#181 验收 #3 + #8：``force=True`` + 超成本 → 仍进 skipped，整批不 abort，跑完 result.usage 正常。"""
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    huge = _add_doc(kb.id, "huge.pdf", embedding_status="failed", page_count=None)
+    small = _add_doc(kb.id, "small.pdf", embedding_status="failed", page_count=3)
+    svc = _stub_reparse(monkeypatch, {})
+    huge.page_count = BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1
+    doc_repo._save_doc_meta(huge)
+
+    with caplog.at_level(logging.WARNING):
+        result = svc.run_bulk_reparse(
+            kb.id, svc.list_target_docs(kb.id, force=True),
+            concurrency=1, forced=True,
+        )
+
+    # cost-exceeded → skipped +1（huge）；force 不能绕过
+    assert [s.doc.id for s in result.skipped] == [huge.id]
+    # runnable（小）继续跑完
+    assert small.id in result.done
+    # failed 列表空
+    assert result.failed == []
+    # result.usage 正常算出（_aggregate_usage 跑过 empty list 不炸）
+    assert result.usage.actual_ocr_pages >= 0
+    # WARNING 日志（banner 单一 sink；不再用 print 双发）
+    assert any(
+        "--force 不能绕过成本护栏" in rec.getMessage() for rec in caplog.records
+    )
+
+
+def test_run_bulk_reparse_ignore_cost_limit_lets_overcost_doc_through(kb, monkeypatch):
+    """#181 验收 #3：``ignore_cost_limit=True`` → 超成本 doc 进 runnable（而非 skipped）。"""
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    huge = _add_doc(kb.id, "huge.pdf", embedding_status="failed", page_count=None)
+    svc = _stub_reparse(monkeypatch, {})
+    huge.page_count = BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1
+    doc_repo._save_doc_meta(huge)
+
+    result = svc.run_bulk_reparse(
+        kb.id, svc.list_target_docs(kb.id),
+        concurrency=1, ignore_cost_limit=True,
+    )
+
+    assert result.skipped == []
+    assert huge.id in result.done
+
+
+def test_run_bulk_reparse_invokes_reap_scratch_at_entry(kb, monkeypatch):
+    """#181 验收 #7：``run_bulk_reparse`` 入口至少调一次 :func:`pdf_splitter.reap_scratch`。"""
+    from services import bulk_reparse_service as svc
+
+    _add_doc(kb.id, "a.pdf", embedding_status="failed", page_count=3)
+    _stub_reparse(monkeypatch, {})
+
+    reaped: list[int] = []
+    real_reap = svc.reap_scratch
+
+    def _spy_reap():
+        reaped.append(1)
+        return real_reap()
+
+    monkeypatch.setattr(svc, "reap_scratch", _spy_reap)
+
+    svc.run_bulk_reparse(kb.id, svc.list_target_docs(kb.id), concurrency=1)
+
+    assert len(reaped) >= 1, f"入口应至少调一次 reap_scratch，实际 {len(reaped)} 次"
 
 
 def test_run_bulk_reparse_invokes_progress_callback_per_doc(kb, monkeypatch):
@@ -702,14 +942,16 @@ def test_bulk_run_failure_terminates_failed_with_error_summary(kb, monkeypatch):
 
 
 def test_bulk_run_with_nothing_runnable_leaves_kb_status_untouched(kb, monkeypatch):
-    """没有可跑的目标（全被页数上限拦下）= 没发生任何重解析，不该改写 KB 状态。
+    """没有可跑的目标（全被拆分成本阈值拦下）= 没发生任何重解析，不该改写 KB 状态。
 
     #154 改在 writer 层取证：空批次连 ``begin()`` 都不该调，更不该有
     ``finish()`` —— 什么都跑过，没理由告诉前端"我们 building 了"。
     """
-    huge = _add_doc(kb.id, "huge.pdf", embedding_status="failed")
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
+    huge = _add_doc(kb.id, "huge.pdf", embedding_status="failed", page_count=None)
     svc, _observed, _calls = _stub_reparse_observing_kb(monkeypatch, kb.id)
-    huge.page_count = PADDLEOCR_PAGE_LIMIT + 1
+    huge.page_count = BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1
     doc_repo._save_doc_meta(huge)
     before = kb_repo.get(kb.id).index_status
     writer_calls = _spy_kb_writer(monkeypatch)
@@ -892,7 +1134,11 @@ def test_cli_argparse_contract_preserved(cli_module, monkeypatch):
     monkeypatch.setattr(cli_module, "bulk_reparse", _fake_bulk)
     monkeypatch.setattr(
         "sys.argv",
-        ["bulk_reparse.py", "--kb-id", "kb_x", "--dry-run", "--concurrency", "8", "--yes", "--force"],
+        [
+            "bulk_reparse.py", "--kb-id", "kb_x",
+            "--dry-run", "--concurrency", "8",
+            "--yes", "--force", "--ignore-cost-limit",
+        ],
     )
 
     assert cli_module.main() == 0
@@ -902,4 +1148,5 @@ def test_cli_argparse_contract_preserved(cli_module, monkeypatch):
         "concurrency": 8,
         "skip_confirm": True,
         "force": True,
+        "ignore_cost_limit": True,
     }

@@ -136,14 +136,14 @@ export type AuditEvent =
   | { type: 'error'; message: string }
 // ── 批量重新解析 (Bulk Reparse) ──
 //
-// 三个端点共用同一形状的源数据（spec #102 / issue #111）：
+// 三个端点共用同一形状的源数据（spec #102 / issue #111 / #181）：
 //   - GET  /bulk-reparse/preflight  → 预检
 //   - POST /bulk-reparse            → 触发
 //   - GET  /bulk-reparse/report     → 报告
 //
 // ``reason`` 取值见 ``services/bulk_reparse_service``：
 //   入选：not_embedded / missing_pages / empty_layout / forced
-//   跳过：page_limit
+//   跳过：split_cost_exceeded
 export interface BulkReparseTarget {
   doc_id: string
   original_name: string
@@ -152,11 +152,18 @@ export interface BulkReparseTarget {
   cache_state: 'cached' | 'uncached'
 }
 
-export interface BulkReparseOverPageLimit {
+export interface BulkReparseCostExceeded {
   doc_id: string
   original_name: string
   page_count: number
   reason: string
+}
+
+export interface BulkReparseWillSplit {
+  doc_id: string
+  original_name: string
+  page_count: number
+  chunks_planned: number
 }
 
 export interface BulkReparsePreflight {
@@ -170,12 +177,16 @@ export interface BulkReparsePreflight {
   uncached_pages: number
   estimated_ocr_pages: number
   targets: BulkReparseTarget[]
-  over_page_limit: BulkReparseOverPageLimit[]
+  cost_exceeded_docs: BulkReparseCostExceeded[]
+  will_split_docs: BulkReparseWillSplit[]
+  chunks_total: number
+  ocr_pages_total: number
 }
 
 export interface BulkReparseTriggerRequest {
   concurrency?: number
   force?: boolean
+  ignore_cost_limit?: boolean
 }
 
 export interface BulkReparseTriggerResponse {

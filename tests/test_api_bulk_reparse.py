@@ -157,28 +157,53 @@ def test_preflight_returns_target_count_and_estimate():
     assert body["uncached_docs"] == 2
     assert body["estimated_ocr_pages"] == 8  # 4 + 4（都是 uncached）
     assert {t["doc_id"] for t in body["targets"]} == {ok.id, bad.id}
-    # over_page_limit 列表对这篇 KB 是空的
-    assert body["over_page_limit"] == []
+    # cost_exceeded_docs 列表对这篇 KB 是空的（150 还没到拆分成本阈值）
+    assert body["cost_exceeded_docs"] == []
     # 每篇带原因
     reasons = {t["reason"] for t in body["targets"]}
     assert "not_embedded" in reasons
 
 
-def test_preflight_marks_over_page_limit_in_warning():
-    """超 ``PADDLEOCR_PAGE_LIMIT`` 的 doc 进 ``over_page_limit`` 清单（AC 5）。"""
+def test_preflight_marks_over_cost_limit_in_warning():
+    """超拆分成本阈值的 doc 进 ``cost_exceeded_docs`` 清单（AC 5 / #181）。"""
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
+
     kb_id = _create_kb("preflight-over")
-    huge = _add_doc(kb_id, "huge.pdf", embedding_status="failed", page_count=150)
+    huge = _add_doc(
+        kb_id, "huge.pdf", embedding_status="failed",
+        page_count=BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1,
+    )
 
     body = client.get(
         f"/api/v1/knowledge-bases/{kb_id}/bulk-reparse/preflight"
     ).json()
 
     assert body["target_count"] == 1
-    over = body["over_page_limit"]
+    over = body["cost_exceeded_docs"]
     assert len(over) == 1
     assert over[0]["doc_id"] == huge.id
-    assert over[0]["page_count"] == 150
-    assert over[0]["reason"] == "page_limit"
+    assert over[0]["page_count"] == BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 1
+    assert over[0]["reason"] == "split_cost_exceeded"
+
+
+def test_preflight_exposes_will_split_docs():
+    """#181 验收：走拆分路径的 doc 进 ``will_split_docs``，带 ``chunks_planned``。"""
+    from core.pdf_splitter import chunk_ranges
+
+    kb_id = _create_kb("preflight-split")
+    _add_doc(kb_id, "huge.pdf", embedding_status="failed", page_count=247)
+
+    body = client.get(
+        f"/api/v1/knowledge-bases/{kb_id}/bulk-reparse/preflight"
+    ).json()
+
+    assert len(body["will_split_docs"]) == 1
+    plan = body["will_split_docs"][0]
+    assert plan["page_count"] == 247
+    assert plan["chunks_planned"] == len(chunk_ranges(247))
+    # 整批合计
+    assert body["chunks_total"] >= 1
+    assert body["ocr_pages_total"] == 247
 
 
 def test_preflight_force_selects_all_docs():

@@ -15,14 +15,18 @@ const isIndexingDoc = (d: KBDocument): boolean =>
 // 把预检结果铺成 ``window.confirm`` 文案 —— 沿用 per-doc reparse 的形态，
 // 不引入新 UI 语言（spec #102 story 39）。数字必须来自预检，不能拍脑袋写。
 // AC #112 明确要求四项：目标篇数 / 未命中 / 预计 OCR / 超限跳过；其余信息不在
-// issue 授权范围内，不擅自加入对话框。
+// issue 授权范围内，不擅自加入对话框。issue #181 拆分路径下"超 PADDLEOCR_PAGE_LIMIT
+// 走拆分解析"，不再进 skipped；新"超拆分成本阈值进 skipped"才是被跳过的部分。
 const buildBulkReparseConfirmMessage = (p: BulkReparsePreflight): string => {
   const lines: string[] = [
     `目标文档：${p.target_count} 篇`,
     `其中未命中缓存：${p.uncached_docs} 篇（将消耗约 ${p.estimated_ocr_pages} 页 OCR 配额）`,
   ]
-  if (p.over_page_limit.length > 0) {
-    lines.push(`超页数上限将被跳过：${p.over_page_limit.length} 篇`)
+  if (p.will_split_docs.length > 0) {
+    lines.push(`超页数上限将走拆分解析：${p.will_split_docs.length} 篇（合计 ${p.chunks_total} 子块）`)
+  }
+  if (p.cost_exceeded_docs.length > 0) {
+    lines.push(`超拆分成本阈值将被跳过：${p.cost_exceeded_docs.length} 篇`)
   }
   lines.push('')
   lines.push(p.target_count === 0 ? '当前没有待重新解析的文档。' : '确认开始批量重新解析？')

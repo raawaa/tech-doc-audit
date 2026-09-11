@@ -360,10 +360,11 @@ def test_report_failed_entries_carry_the_failure_reason(kb, monkeypatch):
 
 
 def test_report_lists_skipped_docs_instead_of_dropping_them(kb, monkeypatch):
-    """超页数上限的 doc 出现在报告里，带原因与页数 —— 跳过不许静默（AC 5）。"""
+    """超拆分成本阈值的 doc 出现在报告里，带原因与页数 —— 跳过不许静默（AC 5）。"""
     from services import bulk_reparse_service as _svc
+    from core.settings import BULK_REPARSE_SPLIT_COST_LIMIT_PAGES
 
-    huge = _add_doc(kb.id, "huge.pdf", page_count=PADDLEOCR_PAGE_LIMIT + 20)
+    huge = _add_doc(kb.id, "huge.pdf", page_count=BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 20)
     small = _add_doc(kb.id, "small.pdf", page_count=2)
     svc = _stub_reparse(monkeypatch, on_parse=lambda d: pages_store.save_pages(kb.id, d.id, _pages(2)))
 
@@ -373,14 +374,42 @@ def test_report_lists_skipped_docs_instead_of_dropping_them(kb, monkeypatch):
         {
             "doc_id": huge.id,
             "original_name": "huge.pdf",
-            "reason": svc.SKIP_REASON_PAGE_LIMIT,
-            "page_count": PADDLEOCR_PAGE_LIMIT + 20,
+            "reason": svc.SKIP_REASON_COST_EXCEEDED,
+            "page_count": BULK_REPARSE_SPLIT_COST_LIMIT_PAGES + 20,
         }
     ]
     assert report["counts"] == {"done": 1, "failed": 0, "skipped": 1}
     assert [e["doc_id"] for e in report["done"]] == [small.id]
 
 
+def test_report_schema_version_is_two(kb, monkeypatch):
+    """#181 验收 #6：报告 ``schema_version == 2``。"""
+    from services import bulk_reparse_service as svc
+
+    _add_doc(kb.id, "a.pdf", page_count=2, content_hash="h_a")
+    stub = _stub_reparse(
+        monkeypatch,
+        on_parse=lambda d: pages_store.save_pages(kb.id, d.id, _pages(2)),
+    )
+
+    report = _run_and_load_report(kb.id, stub, concurrency=1)
+
+    assert report["schema_version"] == 2
+    assert svc.REPORT_SCHEMA_VERSION == 2
+
+
+def test_report_done_source_includes_paddleocr_split_bucket(kb, monkeypatch):
+    """#181 验收 #6：走过拆分路径的 doc ``done[].source == "paddleocr_split"``。"""
+    _add_doc(kb.id, "split.pdf", page_count=2, content_hash="h_split")
+
+    def _parse(d):
+        pages_store.save_pages(kb.id, d.id, _pages(2))
+        _write_cache_entry("h_split", source=paddleocr_cache.SOURCE_PADDLEOCR_SPLIT)
+
+    stub = _stub_reparse(monkeypatch, on_parse=_parse)
+    report = _run_and_load_report(kb.id, stub, concurrency=1)
+
+    assert report["done"][0]["source"] == "paddleocr_split"
 
 
 def test_report_forced_field_promoted_to_top_level(kb, monkeypatch):

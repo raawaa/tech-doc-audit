@@ -268,7 +268,13 @@ def delete_kb_document(kb_id: str, doc_id: str):
 
 
 class BulkReparsePreflightResponse(BaseModel):
-    """预检返回：无副作用 dry-run 的成本估算 + 每篇入选原因。"""
+    """预检返回：无副作用 dry-run 的成本估算 + 每篇入选原因（issue #181 拆分成本分类）。
+
+    ``will_split_docs`` / ``chunks_total`` / ``ocr_pages_total`` 是拆分路径的决策
+    辅助信息（issue #181 / spec §F）；``cost_exceeded_docs`` 是会进 skipped 的清单
+    （拆分成本超阈值）。``done[].source`` 中 ``paddleocr_split`` 是 #178 / #173
+    拆分路径的缓存分桶（仍在烧 OCR 配额，但条目打这个桶名而非 ``paddleocr``）。
+    """
 
     kb_id: str
     force: bool
@@ -282,12 +288,17 @@ class BulkReparsePreflightResponse(BaseModel):
     uncached_pages: int
     estimated_ocr_pages: int
     targets: list[dict]
-    over_page_limit: list[dict]
+    cost_exceeded_docs: list[dict]
+    will_split_docs: list[dict] = []
+    chunks_total: int = 0
+    ocr_pages_total: int = 0
 
 
 class BulkReparseTriggerRequest(BaseModel):
     concurrency: int = DEFAULT_CONCURRENCY
     force: bool = False
+    # issue #181：显式绕过拆分成本护栏（``--force`` 不能绕）。
+    ignore_cost_limit: bool = False
 
 
 class BulkReparseTriggerResponse(BaseModel):
@@ -300,7 +311,13 @@ class BulkReparseTriggerResponse(BaseModel):
 
 
 def _build_preflight_payload(kb_id: str, *, force: bool) -> BulkReparsePreflightResponse:
-    """预检核心：选目标 + 估算成本，纯函数 + 无副作用（issue #111 AC 2）。"""
+    """预检核心：选目标 + 估算成本，纯函数 + 无副作用（issue #111 AC 2 / #181）。
+
+    新增三个字段（issue #181 / spec §F）：
+    - ``will_split_docs`` —— 走拆分解析路径的 doc + 计划块数
+    - ``chunks_total`` / ``ocr_pages_total`` —— 整批的拆分块数 / OCR 总页数合计
+    - ``cost_exceeded_docs`` —— 拆分成本超阈值的清单（``reason="split_cost_exceeded"``）
+    """
     targets = list_target_docs(kb_id, force=force)
     cost: OcrCostEstimate = estimate_ocr_cost(targets)
     return BulkReparsePreflightResponse(
@@ -325,15 +342,26 @@ def _build_preflight_payload(kb_id: str, *, force: bool) -> BulkReparsePreflight
             }
             for t in targets
         ],
-        over_page_limit=[
+        cost_exceeded_docs=[
             {
                 "doc_id": s.doc.id,
                 "original_name": s.doc.original_name,
                 "page_count": s.page_count,
                 "reason": s.reason,
             }
-            for s in cost.over_page_limit
+            for s in cost.cost_exceeded_docs
         ],
+        will_split_docs=[
+            {
+                "doc_id": p.doc.id,
+                "original_name": p.doc.original_name,
+                "page_count": p.page_count,
+                "chunks_planned": p.chunks_planned,
+            }
+            for p in cost.will_split_docs
+        ],
+        chunks_total=cost.chunks_total,
+        ocr_pages_total=cost.ocr_pages_total,
     )
 
 
@@ -411,6 +439,7 @@ def bulk_reparse_trigger(
                 kb_id, targets,
                 concurrency=req.concurrency,
                 forced=req.force,
+                ignore_cost_limit=req.ignore_cost_limit,
             )
         except Exception as e:
             # 编排层自身抛错：把 KB 落在 failed 而不是让它永远卡在 building。
